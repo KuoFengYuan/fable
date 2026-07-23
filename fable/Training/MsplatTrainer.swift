@@ -102,6 +102,23 @@ nonisolated final class MsplatSession: @unchecked Sendable {
         orbitDist = min(max(orbitDist / scale, 0.15), 6.0)
     }
 
+    /// 雙指平移：沿當前相機的 right/up 軸移動樞軸（eye 隨之同移）→ 模型在畫面中平移。
+    /// dx,dy 為螢幕點位移（dy>0 為下）。位移量以樞軸深度換算，接近 1:1 手感。
+    func applyPan(dx: Float, dy: Float) {
+        orbitLock.lock(); defer { orbitLock.unlock() }
+        let up = simd_normalize(orbitQuat.act(baseUp))
+        let eye = orbitCenter + orbitQuat.act(baseOffset * orbitDist)
+        let fwd = simd_normalize(orbitCenter - eye)
+        var right = simd_cross(fwd, up)
+        right = simd_length(right) > 1e-4 ? simd_normalize(right) : SIMD3<Float>(1, 0, 0)
+        let u = simd_cross(right, fwd)                     // 正交化螢幕上方
+        let dist = simd_length(baseOffset) * orbitDist
+        // 螢幕點→world：dist/fy 為每 render 像素的世界量，×0.6 補償 render(240 寬) 放大到全螢幕
+        let k = 0.6 * dist / max(portraitFy, 1)
+        // 手指右(dx>0)→模型右→相機左（-right）；手指下(dy>0)→模型下→相機上（+u）。感覺相反就翻號。
+        orbitCenter += right * (-dx * k) + u * (dy * k)
+    }
+
     func resetView() {
         orbitLock.lock()
         orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))

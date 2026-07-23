@@ -388,6 +388,13 @@ final class CaptureController: NSObject, ObservableObject {
         if trainingComplete { requestOrbitRender() }
     }
 
+    /// 雙指平移檢視（沿螢幕平面移動樞軸）。dx,dy 為螢幕點位移。
+    func panTrainedView(dx: Float, dy: Float) {
+        guard phase == .training else { return }
+        session?.applyPan(dx: dx, dy: dy)
+        if trainingComplete { requestOrbitRender() }
+    }
+
     private func requestOrbitRender() {
         guard let session, phase == .training, trainingComplete else { return }
         if orbitInFlight { orbitPending = true; return }
