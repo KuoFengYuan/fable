@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <cassert>
 #include <cstring>
+#include <utility>
+#include <CoreFoundation/CoreFoundation.h>  // CFRetain/CFRelease（純 C API，.cpp/.mm 皆可）
 
 // Forward-declare the Metal buffer type for C++ compatibility.
 // Full Metal/Metal.h is only needed in .mm files.
@@ -62,6 +64,42 @@ public:
         _cpu_data.resize(bytes);
     }
 
+    // ── 值語意（RAII 引用計數）──
+    // 舊版用編譯器預設淺拷貝（複製 _buffer 指標卻不 retain）＋無解構子＋手動 reset()：
+    //   → 兩個 MTensor 共用同一 buffer 時各自 reset() = CFRelease 兩次（雙重釋放當機）；
+    //   → `x = 新tensor` 覆寫舊指標卻不釋放（記憶體洩漏）。
+    // 改為正確引用計數：拷貝/資料檢視 CFRetain、解構/覆寫 CFRelease → 杜絕雙重釋放與洩漏。
+    // 用 CoreFoundation C API（非 __OBJC__ 條件式），避免 inline reset() 在 .cpp/.mm 兩種定義的 ODR 分歧。
+    MTensor(const MTensor& o)
+        : _buffer(o._buffer), _data(o._data), _cpu_data(o._cpu_data),
+          _shape(o._shape), _dtype(o._dtype), _numel(o._numel) {
+        if (_buffer) CFRetain((CFTypeRef)_buffer);
+    }
+    MTensor& operator=(const MTensor& o) {
+        if (this != &o) {
+            if (o._buffer) CFRetain((CFTypeRef)o._buffer);
+            if (_buffer) CFRelease((CFTypeRef)_buffer);
+            _buffer = o._buffer; _data = o._data; _cpu_data = o._cpu_data;
+            _shape = o._shape; _dtype = o._dtype; _numel = o._numel;
+        }
+        return *this;
+    }
+    MTensor(MTensor&& o) noexcept
+        : _buffer(o._buffer), _data(o._data), _cpu_data(std::move(o._cpu_data)),
+          _shape(std::move(o._shape)), _dtype(o._dtype), _numel(o._numel) {
+        o._buffer = nullptr; o._data = nullptr; o._numel = 0;
+    }
+    MTensor& operator=(MTensor&& o) noexcept {
+        if (this != &o) {
+            if (_buffer) CFRelease((CFTypeRef)_buffer);
+            _buffer = o._buffer; _data = o._data; _cpu_data = std::move(o._cpu_data);
+            _shape = std::move(o._shape); _dtype = o._dtype; _numel = o._numel;
+            o._buffer = nullptr; o._data = nullptr; o._numel = 0;
+        }
+        return *this;
+    }
+    ~MTensor() { reset(); }
+
     bool defined() const { return _buffer != nullptr || !_cpu_data.empty(); }
     bool isGpu() const { return _buffer != nullptr; }
 
@@ -100,9 +138,7 @@ public:
     }
 
     void reset() {
-#ifdef __OBJC__
-        if (_buffer) { CFRelease(_buffer); }
-#endif
+        if (_buffer) { CFRelease((CFTypeRef)_buffer); }
         _buffer = nullptr;
         _data = nullptr;
         _cpu_data.clear();
@@ -119,13 +155,12 @@ public:
     }
 
     // Create a view of the first `n` elements along dim 0.
-    // WARNING: Non-owning — shares the underlying MTLBuffer without retaining it.
-    // The caller MUST ensure the parent MTensor outlives all views.
-    // Use-after-free if the parent is destroyed while a view exists.
+    // 共有底層 MTLBuffer 並「retain」→ 為擁有者之一，靠引用計數保命（不再有 parent 先亡的 UAF）。
     MTensor view(int64_t n) const {
         MTensor v;
-        v._buffer = _buffer;  // shares the buffer (non-owning)
-        v._data = _data;      // shares the CPU-accessible pointer
+        v._buffer = _buffer;  // 共有 buffer
+        if (v._buffer) CFRetain((CFTypeRef)v._buffer);
+        v._data = _data;      // 共有 CPU 可存取指標（buffer 由引用計數保活）
         v._shape = _shape;
         v._shape[0] = n;
         v._dtype = _dtype;
