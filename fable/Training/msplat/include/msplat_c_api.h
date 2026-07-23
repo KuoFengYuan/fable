@@ -39,8 +39,12 @@ static inline MsplatConfig msplat_default_config(void) {
     c.shDegree = 3;
     c.shDegreeInterval = 1000;
     c.ssimWeight = 0.2f;
-    c.numDownscales = 2;
-    c.resolutionSchedule = 3000;
+    // coarse-to-fine：ds = 1<<max(numDownscales - step/resolutionSchedule, 0)。
+    // 舊值 (2,3000) 在 4000~6000 步內最細只到 ds=2（800px）、永遠到不了 1600 全解析度 → 糊。
+    // 改 (1,2000)：step<2000 用 ds=2(800px) 粗訓，step>=2000 用 ds=1(1600px 全上限)，
+    // 且落在 densify 視窗(500~maxSteps/2) 內 → 能在全解析度上長出細節點。
+    c.numDownscales = 1;
+    c.resolutionSchedule = 2000;
     c.refineEvery = 100;
     c.warmupLength = 500;
     c.resetAlphaEvery = 30;
