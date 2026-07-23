@@ -380,10 +380,17 @@ struct FusedTensorCache {
     MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
     MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
 
+    // 關鍵：重配前必先 reset() 舊 MTensor。MTensor 無解構子（ARC=NO 下 __bridge_retained 為 no-op），
+    // 直接 `x = mtensor_empty(...)` 覆寫只換指標、不釋放舊 MTLBuffer → 每次維度變動洩漏一整組緩衝。
+    // 觸發極頻繁：① 每次密集化改變 np/capacity；② 預覽 render(240×520) 與訓練尺寸交替 → img_size 每個
+    // 預覽週期來回切換兩次，各洩漏 loss_intermediates(ih×iw×15 float，上百 MB) 等。這是記憶體線性爬升主因。
+    // reset() 對在飛行中的 command buffer 安全：Metal 會自留資源直到 GPU 完成。
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
         if (np != fwd_num_points) {
             fwd_num_points = np;
+            xys.reset(); depths.reset(); radii_out.reset(); conics.reset();
+            num_tiles_hit.reset(); colors.reset(); aabb.reset(); block_totals.reset();
             xys = mtensor_empty(dev, {np, 2}, DType::Float32);
             depths = mtensor_empty(dev, {np}, DType::Float32);
             radii_out = mtensor_empty(dev, {np}, DType::Int32);
@@ -395,6 +402,7 @@ struct FusedTensorCache {
         }
         if (cap != capacity) {
             capacity = cap;
+            gaussian_ids.reset(); packed_xy_opac.reset(); packed_conic.reset(); packed_rgb.reset();
             gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
@@ -402,6 +410,8 @@ struct FusedTensorCache {
         }
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
+            out_img.reset(); final_Ts.reset(); final_idx.reset();
+            loss_intermediates.reset(); ssim_h_buf.reset(); v_rendered.reset();
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
@@ -411,6 +421,7 @@ struct FusedTensorCache {
         }
         if (nt != num_tiles) {
             num_tiles = nt;
+            tile_bins.reset(); tile_offsets.reset(); tile_scatter_counters.reset(); prealloc_bins.reset();
             tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
             tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
@@ -427,6 +438,7 @@ struct FusedTensorCache {
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
         if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
         chunk_K_max = K;
+        chunk_T.reset(); chunk_C.reset(); chunk_final_idx.reset(); prefix_T.reset(); after_C.reset();
         chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
@@ -438,6 +450,8 @@ struct FusedTensorCache {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
             bwd_num_points = np;
             features_rest_bases = frb;
+            v_xy.reset(); v_conic.reset(); v_colors_rast.reset(); v_opacity.reset(); v_depth.reset();
+            v_mean3d.reset(); v_scale.reset(); v_quat.reset(); v_features_dc.reset(); v_features_rest.reset();
             v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
             v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
