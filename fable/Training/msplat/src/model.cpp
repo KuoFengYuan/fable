@@ -261,7 +261,11 @@ void Model::afterTrain(int step){
 
             float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
             int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
-            bool checkHuge = step > refineEvery * resetAlphaEvery;
+            // 巨大高斯剪枝啟用時機。原始 msplat 用 refineEvery*resetAlphaEvery（=3000，為 30000 步排程設計），
+            // 但本專案 maxSteps=4000 → stopSplitAt=2000，densify 只在 step<2000 跑 → 3000 這門檻永不觸發 →
+            // 覆蓋整幀的巨大高斯（初始化稀疏遠點造成）從不被剪 → 渲染時 tile overflow(>2048/tile) → 方塊。
+            // 改為 warmup 後即啟用（落在 densify 視窗內），順帶降低高斯數/記憶體。
+            bool checkHuge = step > warmupLength;
             int fr_stride = (int)featuresRest_buf.stride0();
 
             int new_count = msplat_densify(
