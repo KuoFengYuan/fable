@@ -112,9 +112,13 @@ final class CoverageVisualizer {
     private var cellNodes: [SCNNode] = []
     private var cellCovered: [Bool] = []
     private var objectCenter: SIMD3<Float>?
+    private var domeRadius: Float = 1
+    private var guidanceCellIdx: Int = -1   // 目前高亮的「最近缺角」格
 
     /// 涵蓋率變動回呼（0...1），供 HUD 顯示
     var onCoverageChanged: ((Double) -> Void)?
+    /// 缺角提醒回呼：往哪補掃的一句提示（nil＝無圓頂或已全涵蓋，隱藏提示）
+    var onGuidanceChanged: ((String?) -> Void)?
 
     var hasDome: Bool { domeRoot != nil }
 
@@ -142,7 +146,10 @@ final class CoverageVisualizer {
         cellNodes = []
         cellCovered = []
         objectCenter = nil
+        domeRadius = 1
+        guidanceCellIdx = -1
         onCoverageChanged?(0)
+        onGuidanceChanged?(nil)
     }
 
     // MARK: - 即時點雲疊加（空間磚 + ARAnchor 錨定，防漂移殘影）
@@ -214,7 +221,77 @@ final class CoverageVisualizer {
         root.addChildNode(dome)
         domeRoot = dome
         objectCenter = center
+        domeRadius = radius
+        guidanceCellIdx = -1
         onCoverageChanged?(0)
+    }
+
+    // MARK: - 缺角提醒（往哪補掃）
+
+    /// 每幀（可節流）呼叫：找出離目前相機最近的未涵蓋格、以橘色高亮，並回報一句「往哪補」的視角相對提示。
+    func updateGuidance(pose: simd_float4x4) {
+        guard let center = objectCenter, !cellNodes.isEmpty else { onGuidanceChanged?(nil); return }
+        let camPos = MatrixUtil.position(pose)
+        let toCam = camPos - center
+        let dist = simd_length(toCam)
+        guard dist > 0.05 else { return }
+        let camDir = toCam / dist
+        let camAz = atan2(camDir.z, camDir.x)
+        let camEl = asin(max(-1, min(1, camDir.y)))
+
+        let azN = config.domeAzimuthBins, elN = config.domeElevationBins
+        let elMax = config.domeElevationMaxDeg * .pi / 180
+
+        // 最近的未涵蓋格（az/el 角距最小）
+        var bestIdx = -1
+        var bestScore = Float.greatestFiniteMagnitude
+        for e in 0..<elN {
+            let cellEl = elMax * (Float(e) + 0.5) / Float(elN)
+            for a in 0..<azN {
+                let idx = e * azN + a
+                if cellCovered[idx] { continue }
+                let cellAz = 2 * .pi * (Float(a) + 0.5) / Float(azN)
+                var dAz = cellAz - camAz
+                while dAz > .pi { dAz -= 2 * .pi }
+                while dAz < -.pi { dAz += 2 * .pi }
+                let dEl = cellEl - camEl
+                let score = dAz * dAz + dEl * dEl
+                if score < bestScore { bestScore = score; bestIdx = idx }
+            }
+        }
+        if bestIdx < 0 { setGuidanceCell(-1); onGuidanceChanged?(nil); return }  // 已全涵蓋
+        setGuidanceCell(bestIdx)
+
+        // 目標格中心的世界座標 → 相機視角相對方向（不需螢幕投影即給明確提示）
+        let e = bestIdx / azN, a = bestIdx % azN
+        let cellEl = elMax * (Float(e) + 0.5) / Float(elN)
+        let cellAz = 2 * .pi * (Float(a) + 0.5) / Float(azN)
+        let tdir = SIMD3<Float>(cos(cellEl) * cos(cellAz), sin(cellEl), cos(cellEl) * sin(cellAz))
+        let target = center + tdir * domeRadius
+        let right = SIMD3<Float>(pose[0][0], pose[0][1], pose[0][2])
+        let up    = SIMD3<Float>(pose[1][0], pose[1][1], pose[1][2])
+        let back  = SIMD3<Float>(pose[2][0], pose[2][1], pose[2][2])   // 相機 +z（背向；視線為 -back）
+        let v = target - camPos
+        let cx = simd_dot(v, right), cy = simd_dot(v, up), cz = simd_dot(v, back)
+        let missing = cellCovered.lazy.filter { !$0 }.count
+
+        let dir: String
+        if cz > 0 { dir = "缺角在你後方 — 轉過去補掃" }
+        else if abs(cx) >= abs(cy) { dir = cx > 0 ? "往右邊繞去補掃" : "往左邊繞去補掃" }
+        else { dir = cy > 0 ? "把視角抬高補掃" : "把視角放低補掃" }
+        onGuidanceChanged?("還缺 \(missing) 個視角 · \(dir)")
+    }
+
+    /// 高亮「最近缺角」格為橘色；還原前一個（若仍未涵蓋）為原本淡色。
+    private func setGuidanceCell(_ idx: Int) {
+        if guidanceCellIdx == idx { return }
+        if guidanceCellIdx >= 0, guidanceCellIdx < cellNodes.count, !cellCovered[guidanceCellIdx] {
+            cellNodes[guidanceCellIdx].geometry?.firstMaterial?.diffuse.contents = UIColor.white.withAlphaComponent(0.14)
+        }
+        guidanceCellIdx = idx
+        if idx >= 0 {
+            cellNodes[idx].geometry?.firstMaterial?.diffuse.contents = UIColor.systemOrange.withAlphaComponent(0.7)
+        }
     }
 
     // MARK: - 關鍵幀

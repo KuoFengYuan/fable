@@ -82,7 +82,7 @@ struct PixelBuffer {
 class Dataset {
 public:
     Dataset(const std::string& path, float downscaleFactor, int maxImageDim,
-            bool evalMode, int testEvery);
+            int maxTrainFrames, bool evalMode, int testEvery);
     ~Dataset();
 
     Dataset(const Dataset&) = delete;

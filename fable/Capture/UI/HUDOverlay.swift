@@ -16,6 +16,7 @@ struct HUDOverlay: View {
             VStack(spacing: 10) {
                 header
                 warningBanner
+                coverageHintBanner
                 speedGauge
                 Spacer()
                 statusLine
@@ -25,6 +26,7 @@ struct HUDOverlay: View {
         }
         .animation(.easeInOut(duration: 0.25), value: controller.assessment.worst)
         .animation(.easeInOut(duration: 0.25), value: controller.phase)
+        .animation(.easeInOut(duration: 0.25), value: controller.coverageHint)
     }
 
     // MARK: - 全螢幕紅框：遮斷級警告（暫停抓幀中）的強視覺提示
@@ -36,6 +38,21 @@ struct HUDOverlay: View {
                 .strokeBorder(Color.red.opacity(0.65), lineWidth: 5)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
+        }
+    }
+
+    // MARK: - 缺角提醒：往哪補掃（物件模式圓頂；擋掉遮斷級警告時不搶版面）
+
+    @ViewBuilder
+    private var coverageHintBanner: some View {
+        if controller.phase == .scanning, !controller.assessment.captureBlocked,
+           let hint = controller.coverageHint {
+            Label(hint, systemImage: "scope")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(Color.orange.opacity(0.85), in: Capsule())
+                .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 

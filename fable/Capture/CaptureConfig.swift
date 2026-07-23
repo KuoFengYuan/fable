@@ -86,6 +86,13 @@ nonisolated struct CaptureConfig: Sendable {
     var previewTileSizeM: Float = 1.2
     /// 點雲融合的模糊閘門（比抓幀遮斷更嚴）：模糊幀的姿態-深度錯位是殘影另一來源
     var previewMaxBlurPixels: Float = 12
+    /// 融合的「相機穩定度」閘門：只在相機夠穩時才把深度融進點雲。
+    /// 模糊值受曝光時間影響（亮處曝光短→快速移動仍判定為低模糊），無法反映「姿態延遲/誤差」；
+    /// 移動過快時姿態不準 → 同一表面被投影到不同世界座標 → 殘影＋點不貼合。故另設速度硬閘門。
+    /// 角速度上限（rad/s）：~0.6 允許正常掃描平移、擋掉甩動。
+    var previewMaxAngularSpeedRadS: Float = 0.6
+    /// 線速度上限（m/s）：~0.5 允許走動掃描、擋掉「來回快步」造成的殘影。想更乾淨可調小（但覆蓋變慢）。
+    var previewMaxLinearSpeedMS: Float = 0.5
 
     // MARK: - 手機端 3DGS 訓練（msplat，on-device）
     /// 訓練迭代數（手機縮規模；桌機版通常 30000）。3–7k 在物件尺度已可觀。
@@ -107,6 +114,10 @@ nonisolated struct CaptureConfig: Sendable {
     /// 影像解碼一次後以 uint8 常駐（1600 全 42 幀約 244MB、有界、不再每輪重解碼）。
     /// 想更快更省 → 1280/1024；想壓最高細節 → 調高（記憶體與時間相應上升）。
     var trainMaxImageDim = 1600
+    /// 訓練用關鍵幀數上限（0＝不限）。訓練時每幀以 uint8 常駐（1600px 每張 ~5.8MB）→ 幀數 × 5.8MB
+    /// 是記憶體大宗；長掃描動輒數百幀就會 OOM。超過上限時沿拍攝軌跡「均勻抽樣」到此數（保留視角分佈）。
+    /// 120 幀 ~690MB，room 尺度 3DGS 已足夠；OOM 就調小、想更細節就調大（留意記憶體）。
+    var trainMaxFrames = 120
     /// 每幾步更新一次即時預覽 render（越小越即時、越吃效能）
     var trainPreviewEvery = 50
     /// 熱狀態達 .serious 以上時暫停訓練（散熱保護，避免 thermal shutdown）
