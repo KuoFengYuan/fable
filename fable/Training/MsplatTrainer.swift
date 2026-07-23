@@ -73,6 +73,7 @@ nonisolated final class MsplatSession: @unchecked Sendable {
     private var orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))  // 累積旋轉（identity 起始）
     private var orbitCenter = SIMD3<Float>(0, 0, 0)   // 樞軸＝物件中心
     private var baseOffset = SIMD3<Float>(0, 0, 1)    // 初始 eye − center
+    private var orbitDist: Float = 1.0                // 縮放：eye→中心距離倍率（pinch 調整，<1 拉近、>1 拉遠）
     private var baseUp = SIMD3<Float>(0, -1, 0)       // 初始 up（世界垂直；若顛倒改 (0,1,0)）
     // 直式 render 內參（填滿直式螢幕、免螢幕旋轉硬湊）
     private var portraitW: Int32 = 720
@@ -84,7 +85,7 @@ nonisolated final class MsplatSession: @unchecked Sendable {
     func applyDrag(dx: Float, dy: Float) {
         orbitLock.lock(); defer { orbitLock.unlock() }
         let up = simd_normalize(orbitQuat.act(baseUp))
-        let eye = orbitCenter + orbitQuat.act(baseOffset)
+        let eye = orbitCenter + orbitQuat.act(baseOffset * orbitDist)
         let fwd = simd_normalize(orbitCenter - eye)
         var right = simd_cross(fwd, up)
         right = simd_length(right) > 1e-4 ? simd_normalize(right) : SIMD3<Float>(1, 0, 0)
@@ -94,8 +95,35 @@ nonisolated final class MsplatSession: @unchecked Sendable {
         orbitQuat = simd_normalize(qYaw * qPitch * orbitQuat)
     }
 
+    /// pinch 縮放：scale>1（手指張開）拉近、<1 拉遠。夾在合理範圍避免穿過物件或飛太遠。
+    func applyZoom(_ scale: Float) {
+        guard scale > 0 else { return }
+        orbitLock.lock(); defer { orbitLock.unlock() }
+        orbitDist = min(max(orbitDist / scale, 0.15), 6.0)
+    }
+
+    /// 雙指平移：沿當前相機的 right/up 軸移動樞軸（eye 隨之同移）→ 模型在畫面中平移。
+    /// dx,dy 為螢幕點位移（dy>0 為下）。位移量以樞軸深度換算，接近 1:1 手感。
+    func applyPan(dx: Float, dy: Float) {
+        orbitLock.lock(); defer { orbitLock.unlock() }
+        let up = simd_normalize(orbitQuat.act(baseUp))
+        let eye = orbitCenter + orbitQuat.act(baseOffset * orbitDist)
+        let fwd = simd_normalize(orbitCenter - eye)
+        var right = simd_cross(fwd, up)
+        right = simd_length(right) > 1e-4 ? simd_normalize(right) : SIMD3<Float>(1, 0, 0)
+        let u = simd_cross(right, fwd)                     // 正交化螢幕上方
+        let dist = simd_length(baseOffset) * orbitDist
+        // 螢幕點→world：dist/fy 為每 render 像素的世界量，×0.6 補償 render(240 寬) 放大到全螢幕
+        let k = 0.6 * dist / max(portraitFy, 1)
+        // 手指右(dx>0)→模型右→相機左（-right）；手指下(dy>0)→模型下→相機上（+u）。感覺相反就翻號。
+        orbitCenter += right * (-dx * k) + u * (dy * k)
+    }
+
     func resetView() {
-        orbitLock.lock(); orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0)); orbitLock.unlock()
+        orbitLock.lock()
+        orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        orbitDist = 1.0
+        orbitLock.unlock()
     }
 
     // MARK: - 訓練
@@ -103,7 +131,7 @@ nonisolated final class MsplatSession: @unchecked Sendable {
     /// setup + 阻塞式訓練迴圈。務必透過本 session 佇列執行（內部已 dispatch）。
     func start(colmapDir: String, metallib: String?,
                iterations: Int, shDegree: Int, maxGaussians: Int,
-               downscale: Float, previewEvery: Int, wantPreview: Bool,
+               downscale: Float, maxImageDim: Int, previewEvery: Int, wantPreview: Bool,
                outputPLY: String,
                isCancelled: @escaping @Sendable () -> Bool,
                thermalPaused: @escaping @Sendable () -> Bool,
@@ -114,7 +142,8 @@ nonisolated final class MsplatSession: @unchecked Sendable {
             do {
                 try setup(colmapDir: colmapDir, metallib: metallib,
                           iterations: iterations, shDegree: shDegree,
-                          maxGaussians: maxGaussians, downscale: downscale)
+                          maxGaussians: maxGaussians, downscale: downscale,
+                          maxImageDim: maxImageDim)
             } catch {
                 onError(error); return
             }
@@ -151,9 +180,9 @@ nonisolated final class MsplatSession: @unchecked Sendable {
 
     private func setup(colmapDir: String, metallib: String?,
                        iterations: Int, shDegree: Int, maxGaussians: Int,
-                       downscale: Float) throws {
+                       downscale: Float, maxImageDim: Int) throws {
         if let metallib { msplat_set_metallib_path(metallib) }
-        guard let ds = msplat_dataset_create(colmapDir, downscale, false, 0) else {
+        guard let ds = msplat_dataset_create(colmapDir, downscale, Int32(maxImageDim), false, 0) else {
             throw TrainingError.initFailed
         }
         dataset = ds
@@ -235,7 +264,7 @@ nonisolated final class MsplatSession: @unchecked Sendable {
 
     /// 由 orbitQuat 算相機 GL camToWorld（繞 orbitCenter 旋轉、lookAt 中心）。呼叫前需持 orbitLock。
     private func currentPoseLocked() -> [Float] {
-        let eye = orbitCenter + orbitQuat.act(baseOffset)
+        let eye = orbitCenter + orbitQuat.act(baseOffset * orbitDist)
         let up = simd_normalize(orbitQuat.act(baseUp))
         let forward = simd_normalize(orbitCenter - eye)
         var r = simd_cross(forward, up)
@@ -274,7 +303,10 @@ nonisolated final class MsplatSession: @unchecked Sendable {
         dir = simd_length(dir) > 1e-4 ? simd_normalize(dir) : SIMD3<Float>(0, 0, 1)
         baseOffset = dir * (radius * 3.0)
         baseUp = SIMD3<Float>(0, -1, 0)   // 世界垂直（重力）；若顛倒改 (0, 1, 0)
-        orbitLock.lock(); orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0)); orbitLock.unlock()
+        orbitLock.lock()
+        orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+        orbitDist = 1.0
+        orbitLock.unlock()
 
         // 直式內參：垂直 FOV 60°。解析度刻意小（240×520）—— 訓練中 render 疊在訓練上，
         // 大尺寸會 OOM；小尺寸縮放到螢幕仍夠看。穩定後可再往上調。

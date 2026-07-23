@@ -19,7 +19,7 @@ void Camera::loadImage(float downscaleFactor) {
     if (raw.empty()) return;
 
     if (!calibrated) {
-        // 首次載入：校正內參 + 決定最終 width/height（只做一次；重載時不可重複調整）
+        // 首次載入：對齊宣告的 (width,height) → 套 downscale + maxImageDim 上限 → 校正內參（只做一次）
         if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
             float sx = (float)raw.width / (float)width;
             float sy = (float)raw.height / (float)height;
@@ -28,14 +28,25 @@ void Camera::loadImage(float downscaleFactor) {
         } else if (width == 0 || height == 0) {
             width = raw.width; height = raw.height;
         }
-        if (downscaleFactor > 1.0f) {
-            int newW = (int)(width / downscaleFactor);
-            int newH = (int)(height / downscaleFactor);
-            raw = resizeArea(raw, newW, newH);
-            float s = 1.0f / downscaleFactor;
-            fx *= s; fy *= s; cx *= s; cy *= s;
-            width = newW; height = newH;
+
+        // 目標尺寸：先套固定 downscale，再套最長邊上限（maxImageDim）——取較強的縮小。
+        // 12MP → 最長邊 1600 約降 6.4× 像素：光柵化/記憶體同步降一個量級（畫質對 3DGS 無損）。
+        int tw = width, th = height;
+        float ds = std::max(1.0f, downscaleFactor);
+        if (ds > 1.0f) { tw = (int)(width / ds); th = (int)(height / ds); }
+        if (maxImageDim > 0 && std::max(tw, th) > maxImageDim) {
+            float f = (float)std::max(tw, th) / (float)maxImageDim;
+            tw = (int)(tw / f); th = (int)(th / f);
         }
+        tw = std::max(1, tw); th = std::max(1, th);
+        if (tw != width || th != height) {
+            raw = resizeArea(raw, tw, th);
+            float sx = (float)tw / (float)width;
+            float sy = (float)th / (float)height;
+            fx *= sx; fy *= sy; cx *= sx; cy *= sy;
+            width = tw; height = th;
+        }
+
         if (hasDistortion()) {
             auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
             raw = std::move(result.image);
@@ -45,28 +56,35 @@ void Camera::loadImage(float downscaleFactor) {
             k1 = k2 = k3 = p1 = p2 = 0;
         }
         calibrated = true;
-        image = std::move(raw);
-        return;
+    } else {
+        // 已校正（理論上 pixels 常駐不會再走此路）；保險：縮到已定案的 (width,height)
+        if (raw.width != width || raw.height != height) raw = resizeArea(raw, width, height);
     }
 
-    // 串流重載（已校正）：只讀像素、縮到最終 (width,height)。內參不再改。
-    // 畸變相機不走此路（其 undistort 裁切無法重現）——見 Dataset/LRU 不驅逐畸變相機。
-    if (raw.width != width || raw.height != height) raw = resizeArea(raw, width, height);
-    image = std::move(raw);
+    // 存成 uint8 常駐（解碼一次）：float [0,1] → uint8 [0,255]。之後 GPU tensor 由此重建、免重解碼。
+    size_t n = (size_t)width * height * 3;
+    pixels.resize(n);
+    const float* s = raw.ptr();
+    for (size_t i = 0; i < n; i++) {
+        float v = s[i] * 255.0f + 0.5f;
+        pixels[i] = (uint8_t)std::clamp(v, 0.0f, 255.0f);
+    }
 }
 
 Image Camera::getImage(int downscaleFactor) {
-    if (image.empty()) loadImage(datasetDownscale);   // 串流：需要時才載入
-    if (downscaleFactor <= 1) return image;
+    if (pixels.empty()) loadImage(datasetDownscale);   // 串流：首用時解碼，之後常駐
 
-    auto it = imagePyramids.find(downscaleFactor);
-    if (it != imagePyramids.end()) return it->second;
+    // uint8 常駐副本 → float 全（已上限）解析度
+    Image full;
+    full.width = width; full.height = height;
+    size_t n = (size_t)width * height * 3;
+    full.data.resize(n);
+    for (size_t i = 0; i < n; i++) full.data[i] = pixels[i] * (1.0f / 255.0f);
 
-    int newW = image.width / downscaleFactor;
-    int newH = image.height / downscaleFactor;
-    Image scaled = resizeArea(image, newW, newH);
-    imagePyramids[downscaleFactor] = scaled;
-    return scaled;
+    if (downscaleFactor <= 1) return full;
+    int newW = width / downscaleFactor;
+    int newH = height / downscaleFactor;
+    return resizeArea(full, newW, newH);   // coarse-to-fine 降採樣（由常駐副本，非重解碼）
 }
 
 MTensor& Camera::getGPUImage(int downscaleFactor) {

@@ -79,7 +79,7 @@ struct PixelBuffer {
 
 class Dataset {
 public:
-    Dataset(const std::string& path, float downscaleFactor,
+    Dataset(const std::string& path, float downscaleFactor, int maxImageDim,
             bool evalMode, int testEvery);
     ~Dataset();
 

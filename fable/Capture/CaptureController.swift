@@ -349,6 +349,7 @@ final class CaptureController: NSObject, ObservableObject {
                 colmapDir: dir.path, metallib: metallib,
                 iterations: cfg.trainIterations, shDegree: cfg.trainSHDegree,
                 maxGaussians: cfg.trainMaxGaussians, downscale: cfg.trainDownscale,
+                maxImageDim: cfg.trainMaxImageDim,
                 previewEvery: cfg.trainPreviewEvery, wantPreview: wantPreview,
                 outputPLY: plyURL.path,
                 isCancelled: { cancel.isCancelled },
@@ -378,6 +379,20 @@ final class CaptureController: NSObject, ObservableObject {
         guard phase == .training else { return }
         session?.applyDrag(dx: deltaX, dy: deltaY)   // trackball 自由轉動（訓練中/完成都可）
         if trainingComplete { requestOrbitRender() } // 完成後：即時 on-demand render（訓練中由迴圈定期 render）
+    }
+
+    /// pinch 縮放檢視（scale>1 拉近）。與拖曳同樣節流；訓練中由訓練迴圈定期 render。
+    func zoomTrainedView(scale: Float) {
+        guard phase == .training else { return }
+        session?.applyZoom(scale)
+        if trainingComplete { requestOrbitRender() }
+    }
+
+    /// 雙指平移檢視（沿螢幕平面移動樞軸）。dx,dy 為螢幕點位移。
+    func panTrainedView(dx: Float, dy: Float) {
+        guard phase == .training else { return }
+        session?.applyPan(dx: dx, dy: dy)
+        if trainingComplete { requestOrbitRender() }
     }
 
     private func requestOrbitRender() {

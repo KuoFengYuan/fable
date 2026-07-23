@@ -96,10 +96,15 @@ nonisolated struct CaptureConfig: Sendable {
     /// 故最終高斯數約為此值的 1/3～1/2；峰值記憶體恆定＝此值（不再動態倍增/一次暴衝 → 不會 OOM）。
     /// 216k 在 iPhone Pro 穩定；記憶體有餘可調高換更多高斯（畫質），OOM 就調低。
     var trainMaxGaussians = 216_000
-    /// 訓練影像降採樣倍率（1＝原解析度；4＝1/4 邊長 → 記憶體/時間約 1/16）。
-    /// msplat 會把所有關鍵幀以 float32 常駐（全解析度 42 幀 ≈ 1.4GB），這是手機記憶體主因。
-    /// ⚠️ 全解析度很吃記憶體，若閃退請調回 2～3。
+    /// 訓練影像額外固定降採樣倍率（1＝不額外降；與 trainMaxImageDim 取較強的縮小）。
+    /// 一般維持 1.0，用 trainMaxImageDim 控制解析度即可。
     var trainDownscale: Float = 1.0
+    /// 訓練影像最長邊上限（px；0＝不限）。手機端 12MP 光柵化是 O(像素數) → 又慢又爆記憶體；
+    /// 業界標準（Inria 3DGS / gsplat / Scaniverse）皆限 ~1600，對 3DGS 成品畫質實質無損。
+    /// 掃描原圖與匯出的 COLMAP/PLY 全部維持原解析度，只有「訓練當下餵給光柵化的影像」受此上限。
+    /// 影像解碼一次後以 uint8 常駐（1600 全 42 幀約 244MB、有界、不再每輪重解碼）。
+    /// 想更快更省 → 1280/1024；想壓最高細節 → 調高（記憶體與時間相應上升）。
+    var trainMaxImageDim = 1600
     /// 每幾步更新一次即時預覽 render（越小越即時、越吃效能）
     var trainPreviewEvery = 50
     /// 熱狀態達 .serious 以上時暫停訓練（散熱保護，避免 thermal shutdown）

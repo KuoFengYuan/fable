@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <tuple>
+#include <cstdint>
 #include <unordered_map>
 #include "metal_tensor.hpp"
 
@@ -24,28 +25,28 @@ struct Camera {
     float camToWorld[16] = {};  // 4x4 row-major, camera-to-world (OpenGL: Y-up, Z-back)
     std::string filePath;
 
-    Image image;
-    std::unordered_map<int, Image> imagePyramids;
+    // 解碼一次後常駐的像素（RGB, uint8, 已套用 maxImageDim 上限與內參校正）。
+    // uint8 而非 float32：省 4×（1600px 全 42 幀約 244MB、有界），訓練用的 GPU tensor
+    // 由此常駐副本即時重建（不需重新解碼 JPEG）→ 串流不再每輪重解碼（解決變慢）。
+    std::vector<uint8_t> pixels;
     std::unordered_map<int, MTensor> mtensorImageCache;
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
-    // 影像串流：不預載全部關鍵幀（全解析度下全常駐是手機 OOM 主因），
-    // 逐幀 lazy load、用完由 LRU 釋放。datasetDownscale 供 lazy 重載使用；
-    // calibrated 確保 loadImage 的內參調整只做一次（重載時只讀像素、不再改內參）。
-    float datasetDownscale = 1.0f;
-    bool calibrated = false;
+    // 訓練解析度上限（最長邊 px；0=不限）。手機端 12MP 光柵化是 O(像素數) → 又慢又吃記憶體；
+    // 業界標準（Inria/gsplat/Scaniverse）皆限 ~1600。掃描原圖與匯出檔案不受此影響。
+    int maxImageDim = 0;
+    float datasetDownscale = 1.0f;   // 額外固定降採樣倍率（與 maxImageDim 取較強的縮小）
+    bool calibrated = false;         // 內參校正只做一次
 
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     void releaseImage() {
-        image = Image();
-        imagePyramids.clear();
-        // 關鍵：MTensor 無解構子（靠手動 reset() CFRelease，且 ARC=NO 下 __bridge_retained 為 no-op）。
-        // 直接 clear() 只移除 map、不釋放底層 MTLBuffer → 每次驅逐都洩漏 GPU 記憶體 → 仍 OOM。
-        // 必須先 reset() 每個 GPU tensor 才 clear。
+        // 只釋放 GPU tensor（LRU 驅逐）；常駐 uint8 pixels 保留 → 下次用到直接重建、免重解碼。
+        // MTensor 無解構子（靠手動 reset() CFRelease，ARC=NO 下 __bridge_retained 為 no-op）：
+        // 直接 clear() 只移除 map、不釋放 MTLBuffer → 每次驅逐洩漏 GPU 記憶體。必須先 reset()。
         for (auto& kv : mtensorImageCache) kv.second.reset();
         mtensorImageCache.clear();
     }
