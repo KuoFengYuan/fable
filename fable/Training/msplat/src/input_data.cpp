@@ -18,40 +18,45 @@ void Camera::loadImage(float downscaleFactor) {
     Image raw = imreadRGB(filePath);
     if (raw.empty()) return;
 
-    // If actual image dimensions differ from metadata, rescale intrinsics
-    if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
-        float sx = (float)raw.width / (float)width;
-        float sy = (float)raw.height / (float)height;
-        fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = raw.width; height = raw.height;
-    } else if (width == 0 || height == 0) {
-        width = raw.width; height = raw.height;
+    if (!calibrated) {
+        // 首次載入：校正內參 + 決定最終 width/height（只做一次；重載時不可重複調整）
+        if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
+            float sx = (float)raw.width / (float)width;
+            float sy = (float)raw.height / (float)height;
+            fx *= sx; fy *= sy; cx *= sx; cy *= sy;
+            width = raw.width; height = raw.height;
+        } else if (width == 0 || height == 0) {
+            width = raw.width; height = raw.height;
+        }
+        if (downscaleFactor > 1.0f) {
+            int newW = (int)(width / downscaleFactor);
+            int newH = (int)(height / downscaleFactor);
+            raw = resizeArea(raw, newW, newH);
+            float s = 1.0f / downscaleFactor;
+            fx *= s; fy *= s; cx *= s; cy *= s;
+            width = newW; height = newH;
+        }
+        if (hasDistortion()) {
+            auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+            raw = std::move(result.image);
+            fx = result.fx; fy = result.fy;
+            cx = result.cx; cy = result.cy;
+            width = result.width; height = result.height;
+            k1 = k2 = k3 = p1 = p2 = 0;
+        }
+        calibrated = true;
+        image = std::move(raw);
+        return;
     }
 
-    // Downscale
-    if (downscaleFactor > 1.0f) {
-        int newW = (int)(width / downscaleFactor);
-        int newH = (int)(height / downscaleFactor);
-        raw = resizeArea(raw, newW, newH);
-        float s = 1.0f / downscaleFactor;
-        fx *= s; fy *= s; cx *= s; cy *= s;
-        width = newW; height = newH;
-    }
-
-    // Undistort if needed
-    if (hasDistortion()) {
-        auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
-        raw = std::move(result.image);
-        fx = result.fx; fy = result.fy;
-        cx = result.cx; cy = result.cy;
-        width = result.width; height = result.height;
-        k1 = k2 = k3 = p1 = p2 = 0;
-    }
-
+    // 串流重載（已校正）：只讀像素、縮到最終 (width,height)。內參不再改。
+    // 畸變相機不走此路（其 undistort 裁切無法重現）——見 Dataset/LRU 不驅逐畸變相機。
+    if (raw.width != width || raw.height != height) raw = resizeArea(raw, width, height);
     image = std::move(raw);
 }
 
 Image Camera::getImage(int downscaleFactor) {
+    if (image.empty()) loadImage(datasetDownscale);   // 串流：需要時才載入
     if (downscaleFactor <= 1) return image;
 
     auto it = imagePyramids.find(downscaleFactor);

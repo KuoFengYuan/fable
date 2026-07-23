@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <numeric>
 #include <random>
+#include <deque>
 
 namespace msplat {
 
@@ -29,8 +30,10 @@ Dataset::Dataset(const std::string& path, float downscaleFactor,
 {
     impl->data = inputDataFromX(path);
 
+    // 影像串流：不預載全部關鍵幀（全解析度下全常駐是手機 OOM 主因）。
+    // 只記錄 downscale，訓練時逐幀 lazy load、由 LRU 釋放（見 Trainer::step）。
     for (auto& cam : impl->data.cameras)
-        cam.loadImage(downscaleFactor);
+        cam.datasetDownscale = downscaleFactor;
 
     if (evalMode) {
         auto split = impl->data.splitTrainTest(testEvery);
@@ -81,6 +84,7 @@ struct Trainer::Impl {
     std::vector<size_t> camIndices;
     size_t camIterPos = 0;
     std::mt19937 rng{42};
+    std::deque<size_t> lru;   // 影像串流：最近使用的相機（超出視窗即釋放影像）
 
     void shuffleCameras() {
         std::shuffle(camIndices.begin(), camIndices.end(), rng);
@@ -122,6 +126,19 @@ Trainer::~Trainer() = default;
 Stats Trainer::step() {
     impl->currentStep++;
     size_t camIdx = impl->nextCamera();
+
+    // 影像串流 LRU：只保留最近 kImageWindow 個相機的影像常駐，其餘釋放
+    // （全解析度下全部常駐 ~數 GB 是 OOM 主因）。驅逐的是數步前用過的 → GPU 早已用完，安全。
+    // 畸變相機不驅逐（其 undistort 裁切重載無法重現；fable 為 PINHOLE 無此問題）。
+    constexpr size_t kImageWindow = 6;
+    impl->lru.push_back(camIdx);
+    if (impl->lru.size() > kImageWindow) {
+        size_t old = impl->lru.front();
+        impl->lru.pop_front();
+        if (old != camIdx && !impl->ds->trainCams[old].hasDistortion())
+            impl->ds->trainCams[old].releaseImage();
+    }
+
     Camera& cam = impl->ds->trainCams[camIdx];
 
     int ds = impl->model->getDownscaleFactor(impl->currentStep);
