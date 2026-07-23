@@ -381,6 +381,13 @@ final class CaptureController: NSObject, ObservableObject {
         if trainingComplete { requestOrbitRender() } // 完成後：即時 on-demand render（訓練中由迴圈定期 render）
     }
 
+    /// pinch 縮放檢視（scale>1 拉近）。與拖曳同樣節流；訓練中由訓練迴圈定期 render。
+    func zoomTrainedView(scale: Float) {
+        guard phase == .training else { return }
+        session?.applyZoom(scale)
+        if trainingComplete { requestOrbitRender() }
+    }
+
     private func requestOrbitRender() {
         guard let session, phase == .training, trainingComplete else { return }
         if orbitInFlight { orbitPending = true; return }

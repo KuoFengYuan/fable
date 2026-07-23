@@ -30,7 +30,8 @@ struct CaptureView: View {
                     onOrbit: { d in
                         controller.orbitTrainedView(deltaX: Float(d.width),
                                                     deltaY: Float(d.height))
-                    })
+                    },
+                    onZoom: { s in controller.zoomTrainedView(scale: Float(s)) })
                     .ignoresSafeArea()
             }
             HUDOverlay(controller: controller)
@@ -81,8 +82,10 @@ private struct TrainingPreviewView: View {
     let image: UIImage?
     var interactive: Bool = false
     var onOrbit: (CGSize) -> Void = { _ in }
+    var onZoom: (CGFloat) -> Void = { _ in }
 
     @State private var lastDrag: CGSize = .zero
+    @State private var lastMagnification: CGFloat = 1.0
 
     var body: some View {
         ZStack {
@@ -106,6 +109,7 @@ private struct TrainingPreviewView: View {
         }
         .contentShape(Rectangle())
         .gesture(interactive ? dragGesture : nil)
+        .simultaneousGesture(interactive ? magnifyGesture : nil)
     }
 
     private var dragGesture: some Gesture {
@@ -117,5 +121,16 @@ private struct TrainingPreviewView: View {
                 onOrbit(CGSize(width: dx, height: dy))
             }
             .onEnded { _ in lastDrag = .zero }
+    }
+
+    // 雙指 pinch 縮放：value 為手勢起始以來的累積比例 → 取增量比例回傳（>1 拉近）
+    private var magnifyGesture: some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                let factor = value / lastMagnification
+                lastMagnification = value
+                if factor.isFinite, factor > 0 { onZoom(factor) }
+            }
+            .onEnded { _ in lastMagnification = 1.0 }
     }
 }
