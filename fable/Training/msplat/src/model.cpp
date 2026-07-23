@@ -121,7 +121,9 @@ void Model::setupOptimizers(){
 
 
     num_active = means.size(0);
-    buf_capacity = num_active * 4;
+    // 固定預配置到 maxGaussians（若設定）：訓練全程 buf_capacity 不變 → 峰值記憶體確定，
+    // 消除動態倍增（44k→88k→…）與 grow 時 old+new 併存的暫時尖峰（on-device OOM 主因）。
+    buf_capacity = (maxGaussians > 0) ? std::max((int)num_active, maxGaussians) : (int)(num_active * 4);
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
         auto shape = param.shape();
         shape[0] = buf_capacity;
@@ -239,9 +241,11 @@ void Model::afterTrain(int step){
     if (step % refineEvery == 0 && step > warmupLength){
         int resetInterval = resetAlphaEvery * refineEvery;
         bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
-        // On-device memory cap: halt densification once the gaussian budget is reached.
-        // Bounds peak memory on iPhone (upstream grows unbounded). 0 = unlimited.
-        if (maxGaussians > 0 && num_active >= maxGaussians) doDensification = false;
+        // 記憶體硬界（數學根治）：densify 內部最壞會產生 3×num_active 顆並需 3N 的緩衝
+        // （見 msplat_densify 的 worst_case=3N 與 assert(3N<=buf_capacity)）。
+        // 只在「3N 不超過固定 buf_capacity」時才 densify → 這一趟不會要求成長、也不會一次暴衝，
+        // 峰值記憶體恆等於 buf_capacity（確定、不隨場景爆掉）。0 = 不限。
+        if (maxGaussians > 0 && 3 * num_active > buf_capacity) doDensification = false;
 
         if (doDensification){
             int numPointsBefore = num_active;
