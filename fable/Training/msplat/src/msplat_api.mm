@@ -25,7 +25,7 @@ struct Dataset::Impl {
 };
 
 Dataset::Dataset(const std::string& path, float downscaleFactor, int maxImageDim,
-                 bool evalMode, int testEvery)
+                 int maxTrainFrames, bool evalMode, int testEvery)
     : impl(std::make_unique<Impl>())
 {
     impl->data = inputDataFromX(path);
@@ -44,6 +44,18 @@ Dataset::Dataset(const std::string& path, float downscaleFactor, int maxImageDim
     } else {
         auto t = impl->data.getCameras(false);
         impl->trainCams = std::get<0>(t);
+    }
+
+    // 幀數上限：訓練每幀以 uint8 常駐（幀數 × ~5.8MB@1600）是記憶體大宗，長掃描數百幀會 OOM。
+    // 超過時沿拍攝順序（≈軌跡）「均勻抽樣」到上限 —— 保留視角分佈、確定性、記憶體有界。
+    if (maxTrainFrames > 0 && (int)impl->trainCams.size() > maxTrainFrames) {
+        const int total = (int)impl->trainCams.size();
+        std::vector<Camera> sub;
+        sub.reserve(maxTrainFrames);
+        for (int i = 0; i < maxTrainFrames; i++)
+            sub.push_back(impl->trainCams[(int)((long long)i * total / maxTrainFrames)]);
+        fprintf(stderr, "Frame cap: %d -> %d train frames (uniform)\n", total, maxTrainFrames);
+        impl->trainCams = std::move(sub);
     }
 }
 
@@ -376,8 +388,8 @@ static msplat::Config configFromC(MsplatConfig c) {
 }
 
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor, int maxImageDim,
-                                     bool evalMode, int testEvery) {
-    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, maxImageDim, evalMode, testEvery);
+                                     int maxTrainFrames, bool evalMode, int testEvery) {
+    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, maxImageDim, maxTrainFrames, evalMode, testEvery);
     return static_cast<MsplatDataset>(ds);
 }
 

@@ -36,6 +36,7 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var keyframeCount = 0
     @Published var pointCount = 0
     @Published var coverage: Double = 0
+    @Published var coverageHint: String?   // 缺角提醒：往哪補掃（物件模式圓頂）
     @Published var exportedZip: URL?
     @Published var statusText: String?
     @Published var domePlaced = false
@@ -103,6 +104,7 @@ final class CaptureController: NSObject, ObservableObject {
         let viz = CoverageVisualizer(config: config)
         viz.attach(to: arView.scene)
         viz.onCoverageChanged = { [weak self] c in self?.coverage = c }
+        viz.onGuidanceChanged = { [weak self] hint in self?.coverageHint = hint }
         visualizer = viz
 
         runSession()
@@ -349,7 +351,7 @@ final class CaptureController: NSObject, ObservableObject {
                 colmapDir: dir.path, metallib: metallib,
                 iterations: cfg.trainIterations, shDegree: cfg.trainSHDegree,
                 maxGaussians: cfg.trainMaxGaussians, downscale: cfg.trainDownscale,
-                maxImageDim: cfg.trainMaxImageDim,
+                maxImageDim: cfg.trainMaxImageDim, maxTrainFrames: cfg.trainMaxFrames,
                 previewEvery: cfg.trainPreviewEvery, wantPreview: wantPreview,
                 outputPLY: plyURL.path,
                 isCancelled: { cancel.isCancelled },
@@ -477,6 +479,7 @@ final class CaptureController: NSObject, ObservableObject {
         keyframeCount = 0
         pointCount = 0
         coverage = 0
+        coverageHint = nil
         exportProgress = 0
         domePlaced = false
         reviewPoints = []
@@ -621,11 +624,19 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             visualizer?.syncTileTransforms(current)
         }
 
-        // 點雲連續融合（~10Hz，與快門解耦）：只收姿態可靠且清晰的幀，
-        // 模糊幀的姿態-深度錯位是點雲殘影的另一主要來源
+        // 點雲連續融合（~10Hz，與快門解耦）：只收「姿態可靠 + 清晰 + 相機夠穩」的幀。
+        // 追蹤丟失/模糊（captureBlocked, blurPixels）+ 相機速度閘門（angular/linear）三管齊下：
+        // 移動過快時姿態延遲/誤差大 → 深度投影到錯位的世界座標 → 點不貼合表面且出殘影，故直接跳過。
         if frameCounter % config.previewFrameInterval == 0,
-           !a.captureBlocked, a.blurPixels <= config.previewMaxBlurPixels {
+           !a.captureBlocked, a.blurPixels <= config.previewMaxBlurPixels,
+           a.angularSpeedRadS <= config.previewMaxAngularSpeedRadS,
+           a.linearSpeedMS <= config.previewMaxLinearSpeedMS {
             integratePreview(frame, blurPixels: a.blurPixels)
+        }
+
+        // 缺角提醒（物件模式圓頂）：每 ~12 幀（~5Hz）更新「離你最近的缺角在哪、往哪補」
+        if let viz = visualizer, viz.hasDome, frameCounter % 12 == 0 {
+            viz.updateGuidance(pose: frame.camera.transform)
         }
 
         guard a.allowCapture else { return }
