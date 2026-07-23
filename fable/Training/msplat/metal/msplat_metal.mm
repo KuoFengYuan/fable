@@ -471,6 +471,11 @@ void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
 }
 
+// 供相機姿態優化在 CPU 端讀取上一次 backward 的世界系 mean 梯度（shared storage；須先 msplat_gpu_sync）。
+const float* msplat_v_mean3d_data() {
+    return g_tcache.v_mean3d.defined() ? g_tcache.v_mean3d.data<float>() : nullptr;
+}
+
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
 // When compute_loss=false, gt/window2d/ssim_weight are ignored.
 static void forward_pipeline(

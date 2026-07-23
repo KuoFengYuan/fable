@@ -34,6 +34,14 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
+    // 相機姿態優化（SE3 左擾動於 world→cam，Adam）。viewCorr = 修正後的 world→cam（4x4 row-major）；
+    // 首次由 prepareCam 以 base viewmat 初始化，之後每步左乘 exp(Δδ̂) 精修。見 Model::cameraPoseStep。
+    bool  poseInit = false;
+    float viewCorr[16] = {};
+    float poseAdamM[6] = {};   // (ω, τ) Adam 一階動量
+    float poseAdamV[6] = {};   // Adam 二階動量
+    int   poseAdamStep = 0;
+
     // 訓練解析度上限（最長邊 px；0=不限）。手機端 12MP 光柵化是 O(像素數) → 又慢又吃記憶體；
     // 業界標準（Inria/gsplat/Scaniverse）皆限 ~1600。掃描原圖與匯出檔案不受此影響。
     int maxImageDim = 0;

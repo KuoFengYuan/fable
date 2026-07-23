@@ -110,6 +110,12 @@ struct Model{
   void mcmcCopyGaussian(int dst, int src);  // 複製全部參數 src→dst
   void mcmcResetAdam(int idx);              // 清零該 slot 的 Adam 動量（6 群）
 
+  // ── 相機姿態優化（SO3×R3 / SE3 左擾動，per-camera Adam）──
+  // ARKit 姿態非完美；訓練中聯合精修每台相機的 6-DOF 修正 → 銳化重建。預設開。
+  // 梯度由 backward 的世界系 v_mean3d 在 CPU 端組裝（g_cam=W·v_mean3d；grad_τ=Σg_cam、grad_ω=Σp_cam×g_cam）。
+  bool useCameraOpt = true;
+  void cameraPoseStep(Camera& cam, int step);
+
   float scale;
   float translation[3] = {};
 };
