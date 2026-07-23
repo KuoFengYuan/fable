@@ -92,9 +92,10 @@ nonisolated struct CaptureConfig: Sendable {
     var trainIterations = 4000
     /// SH degree（0＝僅漫反射、最省記憶體；1＝基本視角相依高光）。手機建議 0–1
     var trainSHDegree = 1
-    /// gaussian 數硬上限（記憶體天花板）：densify 到頂即停。注意 densify 過程 ensureCapacity 會
-    /// 暫時配置到 ~3× 目前數量，故峰值記憶體 ≈ 3× 此值的緩衝。12 萬在手機上是穩定起點。
-    var trainMaxGaussians = 120_000
+    /// gaussian 緩衝容量（固定預配置＝峰值記憶體上限，slot 數）。densify 只在「3×當前數 ≤ 此值」時進行，
+    /// 故最終高斯數約為此值的 1/3～1/2；峰值記憶體恆定＝此值（不再動態倍增/一次暴衝 → 不會 OOM）。
+    /// 216k 在 iPhone Pro 穩定；記憶體有餘可調高換更多高斯（畫質），OOM 就調低。
+    var trainMaxGaussians = 216_000
     /// 訓練影像降採樣倍率（1＝原解析度；4＝1/4 邊長 → 記憶體/時間約 1/16）。
     /// msplat 會把所有關鍵幀以 float32 常駐（全解析度 42 幀 ≈ 1.4GB），這是手機記憶體主因。
     /// ⚠️ 全解析度很吃記憶體，若閃退請調回 2～3。
