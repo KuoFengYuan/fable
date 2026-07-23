@@ -1,0 +1,178 @@
+//
+//  PointCloudFusion.swift
+//  fable — 錨點相對的空間磚化加權融合格（防漂移殘影核心）
+//
+//  刻意不依賴 ARKit：純 simd 幾何，可在 macOS 上以合成漂移做單元驗證
+//  （見 tools/check harness 的 no-ghost 測試）。
+//
+
+import Foundation
+import simd
+
+/// 一塊空間磚的渲染資料（actor 端打包完成，主執行緒只做 O(1) 包裝）。
+/// positions 為「錨點局部座標」，渲染時由節點變換（= 該磚錨點當下變換）帶回世界。
+nonisolated struct TileRenderData: Sendable {
+    let key: Int64
+    let center: SIMD3<Float>
+    let count: Int
+    let positions: Data   // float3（錨點局部座標）
+    let colors: Data      // float3（0-1）
+    let indices: Data     // int32
+}
+
+// MARK: - 錨點相對的空間磚化加權融合格
+//
+// 每個空間磚綁定一個 ARAnchor。cell 的位置存在「該磚錨點的局部座標系」，
+// 融合、去重、渲染全部在局部系進行：
+//   - 世界座標會因 ARKit 漂移/重定位而變動，但「相機相對於鄰近錨點」的局部關係不變，
+//     故同一實體表面永遠映到同一局部 voxel → 重掃時去重合併，不再產生第二份點（殘影）。
+//   - 錨點被 ARKit 修正時，整磚點雲隨節點剛體移動，貼緊實體表面。
+// 換算需要錨點「當下」的變換，由主執行緒每幀擷取後隨封包傳入。
+nonisolated struct TiledFusedGrid {
+
+    struct Tile {
+        var cells: [Int64: FusedVoxelGrid.Cell] = [:]   // 鍵為「局部」voxel
+        var originLatest: simd_float4x4                 // 最近一次換算所用的錨點變換
+    }
+
+    private(set) var tiles: [Int64: Tile] = [:]
+    private var dirtyTiles: Set<Int64> = []
+    private var pendingAnchors: [Int64] = []            // 尚未建立 ARAnchor 的新磚
+    private(set) var voxelSize: Float
+    let tileSize: Float
+    private let maxCells: Int
+    private let weightCap: Float = 8
+    private var totalCells = 0
+
+    init(voxelSize: Float, tileSize: Float, maxCells: Int) {
+        self.voxelSize = voxelSize
+        self.tileSize = tileSize
+        self.maxCells = maxCells
+    }
+
+    var count: Int { totalCells }
+
+    /// anchorTransforms：主執行緒傳入的各磚錨點「當下」變換（漂移修正後）。
+    /// 缺席（新磚尚未建錨）時退回 translate(磚中心)，與稍後建立的錨點初始值一致。
+    mutating func insert(_ candidates: [CloudPoint], anchorTransforms: [Int64: simd_float4x4]) {
+        for pt in candidates {
+            let world = SIMD3<Float>(pt.x, pt.y, pt.z)
+            guard let tileKey = PointCloudMath.voxelKey(world, size: tileSize) else { continue }
+
+            let origin = anchorTransforms[tileKey] ?? Self.translation(tileCenter(tileKey))
+            if tiles[tileKey] == nil {
+                tiles[tileKey] = Tile(originLatest: origin)
+                pendingAnchors.append(tileKey)
+            }
+            tiles[tileKey]!.originLatest = origin
+
+            // 世界 → 錨點局部（剛體逆）：漂移下對同一表面穩定
+            let localH = origin.inverse * SIMD4<Float>(world.x, world.y, world.z, 1)
+            let local = SIMD3<Float>(localH.x, localH.y, localH.z)
+            guard let cellKey = PointCloudMath.voxelKey(local, size: voxelSize) else { continue }
+
+            let rgb = SIMD3<Float>(Float(pt.r), Float(pt.g), Float(pt.b))
+            if var cell = tiles[tileKey]!.cells[cellKey] {
+                let w = max(0.01, pt.score)
+                let total = cell.weight + w
+                cell.mean += (local - cell.mean) * (w / total)
+                cell.color += (rgb - cell.color) * (w / total)
+                cell.weight = min(total, weightCap)
+                cell.bestScore = max(cell.bestScore, pt.score)
+                tiles[tileKey]!.cells[cellKey] = cell
+            } else {
+                tiles[tileKey]!.cells[cellKey] = FusedVoxelGrid.Cell(
+                    mean: local, color: rgb, weight: max(0.01, pt.score), bestScore: pt.score)
+                totalCells += 1
+                if totalCells >= maxCells { coarsen() }
+            }
+            dirtyTiles.insert(tileKey)
+        }
+    }
+
+    /// 觸頂自動粗化：voxel ×2、各磚局部 cell 加權合併 —— 記憶體有界、不停止收點
+    private mutating func coarsen() {
+        voxelSize *= 2
+        totalCells = 0
+        for (tileKey, tile) in tiles {
+            var merged: [Int64: FusedVoxelGrid.Cell] = Dictionary(minimumCapacity: tile.cells.count / 4)
+            for cell in tile.cells.values {
+                guard let key = PointCloudMath.voxelKey(cell.mean, size: voxelSize) else { continue }
+                if var m = merged[key] {
+                    let total = m.weight + cell.weight
+                    m.mean += (cell.mean - m.mean) * (cell.weight / total)
+                    m.color += (cell.color - m.color) * (cell.weight / total)
+                    m.weight = min(total, weightCap)
+                    m.bestScore = max(m.bestScore, cell.bestScore)
+                    merged[key] = m
+                } else {
+                    merged[key] = cell
+                }
+            }
+            tiles[tileKey]!.cells = merged
+            totalCells += merged.count
+            dirtyTiles.insert(tileKey)
+        }
+        print("[PointCloud] 自動粗化 → voxel \(voxelSize * 100)cm，剩 \(totalCells) 點")
+    }
+
+    mutating func popDirtyTiles(limit: Int) -> [Int64] {
+        var out: [Int64] = []
+        while out.count < limit, let key = dirtyTiles.popFirst() { out.append(key) }
+        return out
+    }
+
+    /// 取走待建錨磚（key + 世界中心），主執行緒建 ARAnchor
+    mutating func takePendingAnchors() -> [(Int64, SIMD3<Float>)] {
+        let out = pendingAnchors.map { ($0, tileCenter($0)) }
+        pendingAnchors.removeAll(keepingCapacity: true)
+        return out
+    }
+
+    /// 打包整磚為 GPU-ready Data（位置即錨點局部座標，渲染時由節點變換帶回世界）
+    func tileRenderData(_ tileKey: Int64) -> TileRenderData? {
+        guard let tile = tiles[tileKey], !tile.cells.isEmpty else { return nil }
+        var positions = [Float](); positions.reserveCapacity(tile.cells.count * 3)
+        var colors = [Float](); colors.reserveCapacity(tile.cells.count * 3)
+        var indices = [Int32](); indices.reserveCapacity(tile.cells.count)
+        var n: Int32 = 0
+        for c in tile.cells.values {
+            positions.append(c.mean.x); positions.append(c.mean.y); positions.append(c.mean.z)
+            colors.append(min(1, max(0, c.color.x / 255)))
+            colors.append(min(1, max(0, c.color.y / 255)))
+            colors.append(min(1, max(0, c.color.z / 255)))
+            indices.append(n); n += 1
+        }
+        guard n > 0 else { return nil }
+        return TileRenderData(key: tileKey, center: tileCenter(tileKey), count: Int(n),
+                              positions: positions.withUnsafeBufferPointer { Data(buffer: $0) },
+                              colors: colors.withUnsafeBufferPointer { Data(buffer: $0) },
+                              indices: indices.withUnsafeBufferPointer { Data(buffer: $0) })
+    }
+
+    func tileCenter(_ tileKey: Int64) -> SIMD3<Float> {
+        PointCloudMath.cellCenter(tileKey, size: tileSize)
+    }
+
+    /// 匯出（無 LiDAR 備援用）：局部 → 世界（乘最近錨點變換）後分層擇優下採樣
+    func exportPoints(target: Int) -> [CloudPoint] {
+        func c8(_ f: Float) -> UInt8 { UInt8(min(255, max(0, f))) }
+        var points: [CloudPoint] = []
+        points.reserveCapacity(totalCells)
+        for tile in tiles.values {
+            for c in tile.cells.values {
+                let w = tile.originLatest * SIMD4<Float>(c.mean.x, c.mean.y, c.mean.z, 1)
+                points.append(CloudPoint(x: w.x, y: w.y, z: w.z,
+                                         r: c8(c.color.x), g: c8(c.color.y), b: c8(c.color.z),
+                                         score: c.bestScore * min(1, c.weight / 1.5)))
+            }
+        }
+        return PointCloudMath.stratifiedBest(points, startCell: voxelSize * 2, target: target)
+    }
+
+    private static func translation(_ t: SIMD3<Float>) -> simd_float4x4 {
+        var m = matrix_identity_float4x4
+        m.columns.3 = SIMD4<Float>(t.x, t.y, t.z, 1)
+        return m
+    }
+}

@@ -1,0 +1,4 @@
+numpy>=1.24
+Pillow>=10.0
+# 選用：validate_dataset.py --plot 軌跡視覺化
+# matplotlib>=3.8

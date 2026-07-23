@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# Python (tools/)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 掃描資料 / 訓練輸出（裝置端產物，不入庫）
+scans/
+*.zip
+tools/**/output/
+
+# 編輯器
+.idea/
+*.swp
