@@ -288,6 +288,9 @@ void Trainer::renderFromPoseIntrinsics(const float camToWorld[16], float fx, flo
     // 也用完整 SH。否則輸出會是 width/sf×height/sf，與呼叫端 buffer 尺寸不符。
     MTensor rgb = impl->model->render(cam, 1 << 20);
     msplat_gpu_sync();
+    // 本地 cam 的快取矩陣（prepareCam 內 gpu_empty 配置）無解構子 → 手動 reset() 免每次預覽洩漏
+    cam.cachedViewMat.reset();
+    cam.cachedProjViewMat.reset();
 
     int h = (int)rgb.size(0), w = (int)rgb.size(1);
     *outWidth = w; *outHeight = h;
