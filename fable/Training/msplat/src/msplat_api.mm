@@ -264,7 +264,9 @@ void Trainer::renderFromPoseIntrinsics(const float camToWorld[16], float fx, flo
     cam.cachedViewMat = MTensor();
     cam.cachedProjViewMat = MTensor();
 
-    MTensor rgb = impl->model->render(cam, impl->currentStep);
+    // 用大 step 強制全解析度（避開訓練 coarse-to-fine 降採樣）：輸出尺寸＝指定 width×height，
+    // 也用完整 SH。否則輸出會是 width/sf×height/sf，與呼叫端 buffer 尺寸不符。
+    MTensor rgb = impl->model->render(cam, 1 << 20);
     msplat_gpu_sync();
 
     int h = (int)rgb.size(0), w = (int)rgb.size(1);

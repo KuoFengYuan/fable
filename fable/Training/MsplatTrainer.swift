@@ -276,8 +276,9 @@ nonisolated final class MsplatSession: @unchecked Sendable {
         baseUp = SIMD3<Float>(0, -1, 0)   // 世界垂直（重力）；若顛倒改 (0, 1, 0)
         orbitLock.lock(); orbitQuat = simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0)); orbitLock.unlock()
 
-        // 直式內參：垂直 FOV 60°、填滿直式螢幕
-        portraitW = 720; portraitH = 1560
+        // 直式內參：垂直 FOV 60°。解析度刻意小（240×520）—— 訓練中 render 疊在訓練上，
+        // 大尺寸會 OOM；小尺寸縮放到螢幕仍夠看。穩定後可再往上調。
+        portraitW = 240; portraitH = 520
         let fovY: Float = 60 * .pi / 180
         portraitFy = 0.5 * Float(portraitH) / tan(fovY / 2)
         portraitFx = portraitFy
