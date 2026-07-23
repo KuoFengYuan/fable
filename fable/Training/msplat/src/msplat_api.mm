@@ -117,6 +117,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.maxGaussians,
         config.bgColor
     );
+    impl->model->useMcmc = config.useMcmc;   // MCMC 密集化（預設開）
 
     impl->camIndices.resize(impl->ds->trainCams.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
@@ -361,6 +362,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.maxGaussians = c.maxGaussians;
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;
+    cfg.useMcmc = c.useMcmc;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));
     return cfg;
 }
