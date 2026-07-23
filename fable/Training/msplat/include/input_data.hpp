@@ -40,7 +40,15 @@ struct Camera {
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
-    void releaseImage() { image = Image(); imagePyramids.clear(); mtensorImageCache.clear(); }
+    void releaseImage() {
+        image = Image();
+        imagePyramids.clear();
+        // 關鍵：MTensor 無解構子（靠手動 reset() CFRelease，且 ARC=NO 下 __bridge_retained 為 no-op）。
+        // 直接 clear() 只移除 map、不釋放底層 MTLBuffer → 每次驅逐都洩漏 GPU 記憶體 → 仍 OOM。
+        // 必須先 reset() 每個 GPU tensor 才 clear。
+        for (auto& kv : mtensorImageCache) kv.second.reset();
+        mtensorImageCache.clear();
+    }
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
 
