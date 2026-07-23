@@ -403,8 +403,13 @@ void msplat_trainer_destroy(MsplatTrainer t) {
 }
 
 MsplatStats msplat_trainer_step(MsplatTrainer t) {
-    auto stats = static_cast<msplat::Trainer*>(t)->step();
-    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    // 每步一個 autorelease pool：Metal 的 command buffer / encoder 是 autoreleased 物件，
+    // 訓練迴圈在單一 dispatch block 內、外層 pool 要到整輪結束才排空 → 每步數個 command buffer
+    // 物件累積 → 記憶體線性爬 + 壓力置換變慢。當步排空 → 峰值有界、速度回穩。
+    @autoreleasepool {
+        auto stats = static_cast<msplat::Trainer*>(t)->step();
+        return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    }
 }
 
 void msplat_trainer_train(MsplatTrainer t) {
@@ -412,37 +417,48 @@ void msplat_trainer_train(MsplatTrainer t) {
 }
 
 MsplatEvalMetrics msplat_trainer_evaluate(MsplatTrainer t) {
-    auto m = static_cast<msplat::Trainer*>(t)->evaluate();
-    return MsplatEvalMetrics{m.psnr, m.ssim, m.l1, m.numTest, m.numGaussians};
+    @autoreleasepool {
+        auto m = static_cast<msplat::Trainer*>(t)->evaluate();
+        return MsplatEvalMetrics{m.psnr, m.ssim, m.l1, m.numTest, m.numGaussians};
+    }
 }
 
 MsplatPixelBuffer msplat_trainer_render(MsplatTrainer t, int cameraIndex, bool useTest) {
-    auto buf = static_cast<msplat::Trainer*>(t)->render(cameraIndex, useTest);
-    MsplatPixelBuffer result{buf.data, buf.width, buf.height};
-    buf.data = nullptr; // Transfer ownership to caller
-    return result;
+    @autoreleasepool {
+        auto buf = static_cast<msplat::Trainer*>(t)->render(cameraIndex, useTest);
+        MsplatPixelBuffer result{buf.data, buf.width, buf.height};
+        buf.data = nullptr; // Transfer ownership to caller
+        return result;
+    }
 }
 
 MsplatPixelBuffer msplat_trainer_render_pose(MsplatTrainer t, const float camToWorld[16], int refCameraIndex) {
-    auto buf = static_cast<msplat::Trainer*>(t)->renderFromPose(camToWorld, refCameraIndex);
-    MsplatPixelBuffer result{buf.data, buf.width, buf.height};
-    buf.data = nullptr;
-    return result;
+    @autoreleasepool {
+        auto buf = static_cast<msplat::Trainer*>(t)->renderFromPose(camToWorld, refCameraIndex);
+        MsplatPixelBuffer result{buf.data, buf.width, buf.height};
+        buf.data = nullptr;
+        return result;
+    }
 }
 
 void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorld[16],
                                       int refCameraIndex, uint8_t* outRGBA,
                                       int* outWidth, int* outHeight) {
-    static_cast<msplat::Trainer*>(t)->renderFromPoseToBuffer(
-        camToWorld, refCameraIndex, outRGBA, outWidth, outHeight);
+    @autoreleasepool {
+        static_cast<msplat::Trainer*>(t)->renderFromPoseToBuffer(
+            camToWorld, refCameraIndex, outRGBA, outWidth, outHeight);
+    }
 }
 
 void msplat_trainer_render_pose_intrinsics(MsplatTrainer t, const float camToWorld[16],
                                       float fx, float fy, float cx, float cy,
                                       int width, int height, uint8_t* outRGBA,
                                       int* outWidth, int* outHeight) {
-    static_cast<msplat::Trainer*>(t)->renderFromPoseIntrinsics(
-        camToWorld, fx, fy, cx, cy, width, height, outRGBA, outWidth, outHeight);
+    // 預覽 render 每 previewEvery 步呼叫一次、互動檢視也走這裡：同樣需 pool 排空 command buffer
+    @autoreleasepool {
+        static_cast<msplat::Trainer*>(t)->renderFromPoseIntrinsics(
+            camToWorld, fx, fy, cx, cy, width, height, outRGBA, outWidth, outHeight);
+    }
 }
 
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path) {

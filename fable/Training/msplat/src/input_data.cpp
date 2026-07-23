@@ -74,17 +74,45 @@ void Camera::loadImage(float downscaleFactor) {
 Image Camera::getImage(int downscaleFactor) {
     if (pixels.empty()) loadImage(datasetDownscale);   // 串流：首用時解碼，之後常駐
 
-    // uint8 常駐副本 → float 全（已上限）解析度
-    Image full;
-    full.width = width; full.height = height;
-    size_t n = (size_t)width * height * 3;
-    full.data.resize(n);
-    for (size_t i = 0; i < n; i++) full.data[i] = pixels[i] * (1.0f / 255.0f);
+    const int ds = downscaleFactor > 1 ? downscaleFactor : 1;
 
-    if (downscaleFactor <= 1) return full;
-    int newW = width / downscaleFactor;
-    int newH = height / downscaleFactor;
-    return resizeArea(full, newW, newH);   // coarse-to-fine 降採樣（由常駐副本，非重解碼）
+    if (ds == 1) {
+        // 直接 uint8→float（免中介全圖再拷貝）
+        Image out; out.width = width; out.height = height;
+        size_t n = (size_t)width * height * 3;
+        out.data.resize(n);
+        const uint8_t* s = pixels.data();
+        float* d = out.data.data();
+        for (size_t i = 0; i < n; i++) d[i] = s[i] * (1.0f / 255.0f);
+        return out;
+    }
+
+    // ds>1：由常駐 uint8「直接」box-filter 降採樣到 (tw,th) 的 float，
+    // 免先配置整張 23MB float 再 resize（那是每步的 CPU 與記憶體 churn 主因）。
+    // coarse-to-fine 的 ds 皆為 2 的次方 → 整數框、等同 area 平均。
+    const int tw = width / ds, th = height / ds;
+    Image out; out.width = tw; out.height = th;
+    out.data.resize((size_t)tw * th * 3);
+    for (int dy = 0; dy < th; dy++) {
+        const int iy0 = dy * ds;
+        const int iy1 = std::min(iy0 + ds, height);
+        for (int dx = 0; dx < tw; dx++) {
+            const int ix0 = dx * ds;
+            const int ix1 = std::min(ix0 + ds, width);
+            float a0 = 0, a1 = 0, a2 = 0; int cnt = 0;
+            for (int iy = iy0; iy < iy1; iy++) {
+                const uint8_t* row = &pixels[((size_t)iy * width + ix0) * 3];
+                for (int ix = ix0; ix < ix1; ix++) {
+                    a0 += row[0]; a1 += row[1]; a2 += row[2];
+                    row += 3; cnt++;
+                }
+            }
+            const float inv = 1.0f / (255.0f * (cnt > 0 ? cnt : 1));
+            float* o = &out.data[((size_t)dy * tw + dx) * 3];
+            o[0] = a0 * inv; o[1] = a1 * inv; o[2] = a2 * inv;
+        }
+    }
+    return out;
 }
 
 MTensor& Camera::getGPUImage(int downscaleFactor) {
