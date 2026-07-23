@@ -116,8 +116,151 @@ Model::Model(const InputData &inputData, int numCameras,
     setupOptimizers();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MCMC 密集化（3DGS-MCMC, arXiv:2404.09591）；relocation 公式對齊 gsplat compute_relocation。
+// msplat 的參數緩衝為 MTLStorageModeShared → 直接在 CPU 端操作（免新寫 Metal kernel，低風險）。
+// ─────────────────────────────────────────────────────────────────────────────
+static constexpr int   kMcmcNMax    = 51;      // 二項式表大小 / ratio 上限
+static constexpr float kMcmcMinOpac = 0.005f;  // 死高斯門檻（sigmoid 後）
+static constexpr float kMcmcNoiseLr = 5e5f;    // SGLD 噪聲尺度（× 當前 means lr）
+static constexpr float kMcmcNoiseT  = 0.005f;  // 噪聲 opacity 閘門轉折點
+static constexpr float kMcmcNoiseK  = 100.0f;  // 噪聲 opacity 閘門銳度
+static constexpr float kMcmcGrowRate= 1.12f;   // 每 refine 成長倍率（手機短排程較 gsplat 5% 積極）
+
+static inline float mcmcSigmoid(float x){ return 1.0f/(1.0f+std::exp(-x)); }
+static inline float mcmcLogit(float p){ p=std::min(std::max(p,1e-7f),1.0f-1e-7f); return std::log(p/(1.0f-p)); }
+
+// 給定線性 opacity o、線性 scale s[3]（就地更新為 new_scale）、ratio n，回傳 new 線性 opacity。
+static float mcmcRelocate(const std::vector<float>& binoms, float o, float* s, int n){
+    if(n<1) n=1; if(n>=kMcmcNMax) n=kMcmcNMax-1;
+    float new_op = 1.0f - std::pow(1.0f - o, 1.0f/(float)n);
+    new_op = std::min(std::max(new_op, kMcmcMinOpac), 1.0f-1e-7f);
+    double denom=0.0;
+    for(int i=1;i<=n;i++)
+        for(int k=0;k<=i-1;k++){
+            double bin = binoms[(size_t)(i-1)*kMcmcNMax + k];   // C(i-1,k)
+            double sign = (k%2==0)?1.0:-1.0;
+            denom += bin * (sign/std::sqrt((double)(k+1))) * std::pow((double)new_op,(double)(k+1));
+        }
+    float coeff = (std::abs(denom)>1e-12) ? (float)((double)o/denom) : 1.0f;
+    for(int j=0;j<3;j++) s[j]*=coeff;
+    return new_op;
+}
+
+void Model::mcmcBuildBinoms(){
+    mcmcBinoms.assign((size_t)kMcmcNMax*kMcmcNMax, 0.0f);
+    for(int n=0;n<kMcmcNMax;n++)
+        for(int k=0;k<=n;k++)
+            mcmcBinoms[(size_t)n*kMcmcNMax+k] = (k==0||k==n) ? 1.0f
+                : mcmcBinoms[(size_t)(n-1)*kMcmcNMax+(k-1)] + mcmcBinoms[(size_t)(n-1)*kMcmcNMax+k];
+}
+
+void Model::mcmcCopyGaussian(int dst,int src){
+    if(dst==src) return;
+    int fr=(int)featuresRest_buf.stride0();
+    auto cp=[&](MTensor& buf,int dim){ float* p=buf.data<float>(); std::memcpy(p+(size_t)dst*dim, p+(size_t)src*dim, (size_t)dim*sizeof(float)); };
+    cp(means_buf,3); cp(scales_buf,3); cp(quats_buf,4); cp(featuresDc_buf,3); cp(featuresRest_buf,fr); cp(opacities_buf,1);
+}
+
+void Model::mcmcResetAdam(int idx){
+    int fr=(int)featuresRest_buf.stride0();
+    int dims[N_ADAM_GROUPS]={3,3,4,3,fr,1};
+    for(int g=0;g<N_ADAM_GROUPS;g++){
+        std::memset(adam_exp_avg_buf[g].data<float>()+(size_t)idx*dims[g], 0, (size_t)dims[g]*sizeof(float));
+        std::memset(adam_exp_avg_sq_buf[g].data<float>()+(size_t)idx*dims[g], 0, (size_t)dims[g]*sizeof(float));
+    }
+}
+
+void Model::mcmcRefine(int step){
+    const int N=num_active;
+    if(N<=1 || mcmcBinoms.empty()) return;
+    float* opb=opacities_buf.data<float>();  // logit
+    float* scb=scales_buf.data<float>();      // log
+
+    auto applyReloc=[&](int src,int count){
+        float o=mcmcSigmoid(opb[src]);
+        float sl[3]={std::exp(scb[src*3+0]),std::exp(scb[src*3+1]),std::exp(scb[src*3+2])};
+        float new_op=mcmcRelocate(mcmcBinoms,o,sl,count+1);
+        opb[src]=mcmcLogit(new_op);
+        scb[src*3+0]=std::log(std::max(sl[0],1e-9f));
+        scb[src*3+1]=std::log(std::max(sl[1],1e-9f));
+        scb[src*3+2]=std::log(std::max(sl[2],1e-9f));
+        mcmcResetAdam(src);
+    };
+    auto sampleByOpacity=[&](int cand_count,const int* cand,int n_samp,std::vector<int>& out,std::vector<int>& counts){
+        std::vector<double> cdf(cand_count);
+        double acc=0; for(int j=0;j<cand_count;j++){ int idx=cand?cand[j]:j; acc+=mcmcSigmoid(opb[idx]); cdf[j]=acc; }
+        std::uniform_real_distribution<double> U(0.0, acc>0?acc:1.0);
+        out.resize(n_samp);
+        for(int j=0;j<n_samp;j++){
+            double r=U(mcmcRng);
+            int lo=0,hi=cand_count-1;
+            while(lo<hi){int m=(lo+hi)/2; if(cdf[m]<r)lo=m+1; else hi=m;}
+            int idx=cand?cand[lo]:lo; out[j]=idx; counts[idx]++;
+        }
+    };
+
+    // ---- relocate：死高斯 → 依 opacity 取樣的存活高斯 ----
+    std::vector<int> dead, alive; dead.reserve(N/8); alive.reserve(N);
+    for(int i=0;i<N;i++){ (mcmcSigmoid(opb[i])<=kMcmcMinOpac ? dead : alive).push_back(i); }
+    int relocated=0;
+    if(!dead.empty() && !alive.empty()){
+        std::vector<int> srcs, counts(N,0);
+        sampleByOpacity((int)alive.size(), alive.data(), (int)dead.size(), srcs, counts);
+        for(int src:srcs){ if(counts[src]>0){ applyReloc(src,counts[src]); counts[src]=-1; } }
+        for(size_t j=0;j<dead.size();j++){ mcmcCopyGaussian(dead[j],srcs[j]); mcmcResetAdam(dead[j]); }
+        relocated=(int)dead.size();
+    }
+
+    // ---- grow：依 opacity 取樣複製、append 到預算 ----
+    int n_target=std::min(buf_capacity,(int)std::ceil((double)N*kMcmcGrowRate));
+    int n_add=std::min(n_target-N, buf_capacity-N);
+    if(n_add>0){
+        std::vector<int> srcs, counts(N,0);
+        sampleByOpacity(N, nullptr, n_add, srcs, counts);
+        for(int src:srcs){ if(counts[src]>0){ applyReloc(src,counts[src]); counts[src]=-1; } }
+        for(int j=0;j<n_add;j++){ mcmcCopyGaussian(N+j,srcs[j]); mcmcResetAdam(N+j); }
+        num_active=N+n_add;
+        xysGradNorm.reset(); visCounts.reset(); max2DSize.reset();   // 隨新數量下步重配
+    }
+    std::cout << "MCMC step " << step << ": active=" << num_active
+              << " (relocated " << relocated << ", added " << n_add << ")" << std::endl;
+}
+
+void Model::mcmcInjectNoise(float lr){
+    const int N=num_active;
+    const float noise_scale=lr*kMcmcNoiseLr;
+    if(noise_scale<=0.0f) return;
+    float* mean=means_buf.data<float>();
+    const float* scb=scales_buf.data<float>();
+    const float* qtb=quats_buf.data<float>();
+    const float* opb=opacities_buf.data<float>();
+    std::normal_distribution<float> nd(0.0f,1.0f);
+    for(int i=0;i<N;i++){
+        float o=mcmcSigmoid(opb[i]);
+        float gate=1.0f/(1.0f+std::exp(kMcmcNoiseK*(o-kMcmcNoiseT)));  // = sigmoid(-k(o-t))
+        if(gate<1e-3f) continue;   // 高透明度幾乎不動 → 早退省 CPU
+        float s0=std::exp(scb[i*3+0]),s1=std::exp(scb[i*3+1]),s2=std::exp(scb[i*3+2]);
+        float qw=qtb[i*4+0],qx=qtb[i*4+1],qy=qtb[i*4+2],qz=qtb[i*4+3];
+        float qn=std::sqrt(qw*qw+qx*qx+qy*qy+qz*qz); if(qn>1e-9f){float iv=1.0f/qn;qw*=iv;qx*=iv;qy*=iv;qz*=iv;}
+        float R[3][3]={
+            {1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy)},
+            {2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx)},
+            {2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)}
+        };
+        float d0=s0*s0,d1=s1*s1,d2=s2*s2, cov[3][3];
+        for(int a=0;a<3;a++)for(int b=0;b<3;b++)
+            cov[a][b]=R[a][0]*d0*R[b][0]+R[a][1]*d1*R[b][1]+R[a][2]*d2*R[b][2];
+        float e0=nd(mcmcRng)*gate*noise_scale, e1=nd(mcmcRng)*gate*noise_scale, e2=nd(mcmcRng)*gate*noise_scale;
+        mean[i*3+0]+=cov[0][0]*e0+cov[0][1]*e1+cov[0][2]*e2;
+        mean[i*3+1]+=cov[1][0]*e0+cov[1][1]*e1+cov[1][2]*e2;
+        mean[i*3+2]+=cov[2][0]*e0+cov[2][1]*e1+cov[2][2]*e2;
+    }
+}
+
 void Model::setupOptimizers(){
     releaseOptimizers();
+    if(mcmcBinoms.empty()) mcmcBuildBinoms();
 
 
     num_active = means.size(0);
@@ -237,6 +380,18 @@ int Model::getDownscaleFactor(int step) {
 
 void Model::afterTrain(int step){
     if (!radii.defined()) return;
+
+    if (useMcmc) {
+        // MCMC 路徑：取代梯度啟發式 clone/split/prune 與週期性 opacity reset。
+        // 先 sync 確保本步 GPU Adam 已寫回 shared buffer，CPU 才能安全讀寫參數。
+        msplat_gpu_sync();
+        if (step > warmupLength) mcmcInjectNoise(adam_lr[0]);   // 每步 SGLD 位置噪聲
+        if (step % refineEvery == 0 && step > warmupLength && step < stopSplitAt) {
+            mcmcRefine(step);      // relocate 死高斯 + 成長到固定預算
+            refreshViews();
+        }
+        return;
+    }
 
     if (step % refineEvery == 0 && step > warmupLength){
         int resetInterval = resetAlphaEvery * refineEvery;
