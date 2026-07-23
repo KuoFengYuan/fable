@@ -88,14 +88,16 @@ nonisolated struct CaptureConfig: Sendable {
     var previewMaxBlurPixels: Float = 12
 
     // MARK: - 手機端 3DGS 訓練（msplat，on-device）
-    /// 訓練迭代數（手機縮規模；桌機版通常 30000）。3–7k 在物件尺度已可觀
-    var trainIterations = 4000
+    /// 訓練迭代數（手機縮規模；桌機版通常 30000）。3–7k 在物件尺度已可觀。
+    /// densify 視窗＝前半段（stopSplitAt=maxSteps/2），故迭代越多、densify 也跑越久 → 點更多。
+    var trainIterations = 6000
     /// SH degree（0＝僅漫反射、最省記憶體；1＝基本視角相依高光）。手機建議 0–1
     var trainSHDegree = 1
     /// gaussian 緩衝容量（固定預配置＝峰值記憶體上限，slot 數）。densify 只在「3×當前數 ≤ 此值」時進行，
     /// 故最終高斯數約為此值的 1/3～1/2；峰值記憶體恆定＝此值（不再動態倍增/一次暴衝 → 不會 OOM）。
-    /// 216k 在 iPhone Pro 穩定；記憶體有餘可調高換更多高斯（畫質），OOM 就調低。
-    var trainMaxGaussians = 216_000
+    /// 記憶體洩漏根治後（RAII + 每步 autorelease pool），峰值有界，iPhone Pro 有大量餘裕，
+    /// 故調高到 600k（活躍高斯上限 ~200k，約 2.5×）換畫質。想更細可再往上（每 +100k slot 約 +40MB）；OOM 就調低。
+    var trainMaxGaussians = 600_000
     /// 訓練影像額外固定降採樣倍率（1＝不額外降；與 trainMaxImageDim 取較強的縮小）。
     /// 一般維持 1.0，用 trainMaxImageDim 控制解析度即可。
     var trainDownscale: Float = 1.0
