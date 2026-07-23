@@ -31,9 +31,16 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
+    // 影像串流：不預載全部關鍵幀（全解析度下全常駐是手機 OOM 主因），
+    // 逐幀 lazy load、用完由 LRU 釋放。datasetDownscale 供 lazy 重載使用；
+    // calibrated 確保 loadImage 的內參調整只做一次（重載時只讀像素、不再改內參）。
+    float datasetDownscale = 1.0f;
+    bool calibrated = false;
+
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
+    void releaseImage() { image = Image(); imagePyramids.clear(); mtensorImageCache.clear(); }
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
 
