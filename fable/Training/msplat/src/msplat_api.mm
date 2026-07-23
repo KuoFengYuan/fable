@@ -24,16 +24,18 @@ struct Dataset::Impl {
     std::vector<Camera> testCams;
 };
 
-Dataset::Dataset(const std::string& path, float downscaleFactor,
+Dataset::Dataset(const std::string& path, float downscaleFactor, int maxImageDim,
                  bool evalMode, int testEvery)
     : impl(std::make_unique<Impl>())
 {
     impl->data = inputDataFromX(path);
 
-    // 影像串流：不預載全部關鍵幀（全解析度下全常駐是手機 OOM 主因）。
-    // 只記錄 downscale，訓練時逐幀 lazy load、由 LRU 釋放（見 Trainer::step）。
-    for (auto& cam : impl->data.cameras)
+    // 影像串流：不預載全部關鍵幀。只記錄 downscale + 最長邊上限（maxImageDim），
+    // 訓練時逐幀 lazy load、解碼一次存 uint8 常駐、GPU tensor 由 LRU 驅逐（見 Trainer::step）。
+    for (auto& cam : impl->data.cameras) {
         cam.datasetDownscale = downscaleFactor;
+        cam.maxImageDim = maxImageDim;
+    }
 
     if (evalMode) {
         auto split = impl->data.splitTrainTest(testEvery);
@@ -127,9 +129,10 @@ Stats Trainer::step() {
     impl->currentStep++;
     size_t camIdx = impl->nextCamera();
 
-    // 影像串流 LRU：只保留最近 kImageWindow 個相機的影像常駐，其餘釋放
-    // （全解析度下全部常駐 ~數 GB 是 OOM 主因）。驅逐的是數步前用過的 → GPU 早已用完，安全。
-    // 畸變相機不驅逐（其 undistort 裁切重載無法重現；fable 為 PINHOLE 無此問題）。
+    // 影像 LRU：只保留最近 kImageWindow 個相機的 GPU float tensor，其餘 reset() 釋放。
+    // 注意：解碼後的 uint8 pixels 常駐不驅逐（maxImageDim 上限下全 42 幀僅約 244MB、有界），
+    // 驅逐的只是 GPU tensor；下次用到由常駐 uint8 即時重建、免重新解碼 JPEG（解決變慢）。
+    // 畸變相機的 GPU tensor 亦保留（其 undistort 已在解碼時完成並存入 pixels；fable 為 PINHOLE）。
     constexpr size_t kImageWindow = 6;
     impl->lru.push_back(camIdx);
     if (impl->lru.size() > kImageWindow) {
@@ -359,9 +362,9 @@ static msplat::Config configFromC(MsplatConfig c) {
     return cfg;
 }
 
-MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
+MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor, int maxImageDim,
                                      bool evalMode, int testEvery) {
-    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery);
+    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, maxImageDim, evalMode, testEvery);
     return static_cast<MsplatDataset>(ds);
 }
 

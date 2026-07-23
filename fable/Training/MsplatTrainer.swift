@@ -103,7 +103,7 @@ nonisolated final class MsplatSession: @unchecked Sendable {
     /// setup + 阻塞式訓練迴圈。務必透過本 session 佇列執行（內部已 dispatch）。
     func start(colmapDir: String, metallib: String?,
                iterations: Int, shDegree: Int, maxGaussians: Int,
-               downscale: Float, previewEvery: Int, wantPreview: Bool,
+               downscale: Float, maxImageDim: Int, previewEvery: Int, wantPreview: Bool,
                outputPLY: String,
                isCancelled: @escaping @Sendable () -> Bool,
                thermalPaused: @escaping @Sendable () -> Bool,
@@ -114,7 +114,8 @@ nonisolated final class MsplatSession: @unchecked Sendable {
             do {
                 try setup(colmapDir: colmapDir, metallib: metallib,
                           iterations: iterations, shDegree: shDegree,
-                          maxGaussians: maxGaussians, downscale: downscale)
+                          maxGaussians: maxGaussians, downscale: downscale,
+                          maxImageDim: maxImageDim)
             } catch {
                 onError(error); return
             }
@@ -151,9 +152,9 @@ nonisolated final class MsplatSession: @unchecked Sendable {
 
     private func setup(colmapDir: String, metallib: String?,
                        iterations: Int, shDegree: Int, maxGaussians: Int,
-                       downscale: Float) throws {
+                       downscale: Float, maxImageDim: Int) throws {
         if let metallib { msplat_set_metallib_path(metallib) }
-        guard let ds = msplat_dataset_create(colmapDir, downscale, false, 0) else {
+        guard let ds = msplat_dataset_create(colmapDir, downscale, Int32(maxImageDim), false, 0) else {
             throw TrainingError.initFailed
         }
         dataset = ds

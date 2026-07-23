@@ -349,6 +349,7 @@ final class CaptureController: NSObject, ObservableObject {
                 colmapDir: dir.path, metallib: metallib,
                 iterations: cfg.trainIterations, shDegree: cfg.trainSHDegree,
                 maxGaussians: cfg.trainMaxGaussians, downscale: cfg.trainDownscale,
+                maxImageDim: cfg.trainMaxImageDim,
                 previewEvery: cfg.trainPreviewEvery, wantPreview: wantPreview,
                 outputPLY: plyURL.path,
                 isCancelled: { cancel.isCancelled },
