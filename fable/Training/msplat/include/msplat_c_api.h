@@ -31,6 +31,7 @@ typedef struct {
     bool keepCrs;
     float downscaleFactor;
     bool useMcmc;       // true = MCMC 密集化（固定預算+relocate+SGLD noise）取代梯度啟發式
+    bool useCameraOpt;  // true = 訓練中聯合精修相機姿態（SO3×R3 / SE3，per-camera Adam）
     float bgColor[3];
 } MsplatConfig;
 
@@ -56,7 +57,8 @@ static inline MsplatConfig msplat_default_config(void) {
     c.maxGaussians = 0;
     c.keepCrs = false;
     c.downscaleFactor = 1.0f;
-    c.useMcmc = true;   // 預設開啟 MCMC 密集化
+    c.useMcmc = true;        // 預設開啟 MCMC 密集化
+    c.useCameraOpt = true;   // 預設開啟相機姿態優化
     c.bgColor[0] = 0.6130f; c.bgColor[1] = 0.0101f; c.bgColor[2] = 0.3984f;
     return c;
 }

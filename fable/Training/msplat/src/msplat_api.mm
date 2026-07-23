@@ -117,7 +117,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.maxGaussians,
         config.bgColor
     );
-    impl->model->useMcmc = config.useMcmc;   // MCMC 密集化（預設開）
+    impl->model->useMcmc = config.useMcmc;             // MCMC 密集化（預設開）
+    impl->model->useCameraOpt = config.useCameraOpt;   // 相機姿態優化（預設開）
 
     impl->camIndices.resize(impl->ds->trainCams.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
@@ -152,6 +153,12 @@ Stats Trainer::step() {
 
     impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
     impl->model->schedulersStep(impl->currentStep);
+    // 相機姿態優化：需 backward 的 v_mean3d + 尚未被 MCMC noise 擾動的 means，故在 afterTrain 前。
+    // 先 sync 確保 v_mean3d/means 已落地（shared buffer）。
+    if (impl->model->useCameraOpt) {
+        msplat_gpu_sync();
+        impl->model->cameraPoseStep(cam, impl->currentStep);
+    }
     impl->model->afterTrain(impl->currentStep);
     msplat_commit();
 
@@ -363,6 +370,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;
     cfg.useMcmc = c.useMcmc;
+    cfg.useCameraOpt = c.useCameraOpt;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));
     return cfg;
 }

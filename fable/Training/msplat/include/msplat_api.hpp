@@ -30,7 +30,8 @@ struct Config {
     int maxGaussians = 0;   // 0 = unlimited; >0 caps densification (on-device memory safety)
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
-    bool useMcmc = true;    // MCMC 密集化（取代梯度啟發式）
+    bool useMcmc = true;        // MCMC 密集化（取代梯度啟發式）
+    bool useCameraOpt = true;   // 相機姿態優化（SE3 per-camera Adam）
     float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
 };
 

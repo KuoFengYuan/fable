@@ -664,25 +664,49 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     float fovX = 2.0f * std::atan(s.width / (2.0f * s.fx));
     float fovY = 2.0f * std::atan(s.height / (2.0f * s.fy));
 
-    if (!cam.cachedViewMat.defined() || cam.cachedFovX != fovX || cam.cachedFovY != fovY) {
-        const float *d = cam.camToWorld;
-        float R[3][3], Rinv[3][3], T[3], Tinv[3];
-        for (int i = 0; i < 3; i++) {
-            R[i][0] = d[i*4+0]; R[i][1] = -d[i*4+1]; R[i][2] = -d[i*4+2]; T[i] = d[i*4+3];
+    // world→cam（CV）。useCameraOpt 時用逐步精修的 cam.viewCorr（首次以 base 初始化、之後每步重算）；
+    // 否則用 base viewmat，依 fov 快取。
+    bool recompute = useCameraOpt || !cam.cachedViewMat.defined()
+                     || cam.cachedFovX != fovX || cam.cachedFovY != fovY;
+    if (recompute) {
+        float vm[16];
+        if (useCameraOpt) {
+            if (!cam.poseInit) {
+                const float *d = cam.camToWorld;
+                float R[3][3], Rinv[3][3], T[3], Tinv[3];
+                for (int i=0;i<3;i++){ R[i][0]=d[i*4+0]; R[i][1]=-d[i*4+1]; R[i][2]=-d[i*4+2]; T[i]=d[i*4+3]; }
+                for (int i=0;i<3;i++) for (int j=0;j<3;j++) Rinv[i][j]=R[j][i];
+                for (int i=0;i<3;i++) Tinv[i]=-(Rinv[i][0]*T[0]+Rinv[i][1]*T[1]+Rinv[i][2]*T[2]);
+                float b[16]={Rinv[0][0],Rinv[0][1],Rinv[0][2],Tinv[0], Rinv[1][0],Rinv[1][1],Rinv[1][2],Tinv[1], Rinv[2][0],Rinv[2][1],Rinv[2][2],Tinv[2], 0,0,0,1};
+                std::memcpy(cam.viewCorr, b, sizeof(b));
+                cam.poseInit = true;
+            }
+            std::memcpy(vm, cam.viewCorr, sizeof(vm));
+        } else {
+            const float *d = cam.camToWorld;
+            float R[3][3], Rinv[3][3], T[3], Tinv[3];
+            for (int i=0;i<3;i++){ R[i][0]=d[i*4+0]; R[i][1]=-d[i*4+1]; R[i][2]=-d[i*4+2]; T[i]=d[i*4+3]; }
+            for (int i=0;i<3;i++) for (int j=0;j<3;j++) Rinv[i][j]=R[j][i];
+            for (int i=0;i<3;i++) Tinv[i]=-(Rinv[i][0]*T[0]+Rinv[i][1]*T[1]+Rinv[i][2]*T[2]);
+            float b[16]={Rinv[0][0],Rinv[0][1],Rinv[0][2],Tinv[0], Rinv[1][0],Rinv[1][1],Rinv[1][2],Tinv[1], Rinv[2][0],Rinv[2][1],Rinv[2][2],Tinv[2], 0,0,0,1};
+            std::memcpy(vm, b, sizeof(b));
         }
-        for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) Rinv[i][j] = R[j][i];
-        for (int i = 0; i < 3; i++) Tinv[i] = -(Rinv[i][0]*T[0] + Rinv[i][1]*T[1] + Rinv[i][2]*T[2]);
-        float vm[16] = { Rinv[0][0],Rinv[0][1],Rinv[0][2],Tinv[0], Rinv[1][0],Rinv[1][1],Rinv[1][2],Tinv[1], Rinv[2][0],Rinv[2][1],Rinv[2][2],Tinv[2], 0,0,0,1 };
+        // camPos(world) = -Wᵀ t，W=vm 旋轉、t=vm 平移
+        float camPos[3] = {
+            -(vm[0]*vm[3] + vm[4]*vm[7] + vm[8]*vm[11]),
+            -(vm[1]*vm[3] + vm[5]*vm[7] + vm[9]*vm[11]),
+            -(vm[2]*vm[3] + vm[6]*vm[7] + vm[10]*vm[11])
+        };
         float t_p = 0.001f * std::tan(0.5f * fovY), r_p = 0.001f * std::tan(0.5f * fovX);
         float pm[16] = { 0.001f/r_p,0,0,0, 0,0.001f/t_p,0,0, 0,0,(1000.0f+0.001f)/(1000.0f-0.001f),-1000.0f*0.001f/(1000.0f-0.001f), 0,0,1,0 };
         float pvm[16] = {};
         for (int i=0;i<4;i++) for (int j=0;j<4;j++) for (int k=0;k<4;k++) pvm[i*4+j] += pm[i*4+k] * vm[k*4+j];
 
-        cam.cachedViewMat = gpu_empty({4, 4}, DType::Float32);
-        memcpy(cam.cachedViewMat.data_ptr(), vm, sizeof(vm));
-        cam.cachedProjViewMat = gpu_empty({4, 4}, DType::Float32);
-        memcpy(cam.cachedProjViewMat.data_ptr(), pvm, sizeof(pvm));
-        cam.cachedCamPos[0] = T[0]; cam.cachedCamPos[1] = T[1]; cam.cachedCamPos[2] = T[2];
+        if (!cam.cachedViewMat.defined())     cam.cachedViewMat     = gpu_empty({4, 4}, DType::Float32);
+        if (!cam.cachedProjViewMat.defined()) cam.cachedProjViewMat = gpu_empty({4, 4}, DType::Float32);
+        std::memcpy(cam.cachedViewMat.data_ptr(), vm, sizeof(vm));
+        std::memcpy(cam.cachedProjViewMat.data_ptr(), pvm, sizeof(pvm));
+        cam.cachedCamPos[0]=camPos[0]; cam.cachedCamPos[1]=camPos[1]; cam.cachedCamPos[2]=camPos[2];
         cam.cachedFovX = fovX; cam.cachedFovY = fovY;
     }
 
@@ -697,6 +721,89 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     s.cam_pos[2] = cam.cachedCamPos[2];
 
     return s;
+}
+
+// 相機姿態優化：由 backward 世界系 v_mean3d 在 CPU 端組裝 SE3 位姿梯度，per-camera Adam 精修。
+// 左擾動於 world→cam：corrected = exp(δ̂)·viewCorr。安全網：延遲啟動 + 保守 lr + 單步幅度上限
+//（無法在此跑有限差分驗證，故以安全網防梯度號誤造成的發散；如品質退步可用 useCameraOpt 關閉對照）。
+void Model::cameraPoseStep(Camera& cam, int step){
+    if (!useCameraOpt) return;
+    static constexpr int   kPoseStartIter = 800;    // 等幾何/密集化稍穩再開
+    static constexpr float kPoseLrRot     = 1e-4f;  // ω 學習率（保守）
+    static constexpr float kPoseLrTrans   = 1e-3f;  // τ 學習率
+    static constexpr float kPoseMaxStep   = 3e-3f;  // 單步修正幅度上限（防發散）
+    static constexpr float kB1=0.9f, kB2=0.999f, kEps=1e-8f;
+    if (step < kPoseStartIter) return;
+
+    const float* vmean = msplat_v_mean3d_data();     // 世界系 ∂loss/∂mean（須已 sync）
+    if (!vmean || !cam.cachedViewMat.defined()) return;
+    const int N = num_active;
+    const float* mw = means_buf.data<float>();
+    const float* vm = (const float*)cam.cachedViewMat.data_ptr();  // corrected world→cam (row-major)
+    const float W[3][3]={{vm[0],vm[1],vm[2]},{vm[4],vm[5],vm[6]},{vm[8],vm[9],vm[10]}};
+    const float t[3]={vm[3],vm[7],vm[11]};
+
+    double gw[3]={0,0,0}, gt[3]={0,0,0};             // grad_ω, grad_τ
+    for (int i=0;i<N;i++){
+        const float* vi=&vmean[i*3];
+        if (vi[0]==0.f && vi[1]==0.f && vi[2]==0.f) continue;   // 不可見/未貢獻
+        float gc0=W[0][0]*vi[0]+W[0][1]*vi[1]+W[0][2]*vi[2];    // g_cam = W·v_mean3d
+        float gc1=W[1][0]*vi[0]+W[1][1]*vi[1]+W[1][2]*vi[2];
+        float gc2=W[2][0]*vi[0]+W[2][1]*vi[1]+W[2][2]*vi[2];
+        const float* p=&mw[i*3];
+        float pc0=W[0][0]*p[0]+W[0][1]*p[1]+W[0][2]*p[2]+t[0];  // p_cam = W·p_world + t
+        float pc1=W[1][0]*p[0]+W[1][1]*p[1]+W[1][2]*p[2]+t[1];
+        float pc2=W[2][0]*p[0]+W[2][1]*p[1]+W[2][2]*p[2]+t[2];
+        gt[0]+=gc0; gt[1]+=gc1; gt[2]+=gc2;                     // grad_τ += g_cam
+        gw[0]+=pc1*gc2-pc2*gc1;                                 // grad_ω += p_cam × g_cam
+        gw[1]+=pc2*gc0-pc0*gc2;
+        gw[2]+=pc0*gc1-pc1*gc0;
+    }
+
+    // Adam（6-vec：ω,τ）。adam 對梯度尺度不變 → 步長由 lr 控制，與高斯數無關。
+    float g[6]={(float)gw[0],(float)gw[1],(float)gw[2],(float)gt[0],(float)gt[1],(float)gt[2]};
+    cam.poseAdamStep++;
+    float bc1=1.f-std::pow(kB1,(float)cam.poseAdamStep), bc2=1.f-std::pow(kB2,(float)cam.poseAdamStep);
+    float delta[6];
+    for(int j=0;j<6;j++){
+        cam.poseAdamM[j]=kB1*cam.poseAdamM[j]+(1-kB1)*g[j];
+        cam.poseAdamV[j]=kB2*cam.poseAdamV[j]+(1-kB2)*g[j]*g[j];
+        float mhat=cam.poseAdamM[j]/bc1, vhat=cam.poseAdamV[j]/bc2;
+        float lr=(j<3)?kPoseLrRot:kPoseLrTrans;
+        float d=-lr*mhat/(std::sqrt(vhat)+kEps);
+        delta[j]=std::min(std::max(d,-kPoseMaxStep),kPoseMaxStep);   // 幅度上限（安全網）
+    }
+
+    // 左乘 exp(δ̂)：R'=dR·W, t'=dR·t+dτ。SO3 exp 用 Rodrigues。
+    float wx=delta[0],wy=delta[1],wz=delta[2];
+    float th=std::sqrt(wx*wx+wy*wy+wz*wz);
+    float dR[3][3];
+    if (th<1e-8f){
+        dR[0][0]=1;dR[0][1]=-wz;dR[0][2]=wy; dR[1][0]=wz;dR[1][1]=1;dR[1][2]=-wx; dR[2][0]=-wy;dR[2][1]=wx;dR[2][2]=1;
+    } else {
+        float a=std::sin(th)/th, bb=(1-std::cos(th))/(th*th);
+        float K[3][3]={{0,-wz,wy},{wz,0,-wx},{-wy,wx,0}}, K2[3][3];
+        for(int r=0;r<3;r++)for(int c=0;c<3;c++) K2[r][c]=K[r][0]*K[0][c]+K[r][1]*K[1][c]+K[r][2]*K[2][c];
+        for(int r=0;r<3;r++)for(int c=0;c<3;c++) dR[r][c]=(r==c?1.f:0.f)+a*K[r][c]+bb*K2[r][c];
+    }
+    float nW[3][3], nt[3];
+    for(int r=0;r<3;r++){
+        for(int c=0;c<3;c++) nW[r][c]=dR[r][0]*W[0][c]+dR[r][1]*W[1][c]+dR[r][2]*W[2][c];
+        nt[r]=dR[r][0]*t[0]+dR[r][1]*t[1]+dR[r][2]*t[2]+delta[3+r];
+    }
+    // 對 nW 做 Gram-Schmidt 再正交化，避免長時間累積漂移
+    auto n3=[](float* v){ float n=std::sqrt(v[0]*v[0]+v[1]*v[1]+v[2]*v[2]); if(n>1e-12f){v[0]/=n;v[1]/=n;v[2]/=n;} };
+    float r0[3]={nW[0][0],nW[0][1],nW[0][2]}; n3(r0);
+    float r1[3]={nW[1][0],nW[1][1],nW[1][2]};
+    float d01=r0[0]*r1[0]+r0[1]*r1[1]+r0[2]*r1[2];
+    r1[0]-=d01*r0[0]; r1[1]-=d01*r0[1]; r1[2]-=d01*r0[2]; n3(r1);
+    float r2[3]={r0[1]*r1[2]-r0[2]*r1[1], r0[2]*r1[0]-r0[0]*r1[2], r0[0]*r1[1]-r0[1]*r1[0]};
+
+    float* vc=cam.viewCorr;
+    vc[0]=r0[0];vc[1]=r0[1];vc[2]=r0[2];vc[3]=nt[0];
+    vc[4]=r1[0];vc[5]=r1[1];vc[6]=r1[2];vc[7]=nt[1];
+    vc[8]=r2[0];vc[9]=r2[1];vc[10]=r2[2];vc[11]=nt[2];
+    vc[12]=0;vc[13]=0;vc[14]=0;vc[15]=1;
 }
 
 MTensor Model::render(Camera& cam, int step){
