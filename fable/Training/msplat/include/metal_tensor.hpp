@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cassert>
 #include <cstring>
+#include <cstdio>
 #include <utility>
 #include <CoreFoundation/CoreFoundation.h>  // CFRetain/CFRelease（純 C API，.cpp/.mm 皆可）
 
@@ -48,6 +49,15 @@ public:
         size_t bytes = _numel * dtypeSize(_dtype);
         if (bytes == 0) bytes = 4;
         id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        // 配置失敗必須大聲。newBufferWithLength 在記憶體吃緊時回傳 nil，而過去這被靜默吞掉：
+        // _buffer=nullptr、[nil contents]=nullptr → 之後 ENC_BUF 綁 nil buffer，Metal 不報錯、
+        // kernel 什麼都沒寫 → 畫面全黑但不崩潰。這是最難查的失敗模式，一定要留下痕跡。
+        if (!buf) {
+            fprintf(stderr, "FATAL: MTLBuffer alloc FAILED: %zu bytes (%.1f MB), shape[0]=%lld — "
+                    "後續 kernel 會綁到 nil buffer（畫面全黑）。請降低高斯上限或影像解析度。\n",
+                    bytes, (double)bytes / (1024.0 * 1024.0),
+                    _shape.empty() ? 0LL : (long long)_shape[0]);
+        }
         _buffer = (__bridge_retained void*)buf;
         _data = [buf contents];  // cache CPU-accessible pointer for C++ access
     }

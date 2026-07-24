@@ -102,11 +102,22 @@ struct Model{
   // 取代梯度啟發式 clone/split/prune：固定預算、把死高斯(低透明度)relocate 到高透明度處、
   // 每步注入 SGLD 位置噪聲探索。手機端優勢＝預算固定（記憶體有界）＋同預算下畫質更好。
   bool useMcmc = true;
-  std::vector<float> mcmcBinoms;      // [nMax*nMax] 二項式係數 C(n,k)，relocation scale 修正用
   std::mt19937 mcmcRng{1234567u};
-  void mcmcBuildBinoms();
-  void mcmcRefine(int step);          // relocate 死高斯 + 成長到預算（於 refine 間隔）
-  void mcmcInjectNoise(float lr);     // 每步 SGLD 位置噪聲
+  void mcmcRefine(int step);          // MRNF 密集化：梯度引導候選 + Gumbel top-k + Long Axis Split
+  void mrnfLongAxisSplit(int parent, int child);  // 沿最長軸切兩半並 ±偏移（取代原地複製）
+
+  // ── 誤差圖引導（MRNF use_error_map 等價；per-gaussian 累加，無新 Metal kernel）──
+  // 梯度引導回答「哪裡還沒重建好」，細節圖回答「哪裡本來就有紋理」——兩者互補。
+  bool useEdgeGuidance = true;
+  std::vector<float> mrnfEdgeScore;   // [buf_capacity] refine 視窗內累加的細節分
+  std::vector<float> mrnfEdgeCount;   // [buf_capacity] 對應被觀測次數
+  void mrnfAccumEdge(Camera& cam, int step);   // 投影取樣細節圖 → 累加
+  void mcmcInjectNoise(float lr);     // SGLD 位置噪聲
+  // 正則化參考量（初始點雲統計，只算一次）
+  float mcmcScaleRef = 0.0f;          // 初始線性 scale 均值 ≈ 局部點距（尺度正則的無量綱化基準）
+  float mcmcMaxScale = 0.0f;          // 世界系 scale 硬上限 = 0.1 × 場景 RMS 半徑
+  void mcmcComputeScaleRefs();
+  void mcmcRegularize(int step);      // opacity/scale 退火衰減 + 巨大高斯夾限（對齊 LichtFeld MRNF）
   void mcmcCopyGaussian(int dst, int src);  // 複製全部參數 src→dst
   void mcmcResetAdam(int idx);              // 清零該 slot 的 Adam 動量（6 群）
 

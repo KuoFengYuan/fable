@@ -34,6 +34,7 @@ typedef struct {
     bool useCameraOpt;  // true = 訓練中聯合精修相機姿態（SO3×R3 / SE3，per-camera Adam）
     bool useAppearance; // true = per-image 學習式仿射外觀校正（吸收逐幀曝光/白平衡差異）
     bool useDepthSupervision; // true = LiDAR 深度監督（把近表面高斯拉到度量深度真值）
+    bool useEdgeGuidance;     // true = 誤差圖引導密集化（細節多的地方優先長點；MRNF use_error_map）
     float bgColor[3];
 } MsplatConfig;
 
@@ -45,10 +46,12 @@ static inline MsplatConfig msplat_default_config(void) {
     c.ssimWeight = 0.2f;
     // coarse-to-fine：ds = 1<<max(numDownscales - step/resolutionSchedule, 0)。
     // 舊值 (2,3000) 在 4000~6000 步內最細只到 ds=2（800px）、永遠到不了 1600 全解析度 → 糊。
-    // 改 (1,2000)：step<2000 用 ds=2(800px) 粗訓，step>=2000 用 ds=1(1600px 全上限)，
-    // 且落在 densify 視窗(500~maxSteps/2) 內 → 能在全解析度上長出細節點。
+    // (1,2000) 雖能到全解析度，但 densify 視窗是 500~3000，其中 500~2000（大部分成長）仍在
+    // ds=2(800px)：高斯是照 800px 的螢幕梯度長/定尺寸的，拿到 1600px 看就是 2× 太大 → 糊。
+    // 改 (1,1000)：只用 1000 步粗訓穩住全局結構，之後 1000~3000 的成長全在 1600px 全解析度下
+    // 進行 → 高斯尺寸對齊最終觀看解析度。像素成本 +17%，但配合 scale 正則後高斯小 3.7×，淨變快。
     c.numDownscales = 1;
-    c.resolutionSchedule = 2000;
+    c.resolutionSchedule = 1000;
     c.refineEvery = 100;
     c.warmupLength = 500;
     c.resetAlphaEvery = 30;
@@ -63,6 +66,7 @@ static inline MsplatConfig msplat_default_config(void) {
     c.useCameraOpt = true;   // 預設開啟相機姿態優化
     c.useAppearance = true;  // 預設開啟外觀校正
     c.useDepthSupervision = true;  // 預設開啟 LiDAR 深度監督
+    c.useEdgeGuidance = true;      // 預設開啟誤差圖引導（對齊 LichtFeld use_error_map=true）
     c.bgColor[0] = 0.6130f; c.bgColor[1] = 0.0101f; c.bgColor[2] = 0.3984f;
     return c;
 }

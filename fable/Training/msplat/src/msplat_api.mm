@@ -133,6 +133,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     impl->model->useCameraOpt = config.useCameraOpt;   // 相機姿態優化（預設開）
     impl->model->useAppearance = config.useAppearance; // 外觀校正（預設開）
     impl->model->useDepthSupervision = config.useDepthSupervision; // LiDAR 深度監督（預設開）
+    impl->model->useEdgeGuidance = config.useEdgeGuidance;         // 誤差圖引導密集化（預設開）
 
     impl->camIndices.resize(impl->ds->trainCams.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
@@ -183,6 +184,7 @@ Stats Trainer::step() {
         if (impl->model->useCameraOpt) impl->model->cameraPoseStep(cam, impl->currentStep);
         if (impl->model->useAppearance) impl->model->appearanceStep(cam, impl->currentStep);
         if (impl->model->useDepthSupervision) impl->model->depthRefineStep(cam, impl->currentStep);
+        if (impl->model->useEdgeGuidance) impl->model->mrnfAccumEdge(cam, impl->currentStep);
     }
     impl->model->afterTrain(impl->currentStep);
     msplat_commit();
@@ -398,6 +400,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.useCameraOpt = c.useCameraOpt;
     cfg.useAppearance = c.useAppearance;
     cfg.useDepthSupervision = c.useDepthSupervision;
+    cfg.useEdgeGuidance = c.useEdgeGuidance;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));
     return cfg;
 }

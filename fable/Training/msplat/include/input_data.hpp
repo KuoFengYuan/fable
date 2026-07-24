@@ -64,6 +64,15 @@ struct Camera {
     bool lidarTried = false;
     void loadLidarDepth();
 
+    // 誤差圖引導（LichtFeld MRNF use_error_map 的等價實作，但不需要新的光柵器 pass）。
+    // 1/8 解析度的「高頻能量圖」：密集化只需要「這裡紋理多不多」的空間先驗，
+    // 不需要 Canny 的精確邊緣定位。1/8 → 200×150 uint8 ≈ 30KB/幀（120 幀約 3.6MB），
+    // 由常駐 pixels 一次算好後快取。見 Model::mrnfAccumEdge。
+    std::vector<uint8_t> edgeMap;
+    int edgeW = 0, edgeH = 0;
+    bool edgeTried = false;
+    void buildEdgeMap();
+
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
