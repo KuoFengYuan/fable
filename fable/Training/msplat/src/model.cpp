@@ -834,6 +834,46 @@ void Model::appearanceStep(Camera& cam, int step){
     }
 }
 
+// LiDAR 深度監督（per-gaussian）：把近 LiDAR 表面的高斯沿光學軸拉到度量深度真值。
+// 使用修正後 viewmat（cam.cachedViewMat）；band 閘門確保只精修近表面高斯（安全）。
+void Model::depthRefineStep(Camera& cam, int step){
+    if (!useDepthSupervision) return;
+    if (!cam.lidarTried) cam.loadLidarDepth();     // lazy 載入
+    if (cam.lidarW == 0 || !cam.cachedViewMat.defined()) return;   // 無深度 / 無 viewmat
+    static constexpr float kBand = 0.10f;          // 只精修 |view_z - d_lidar| < 10cm 的高斯
+    static constexpr float kLr   = 0.5f;           // 每次校正誤差的比例
+    static constexpr float kMaxD = 8.0f;           // LiDAR 有效上限
+
+    const float* vm = (const float*)cam.cachedViewMat.data_ptr();  // world→cam (row-major)
+    const float W0=vm[0],W1=vm[1],W2=vm[2], W4=vm[4],W5=vm[5],W6=vm[6], W8=vm[8],W9=vm[9],W10=vm[10];
+    const float t0=vm[3],t1=vm[7],t2=vm[11];
+    const float fx=cam.fx, fy=cam.fy, cx=cam.cx, cy=cam.cy;
+    const int   W=cam.width, H=cam.height;
+    if (W<=0 || H<=0) return;
+    float* mean = means_buf.data<float>();
+    const int N = num_active;
+    for (int i=0;i<N;i++){
+        float x=mean[i*3], y=mean[i*3+1], z=mean[i*3+2];
+        float vz = W8*x + W9*y + W10*z + t2;                 // view-space depth
+        if (vz <= 0.05f) continue;
+        float vx = W0*x + W1*y + W2*z + t0;
+        float vy = W4*x + W5*y + W6*z + t1;
+        float px = fx*(vx/vz) + cx, py = fy*(vy/vz) + cy;    // 訓練影像像素座標
+        if (px<0 || py<0 || px>=W || py>=H) continue;
+        int lu = (int)(px / (float)W * cam.lidarW);          // → LiDAR 像素（FOV 不變的正規化對應）
+        int lv = (int)(py / (float)H * cam.lidarH);
+        if (lu<0 || lv<0 || lu>=cam.lidarW || lv>=cam.lidarH) continue;
+        int li = lv*cam.lidarW + lu;
+        if (!cam.lidarConf.empty() && cam.lidarConf[li] < 2) continue;   // 只用高信心
+        float d = cam.lidarDepth[li];
+        if (d <= 0.05f || d > kMaxD) continue;
+        float err = d - vz;
+        if (fabsf(err) > kBand) continue;                    // 只精修近表面高斯（安全閘門）
+        float dz = kLr * err;                                 // 沿光學軸移動：Δp = dz·(W row2)
+        mean[i*3+0] += dz*W8; mean[i*3+1] += dz*W9; mean[i*3+2] += dz*W10;
+    }
+}
+
 MTensor Model::render(Camera& cam, int step){
     auto s = prepareCam(cam, step);
     return msplat_render(

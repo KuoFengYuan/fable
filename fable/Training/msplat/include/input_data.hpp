@@ -56,6 +56,14 @@ struct Camera {
     float datasetDownscale = 1.0f;   // 額外固定降採樣倍率（與 maxImageDim 取較強的縮小）
     bool calibrated = false;         // 內參校正只做一次
 
+    // LiDAR 深度監督用（度量真值）：depth/<stem>_depth.bin（ARKit sceneDepth 256×192 float32）+ _conf.bin。
+    // 由 filePath 推導路徑、lazy 載入；PINHOLE 才用（畸變 undistort 裁切會破壞 FOV 對應）。
+    std::vector<float> lidarDepth;
+    std::vector<uint8_t> lidarConf;
+    int lidarW = 0, lidarH = 0;
+    bool lidarTried = false;
+    void loadLidarDepth();
+
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);

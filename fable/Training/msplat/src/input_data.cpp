@@ -14,6 +14,29 @@ using json = nlohmann::json;
 
 // ── Image loading ───────────────────────────────────────────────────────────
 
+void Camera::loadLidarDepth() {
+    lidarTried = true;
+    if (hasDistortion()) return;                  // undistort 裁切會破壞 FOV↔LiDAR 對應
+    fs::path img(filePath);                        // .../images/frame_XXXXX.jpg
+    fs::path depthDir = img.parent_path().parent_path() / "depth";
+    fs::path dpath = depthDir / (img.stem().string() + "_depth.bin");
+    std::error_code ec;
+    const int W = 256, H = 192;                    // ARKit sceneDepth 固定解析度
+    if (!fs::exists(dpath, ec) || fs::file_size(dpath, ec) != (uintmax_t)W * H * 4) return;
+    std::ifstream f(dpath, std::ios::binary);
+    lidarDepth.resize((size_t)W * H);
+    f.read(reinterpret_cast<char*>(lidarDepth.data()), (std::streamsize)W * H * 4);
+    if (!f) { lidarDepth.clear(); return; }
+    lidarW = W; lidarH = H;
+    fs::path cpath = depthDir / (img.stem().string() + "_conf.bin");
+    if (fs::exists(cpath, ec) && fs::file_size(cpath, ec) == (uintmax_t)W * H) {
+        std::ifstream cf(cpath, std::ios::binary);
+        lidarConf.resize((size_t)W * H);
+        cf.read(reinterpret_cast<char*>(lidarConf.data()), (std::streamsize)W * H);
+        if (!cf) lidarConf.clear();
+    }
+}
+
 void Camera::loadImage(float downscaleFactor) {
     Image raw = imreadRGB(filePath);
     if (raw.empty()) return;

@@ -122,6 +122,12 @@ struct Model{
   void appearanceEnsureInit(Camera& cam);   // 首次把 affine 設為 identity
   void appearanceStep(Camera& cam, int step);  // 讀 GPU 累加的 affine 梯度 → per-camera Adam + L2 拉回 identity
 
+  // ── LiDAR 深度監督（per-gaussian，CPU 端）──
+  // 用 LiDAR 度量深度真值把「近表面」高斯沿光學軸拉到正確深度 → 表面更薄更準、幾何更硬。
+  // band 閘門只碰接近 LiDAR 表面的高斯（不亂拉遮擋/浮點，安全）。
+  bool useDepthSupervision = true;
+  void depthRefineStep(Camera& cam, int step);
+
   float scale;
   float translation[3] = {};
 };
