@@ -116,6 +116,12 @@ struct Model{
   bool useCameraOpt = true;
   void cameraPoseStep(Camera& cam, int step);
 
+  // ── 外觀校正（per-image 學習式仿射；bilateral guided）──
+  // 吸收逐幀曝光/白平衡差異，避免多視角顏色不一致污染幾何（霧感/飄浮物）。作用於損失層。
+  bool useAppearance = true;
+  void appearanceEnsureInit(Camera& cam);   // 首次把 affine 設為 identity
+  void appearanceStep(Camera& cam, int step);  // 讀 GPU 累加的 affine 梯度 → per-camera Adam + L2 拉回 identity
+
   float scale;
   float translation[3] = {};
 };

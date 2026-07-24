@@ -806,6 +806,34 @@ void Model::cameraPoseStep(Camera& cam, int step){
     vc[12]=0;vc[13]=0;vc[14]=0;vc[15]=1;
 }
 
+// 外觀校正：affine init 為 identity（M=I, t=0）→ 起始不改變影像，之後 Adam 精修。
+void Model::appearanceEnsureInit(Camera& cam){
+    if (cam.appInit) return;
+    for (int i = 0; i < 12; i++) { cam.appAffine[i] = 0.f; cam.appAdamM[i] = 0.f; cam.appAdamV[i] = 0.f; }
+    cam.appAffine[0] = cam.appAffine[4] = cam.appAffine[8] = 1.f;  // M = I
+    cam.appAdamStep = 0;
+    cam.appInit = true;
+}
+
+// 讀 GPU 累加的 affine 梯度（12，須 caller 已 sync）→ per-camera Adam；加 L2 拉回 identity 防退化。
+void Model::appearanceStep(Camera& cam, int step){
+    if (!useAppearance) return;
+    const float* grad = msplat_appearance_grad_data();
+    if (!grad) return;
+    static constexpr float kLr = 1e-3f, kB1 = 0.9f, kB2 = 0.999f, kEps = 1e-8f, kL2 = 1e-2f;
+    static const float identity[12] = {1,0,0, 0,1,0, 0,0,1, 0,0,0};
+    cam.appAdamStep++;
+    float bc1 = 1.f - std::pow(kB1, (float)cam.appAdamStep);
+    float bc2 = 1.f - std::pow(kB2, (float)cam.appAdamStep);
+    for (int j = 0; j < 12; j++) {
+        float g = grad[j] + kL2 * (cam.appAffine[j] - identity[j]);   // L2 → identity（避免外觀吃掉幾何）
+        cam.appAdamM[j] = kB1 * cam.appAdamM[j] + (1 - kB1) * g;
+        cam.appAdamV[j] = kB2 * cam.appAdamV[j] + (1 - kB2) * g * g;
+        float mh = cam.appAdamM[j] / bc1, vh = cam.appAdamV[j] / bc2;
+        cam.appAffine[j] -= kLr * mh / (std::sqrt(vh) + kEps);
+    }
+}
+
 MTensor Model::render(Camera& cam, int step){
     auto s = prepareCam(cam, step);
     return msplat_render(

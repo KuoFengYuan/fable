@@ -469,6 +469,23 @@ kernel void project_gaussians_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 }
 
+// Mip-Splatting 2D 濾波的 opacity 補償：由 conic（=dilated cov2d 的逆）反推
+// comp = √(det(Σ)/det(Σ+ρI))，ρ=0.3（與 project_cov3d_ewa 的 +0.3 膨脹一致）。
+// comp∈(0,1]：次像素高斯 comp→小 → 降低其不透明度貢獻 → 抗鋸齒。乘在 alpha（非存回 opac），
+// 且對 conic detach → 光柵器 backward 的 v_sigma/v_opacity/v_conic 公式自動保持正確。
+inline float mip_comp_from_conic(float3 conic) {
+    float detC = conic.x * conic.z - conic.y * conic.y;   // det(conic) = 1/det(dilated cov)
+    if (detC <= 1e-9f) return 1.0f;
+    float inv = 1.0f / detC;
+    float dxx = conic.z * inv, dyy = conic.x * inv, dxy = -conic.y * inv;  // dilated cov2d
+    float det_d = dxx * dyy - dxy * dxy;                                    // = inv
+    float oxx = dxx - 0.3f, oyy = dyy - 0.3f;                              // 原始（去膨脹）cov2d
+    float det_o = oxx * oyy - dxy * dxy;
+    if (det_d <= 1e-9f) return 1.0f;
+    if (det_o <= 0.0f) return 0.0f;   // 原始 cov 退化（次像素）→ 完全淡出
+    return sqrt(det_o / det_d);
+}
+
 kernel void nd_rasterize_forward_kernel(
     constant uint3& tile_bounds,
     constant uint3& img_size,
@@ -506,6 +523,7 @@ kernel void nd_rasterize_forward_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float  comp_batch[RAST_BLOCK_SIZE];   // Mip-Splatting 2D opacity 補償（每高斯）
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -523,6 +541,7 @@ kernel void nd_rasterize_forward_kernel(
             // Sequential reads from packed sorted-order buffers
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            comp_batch[tr] = mip_comp_from_conic(conic_batch[tr]);
             // packed_rgb has raw SH output — clamp_min(raw + 0.5, 0)
             const float3 raw_c = read_packed_float3(packed_rgb, idx);
             rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
@@ -538,6 +557,7 @@ kernel void nd_rasterize_forward_kernel(
         for (int t = 0; t < batch_size; ++t) {
             const float3 conic_local = conic_batch[t];
             const float3 xy_opac = xy_opacity_batch[t];
+            const float mip_comp = comp_batch[t];
             const float2 delta = {xy_opac.x - px, xy_opac.y - py};
 
             const float sigma = fma(0.5f,
@@ -552,7 +572,7 @@ kernel void nd_rasterize_forward_kernel(
                 continue;
             }
 
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            const float alpha = min(0.999f, xy_opac.z * mip_comp * exp(-sigma));
             if (alpha < 1.f / 255.f) {
                 continue;
             }
@@ -1030,7 +1050,9 @@ kernel void rasterize_backward_kernel(
                     valid = 0;
                 } else {
                     vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
+                    // Mip-Splatting 2D 補償乘在 alpha（與 forward 一致）：v_sigma=-alpha·v_alpha 自動含
+                    // comp、v_opacity=-v_sigma·(1-opac) comp 恰抵消、v_conic 因 comp detach 不變 → 全對。
+                    alpha = min(0.999f, opac * mip_comp_from_conic(b_conic) * vis);
                     if (alpha < 1.f / 255.f) {
                         valid = 0;
                     }
@@ -2606,6 +2628,59 @@ kernel void fused_loss_backward_kernel(
         v_rendered[(py * W + px) * 3 + c] = inv_n * (
             -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1
         );
+    }
+}
+
+// ============================================================================
+// 外觀校正（per-image 學習式仿射；bilateral guided 的核心：吸收逐幀曝光/白平衡差異）
+// affine 12 = M(3x3 row-major, 9) + t(3)。corrected = M·rgb + t。init 為 identity。
+// 作用在損失層（不動光柵器核心）：ssim/loss 比對 corrected vs gt；backward 把梯度鏈回 rendered
+// （v_rendered = Mᵀ·v_corrected）並累加 affine 梯度（threadgroup 歸約 → 每組僅 12 次 global atomic）。
+// ============================================================================
+
+kernel void appearance_forward_kernel(
+    constant float* in_img,        // (H,W,3) rendered
+    constant float* affine,        // 12
+    constant uint2& img_size,      // (W,H)
+    device float* corrected,       // (H,W,3)
+    uint2 gp [[thread_position_in_grid]]
+) {
+    if (gp.x >= img_size.x || gp.y >= img_size.y) return;
+    uint i = (gp.y * img_size.x + gp.x) * 3;
+    float r = in_img[i], g = in_img[i+1], b = in_img[i+2];
+    corrected[i]   = affine[0]*r + affine[1]*g + affine[2]*b + affine[9];
+    corrected[i+1] = affine[3]*r + affine[4]*g + affine[5]*b + affine[10];
+    corrected[i+2] = affine[6]*r + affine[7]*g + affine[8]*b + affine[11];
+}
+
+kernel void appearance_backward_kernel(
+    constant float* in_img,        // (H,W,3) rendered rgb（原始，供 affine 梯度）
+    constant float* affine,        // 12
+    constant uint2& img_size,      // (W,H)
+    device float* v_rendered,      // (H,W,3) in=v_corrected → out=v_rendered（就地）
+    device atomic_float* grad_affine,  // 12
+    uint2 gp [[thread_position_in_grid]],
+    uint sl [[thread_index_in_simdgroup]]
+) {
+    float gacc[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
+    if (gp.x < img_size.x && gp.y < img_size.y) {
+        uint i = (gp.y * img_size.x + gp.x) * 3;
+        float vr = v_rendered[i], vg = v_rendered[i+1], vb = v_rendered[i+2];  // v_corrected
+        float r = in_img[i], g = in_img[i+1], b = in_img[i+2];
+        // 鏈回 rendered：v_rendered = Mᵀ · v_corrected
+        v_rendered[i]   = affine[0]*vr + affine[3]*vg + affine[6]*vb;
+        v_rendered[i+1] = affine[1]*vr + affine[4]*vg + affine[7]*vb;
+        v_rendered[i+2] = affine[2]*vr + affine[5]*vg + affine[8]*vb;
+        // affine 梯度：grad_M[c][c'] += v_corrected[c]·rgb[c']；grad_t[c] += v_corrected[c]
+        gacc[0]=vr*r; gacc[1]=vr*g; gacc[2]=vr*b;
+        gacc[3]=vg*r; gacc[4]=vg*g; gacc[5]=vg*b;
+        gacc[6]=vb*r; gacc[7]=vb*g; gacc[8]=vb*b;
+        gacc[9]=vr;   gacc[10]=vg;  gacc[11]=vb;
+    }
+    // simdgroup 歸約後，每個 simdgroup 只做 12 次 device atomic（降競爭）
+    for (int k = 0; k < 12; k++) {
+        float s = simd_sum(gacc[k]);
+        if (sl == 0) atomic_fetch_add_explicit(&grad_affine[k], s, memory_order_relaxed);
     }
 }
 

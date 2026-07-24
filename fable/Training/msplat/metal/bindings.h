@@ -28,6 +28,11 @@ void msplat_gpu_sync();
 // 供相機姿態優化在 CPU 端組裝位姿梯度用。回傳 nullptr 表示尚未配置。
 const float* msplat_v_mean3d_data();
 
+// 外觀校正（per-image 學習式仿射）側通道：每步呼叫 train_step 前設當前相機 affine（12：M+t），
+// 呼叫後由 msplat_appearance_grad_data 讀回梯度（12，shared；須先 msplat_gpu_sync）做 CPU Adam。
+void msplat_set_appearance(const float* affine12, bool enabled);
+const float* msplat_appearance_grad_data();
+
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
 // Drains accumulated GPU times (ms per CB) into the provided vector. Thread-safe.

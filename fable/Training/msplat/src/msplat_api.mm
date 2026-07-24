@@ -131,6 +131,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     );
     impl->model->useMcmc = config.useMcmc;             // MCMC 密集化（預設開）
     impl->model->useCameraOpt = config.useCameraOpt;   // 相機姿態優化（預設開）
+    impl->model->useAppearance = config.useAppearance; // 外觀校正（預設開）
 
     impl->camIndices.resize(impl->ds->trainCams.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
@@ -163,13 +164,23 @@ Stats Trainer::step() {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
+    // 外觀校正：訓練前設定當前相機的 affine（供損失層以 corrected 比對 gt）。
+    if (impl->model->useAppearance) {
+        impl->model->appearanceEnsureInit(cam);
+        msplat_set_appearance(cam.appAffine, true);
+    } else {
+        msplat_set_appearance(nullptr, false);
+    }
+
     impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
     impl->model->schedulersStep(impl->currentStep);
-    // 相機姿態優化：需 backward 的 v_mean3d + 尚未被 MCMC noise 擾動的 means，故在 afterTrain 前。
-    // 先 sync 確保 v_mean3d/means 已落地（shared buffer）。
-    if (impl->model->useCameraOpt) {
+
+    // 姿態優化 + 外觀 Adam 皆需 backward 結果（v_mean3d / appearance_grad）已落地，且須在 MCMC noise
+    // 擾動 means 前。共用一次 sync。
+    if (impl->model->useCameraOpt || impl->model->useAppearance) {
         msplat_gpu_sync();
-        impl->model->cameraPoseStep(cam, impl->currentStep);
+        if (impl->model->useCameraOpt) impl->model->cameraPoseStep(cam, impl->currentStep);
+        if (impl->model->useAppearance) impl->model->appearanceStep(cam, impl->currentStep);
     }
     impl->model->afterTrain(impl->currentStep);
     msplat_commit();
@@ -383,6 +394,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.downscaleFactor = c.downscaleFactor;
     cfg.useMcmc = c.useMcmc;
     cfg.useCameraOpt = c.useCameraOpt;
+    cfg.useAppearance = c.useAppearance;
     memcpy(cfg.bgColor, c.bgColor, sizeof(cfg.bgColor));
     return cfg;
 }

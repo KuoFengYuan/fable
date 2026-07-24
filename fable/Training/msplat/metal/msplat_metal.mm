@@ -149,6 +149,9 @@ struct MetalContext {
     id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso;
     id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso;
     id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso;
+    // 外觀校正（per-image 學習式仿射）
+    id<MTLComputePipelineState> appearance_forward_kernel_cpso;
+    id<MTLComputePipelineState> appearance_backward_kernel_cpso;
     // Backward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso;
     id<MTLComputePipelineState> fused_adam_kernel_cpso;
@@ -252,6 +255,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
     ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
     ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
+    ctx->appearance_forward_kernel_cpso           = load(@"appearance_forward_kernel");
+    ctx->appearance_backward_kernel_cpso          = load(@"appearance_backward_kernel");
     // Backward pipeline
     ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
     ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
@@ -356,6 +361,8 @@ struct FusedTensorCache {
     MTensor out_img, final_Ts, final_idx;
     MTensor loss_intermediates;
     MTensor ssim_h_buf;
+    MTensor appearance_corrected;   // (H,W,3) 外觀校正後影像（隨影像尺寸）
+    MTensor appearance_grad;        // (12) 當步 affine 梯度累加（一次配置）
     MTensor tile_bins, loss_sum;
 
     // Tile-local sorting buffers
@@ -412,12 +419,14 @@ struct FusedTensorCache {
             img_height = ih; img_width = iw;
             out_img.reset(); final_Ts.reset(); final_idx.reset();
             loss_intermediates.reset(); ssim_h_buf.reset(); v_rendered.reset();
+            appearance_corrected.reset();
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
             loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            appearance_corrected = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -432,6 +441,9 @@ struct FusedTensorCache {
         }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+        }
+        if (!appearance_grad.defined()) {
+            appearance_grad = mtensor_empty(dev, {12}, DType::Float32);
         }
     }
 
@@ -474,6 +486,18 @@ void cleanup_msplat_metal() {
 // 供相機姿態優化在 CPU 端讀取上一次 backward 的世界系 mean 梯度（shared storage；須先 msplat_gpu_sync）。
 const float* msplat_v_mean3d_data() {
     return g_tcache.v_mean3d.defined() ? g_tcache.v_mean3d.data<float>() : nullptr;
+}
+
+// ── 外觀校正（per-image 學習式仿射）側通道：model 每步呼叫前設定當前相機 affine，呼叫後讀回梯度 ──
+static bool  g_app_enabled = false;
+static float g_app_affine[12] = {1,0,0,0, 0,1,0,0, 0,0,1,0};  // M(row-major)+t，identity 起始
+
+void msplat_set_appearance(const float* affine12, bool enabled) {
+    g_app_enabled = enabled;
+    if (affine12) for (int i = 0; i < 12; i++) g_app_affine[i] = affine12[i];
+}
+const float* msplat_appearance_grad_data() {   // 12 floats（shared；須先 msplat_gpu_sync）
+    return g_tcache.appearance_grad.defined() ? g_tcache.appearance_grad.data<float>() : nullptr;
 }
 
 // Internal forward pipeline — used by both msplat_render and msplat_train_step.
@@ -1022,30 +1046,55 @@ std::tuple<MTensor, float> msplat_train_step(
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
+
+        // 外觀校正 forward：corrected = M·out_img + t。損失改比對 corrected vs gt（吸收逐幀曝光/白平衡）。
+        MTensor &loss_in = g_app_enabled ? g_tcache.appearance_corrected : out_img;
+        if (g_app_enabled) {
+            [enc setComputePipelineState:ctx->appearance_forward_kernel_cpso];
+            ENC_BUF(enc, out_img, 0);
+            [enc setBytes:g_app_affine length:sizeof(g_app_affine) atIndex:1];
+            [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
+            ENC_BUF(enc, g_tcache.appearance_corrected, 3);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
         // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
         [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, loss_intermediates, 6); ENC_BUF(enc, loss_sum, 7);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // Pass 3: V bwd
+        // Pass 3: V bwd → v_rendered（此時 v_rendered 為 ∂loss/∂corrected）
         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, loss_intermediates, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, v_rendered, 6);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+
+        // 外觀校正 backward：v_rendered ← Mᵀ·v_corrected（就地）；同時累加 affine 梯度
+        if (g_app_enabled) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->appearance_backward_kernel_cpso];
+            ENC_BUF(enc, out_img, 0);
+            [enc setBytes:g_app_affine length:sizeof(g_app_affine) atIndex:1];
+            [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
+            ENC_BUF(enc, v_rendered, 3);
+            ENC_BUF(enc, g_tcache.appearance_grad, 4);
+            [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        }
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1183,6 +1232,8 @@ std::tuple<MTensor, float> msplat_train_step(
         // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
+        if (g_app_enabled)
+            [blit fillBuffer:g_tcache.appearance_grad.buffer() range:NSMakeRange(0, g_tcache.appearance_grad.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];

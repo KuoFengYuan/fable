@@ -42,6 +42,14 @@ struct Camera {
     float poseAdamV[6] = {};   // Adam 二階動量
     int   poseAdamStep = 0;
 
+    // 外觀校正（per-image 學習式仿射，bilateral guided 核心）：M(3x3 row-major,9)+t(3)=12。
+    // init 為 identity（起始無作用），Adam 精修以吸收本幀曝光/白平衡差異；僅作用於訓練損失。
+    bool  appInit = false;
+    float appAffine[12] = {};
+    float appAdamM[12] = {};
+    float appAdamV[12] = {};
+    int   appAdamStep = 0;
+
     // 訓練解析度上限（最長邊 px；0=不限）。手機端 12MP 光柵化是 O(像素數) → 又慢又吃記憶體；
     // 業界標準（Inria/gsplat/Scaniverse）皆限 ~1600。掃描原圖與匯出檔案不受此影響。
     int maxImageDim = 0;
