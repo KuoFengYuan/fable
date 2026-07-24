@@ -2610,6 +2610,59 @@ kernel void fused_loss_backward_kernel(
 }
 
 // ============================================================================
+// 外觀校正（per-image 學習式仿射；bilateral guided 的核心：吸收逐幀曝光/白平衡差異）
+// affine 12 = M(3x3 row-major, 9) + t(3)。corrected = M·rgb + t。init 為 identity。
+// 作用在損失層（不動光柵器核心）：ssim/loss 比對 corrected vs gt；backward 把梯度鏈回 rendered
+// （v_rendered = Mᵀ·v_corrected）並累加 affine 梯度（threadgroup 歸約 → 每組僅 12 次 global atomic）。
+// ============================================================================
+
+kernel void appearance_forward_kernel(
+    constant float* in_img,        // (H,W,3) rendered
+    constant float* affine,        // 12
+    constant uint2& img_size,      // (W,H)
+    device float* corrected,       // (H,W,3)
+    uint2 gp [[thread_position_in_grid]]
+) {
+    if (gp.x >= img_size.x || gp.y >= img_size.y) return;
+    uint i = (gp.y * img_size.x + gp.x) * 3;
+    float r = in_img[i], g = in_img[i+1], b = in_img[i+2];
+    corrected[i]   = affine[0]*r + affine[1]*g + affine[2]*b + affine[9];
+    corrected[i+1] = affine[3]*r + affine[4]*g + affine[5]*b + affine[10];
+    corrected[i+2] = affine[6]*r + affine[7]*g + affine[8]*b + affine[11];
+}
+
+kernel void appearance_backward_kernel(
+    constant float* in_img,        // (H,W,3) rendered rgb（原始，供 affine 梯度）
+    constant float* affine,        // 12
+    constant uint2& img_size,      // (W,H)
+    device float* v_rendered,      // (H,W,3) in=v_corrected → out=v_rendered（就地）
+    device atomic_float* grad_affine,  // 12
+    uint2 gp [[thread_position_in_grid]],
+    uint sl [[thread_index_in_simdgroup]]
+) {
+    float gacc[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
+    if (gp.x < img_size.x && gp.y < img_size.y) {
+        uint i = (gp.y * img_size.x + gp.x) * 3;
+        float vr = v_rendered[i], vg = v_rendered[i+1], vb = v_rendered[i+2];  // v_corrected
+        float r = in_img[i], g = in_img[i+1], b = in_img[i+2];
+        // 鏈回 rendered：v_rendered = Mᵀ · v_corrected
+        v_rendered[i]   = affine[0]*vr + affine[3]*vg + affine[6]*vb;
+        v_rendered[i+1] = affine[1]*vr + affine[4]*vg + affine[7]*vb;
+        v_rendered[i+2] = affine[2]*vr + affine[5]*vg + affine[8]*vb;
+        // affine 梯度：grad_M[c][c'] += v_corrected[c]·rgb[c']；grad_t[c] += v_corrected[c]
+        gacc[0]=vr*r; gacc[1]=vr*g; gacc[2]=vr*b;
+        gacc[3]=vg*r; gacc[4]=vg*g; gacc[5]=vg*b;
+        gacc[6]=vb*r; gacc[7]=vb*g; gacc[8]=vb*b;
+        gacc[9]=vr;   gacc[10]=vg;  gacc[11]=vb;
+    }
+    // simdgroup 歸約後，每個 simdgroup 只做 12 次 device atomic（降競爭）
+    for (int k = 0; k < 12; k++) {
+        float s = simd_sum(gacc[k]);
+        if (sl == 0) atomic_fetch_add_explicit(&grad_affine[k], s, memory_order_relaxed);
+    }
+}
+
+// ============================================================================
 // Depth-chunked rasterization kernels
 // ============================================================================
 
