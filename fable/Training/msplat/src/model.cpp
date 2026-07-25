@@ -165,6 +165,9 @@ static constexpr float kMrnfLogMinScale     = -23.0258509f; // log(1e-10)：退�
 static constexpr float kMrnfLasLong    = 0.5f;   // LAS：長軸 ×0.5
 static constexpr float kMrnfLasOther   = 0.85f;  // LAS：其餘兩軸 ×0.85
 static constexpr float kMrnfLasOpacity = 0.6f;   // LAS：父子各 0.6×σ
+// 候選池比例。必須 >> 每次 refine 要挑的數量，否則 Gumbel top-k 沒有選擇餘地（實測 7% 時
+// split==cand，引導形同關閉）。取梯度最高的 30%：以 n_add≈6% 計，池子約為需求的 5 倍。
+static constexpr float kMrnfCandFraction = 0.30f;
 
 // Gumbel top-k：依權重 w 做「不重複」加權取樣（Gumbel-max trick, Vieira 2014）。
 // key_i = log(w_i) + G_i，G_i = −log(−log U_i) ⇒ 取 key 最大的 k 個
@@ -295,7 +298,26 @@ void Model::mcmcRefine(int step){
         const float* vc = visCounts.data<float>();
         const float* m2d = have2D ? max2DSize.data<float>() : nullptr;
         const float halfMaxDim = 0.5f * (float)std::max(lastWidth, lastHeight);
-        cand.reserve((size_t)N/4); cw.reserve((size_t)N/4);
+        // 門檻改為「百分位」而非絕對值。實測用絕對值 densifyGradThresh 時候選只佔 ~7%，
+        // 導致 nSplit == cand.size()（池子被抽乾）→ Gumbel top-k 退化成「全拿」→
+        // 權重完全不起作用 → 梯度/細節引導實質失效。池子必須顯著大於要挑的數量才有選擇壓力。
+        // 百分位還順帶修掉解析度相依性：avgGrad ∝ halfMaxDim，coarse-to-fine 在 ds 切換那一步
+        // 會讓固定門檻的選擇性突然跳 2 倍（實測 step 1000 候選數暴增 2.4 倍）。
+        {
+            std::vector<float> g; g.reserve((size_t)N);
+            for(int i=0;i<N;i++){
+                if(isDead[(size_t)i] || vc[i] <= 0.0f) continue;
+                g.push_back((gn[i]/vc[i]) * halfMaxDim);
+            }
+            if(!g.empty()){
+                const size_t keep = std::max<size_t>(1, (size_t)(g.size() * kMrnfCandFraction));
+                std::nth_element(g.begin(), g.begin()+(g.size()-keep), g.end());
+                mrnfGradCut = g[g.size()-keep];      // 取梯度最高的 kMrnfCandFraction 比例
+            } else {
+                mrnfGradCut = densifyGradThresh;
+            }
+        }
+        cand.reserve((size_t)N/3); cw.reserve((size_t)N/3);
         for(int i=0;i<N;i++){
             if(isDead[(size_t)i] || vc[i] <= 0.0f) continue;
             const float avg = (gn[i]/vc[i]) * halfMaxDim;
@@ -305,8 +327,8 @@ void Model::mcmcRefine(int step){
             // msplat 既有已校準的門檻（原本只有梯度啟發式路徑在用，MRNF 路徑白白忽略了它）。
             const float over = (m2d && splitScreenSize > 0.0f) ? (m2d[i] / splitScreenSize) : 0.0f;
             float w = avg;
-            if(over > 1.0f) w = std::max(avg, densifyGradThresh) * over;  // 超出越多、權重越高
-            else if(!(avg > densifyGradThresh)) continue;                 // 梯度低且螢幕不大 → 跳過
+            if(over > 1.0f) w = std::max(avg, mrnfGradCut) * over;  // 超出越多、權重越高
+            else if(!(avg >= mrnfGradCut)) continue;                // 梯度低且螢幕不大 → 跳過
             cand.push_back(i); cw.push_back(w);
         }
         // 細節圖引導：×(1 + 0.25·score/median)，與 LichtFeld edge_guidance_factor 同形式

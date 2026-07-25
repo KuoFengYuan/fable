@@ -2040,7 +2040,28 @@ kernel void pack_sorted_gaussians_kernel(
 // Eliminates count→prefix_sum→scatter pipeline (3 dispatches + 3 barriers saved).
 
 #define SORT_TG_SIZE 256
-#define MAX_TILE_ELEMS 2048
+// per-tile 槽位數。從 2048 降到 512：bitonic sort 的 threadgroup 陣列是靜態配置的
+// （2048×8B = 16KB，Apple GPU 每核心 32KB → 只能駐留 2 個 threadgroup，延遲隱藏極差），
+// 512×4B = 2KB → 可駐留 8 個。prealloc_bins 也從 nt×2048×8B 降到 nt×512×4B（1/8）。
+// 之所以敢降：alpha 合成中第 k 顆（由近到遠）的貢獻 ∝ T_k = ∏(1-α_j) 幾何衰減，
+// 典型 α~0.1~0.5 時約 100 顆後 T<1e-5 → 512 已在看不見的尾巴裡。前提是「丟遠的、留近的」。
+#define MAX_TILE_ELEMS 512
+// 32-bit bin key = (12-bit 量化深度) << 20 | (20-bit gaussian id)。
+// 為何非得壓到 32 bits：實測本工具鏈完全不支援 64-bit atomic（load / CAS / fetch_min 皆
+// 編譯失敗），而「保留較近者」需要對 key 做原子比較。32-bit 的 atomic_fetch_min 可用，
+// 且 key 高位是深度 ⇒ fetch_min 恰好就是「較近者勝」，一道指令、無迴圈。
+#define TILE_KEY_ID_BITS   20
+#define TILE_KEY_ID_MASK   ((1u << TILE_KEY_ID_BITS) - 1u)   // 1048575 顆上限
+#define TILE_KEY_DEPTH_MAX 4095u                              // 2^12 - 1
+#define TILE_KEY_EMPTY     0xFFFFFFFFu
+// 倒數深度量化（像 depth buffer，把精度分配到近處，遠處反正被遮住）。
+// 固定範圍 [0.1, 200]m：z=0.5m→0.3mm、1m→2.4mm、5m→6cm，房間掃描綽綽有餘。
+inline uint tile_depth_quant(float z) {
+    const float inv_near = 1.0f / 0.1f, inv_far = 1.0f / 200.0f;
+    float t = (1.0f / max(z, 1e-4f) - inv_far) / (inv_near - inv_far);
+    // t 越大＝越近；key 要「越近越小」⇒ 取 1-t
+    return (uint)(clamp(1.0f - t, 0.0f, 1.0f) * (float)TILE_KEY_DEPTH_MAX);
+}
 
 // Scatter each gaussian's intersections directly into pre-allocated per-tile bins.
 // Each tile gets MAX_TILE_ELEMS slots. Per-tile atomics track fill count.
@@ -2052,7 +2073,7 @@ kernel void scatter_to_prealloc_bins_kernel(
     constant float* aabb                    [[buffer(4)]],
     constant uint3& tile_bounds             [[buffer(5)]],
     device atomic_uint* scatter_counters    [[buffer(6)]],
-    device uint64_t* prealloc_bins          [[buffer(7)]],
+    device atomic_uint* prealloc_bins       [[buffer(7)]],
     device atomic_uint* overflow_flag       [[buffer(8)]],
     uint idx [[thread_position_in_grid]]
 ) {
@@ -2063,19 +2084,29 @@ kernel void scatter_to_prealloc_bins_kernel(
     uint2 tile_min, tile_max;
     get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
 
-    uint depth_bits = as_type<uint>(depths[idx]);
+    uint key = (tile_depth_quant(depths[idx]) << TILE_KEY_ID_BITS) | (idx & TILE_KEY_ID_MASK);
 
     for (uint i = tile_min.y; i < tile_max.y; i++) {
         for (uint j = tile_min.x; j < tile_max.x; j++) {
             uint tile_id = i * tile_bounds.x + j;
             uint pos = atomic_fetch_add_explicit(&scatter_counters[tile_id], 1u, memory_order_relaxed);
+            uint slot;
             if (pos >= MAX_TILE_ELEMS) {
                 // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
                 atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
                 atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
-                continue;
+                // 不再直接丟棄：與某個既有項比深度，較近者勝出（fetch_min）。
+                // 於是被擠掉的一定是「較遠」的那顆 → 由 T_k 幾何衰減，視覺上等於免費。
+                // 舊行為是丟棄「競爭 atomic 失敗者」＝任意一顆，可能丟掉最近的、留下最遠的 →
+                // 表面破洞/透видно。這才是 overflow 造成畫面瑕疵的真正原因。
+                slot = pos % MAX_TILE_ELEMS;
+            } else {
+                slot = pos;
             }
-            prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
+            // 所有寫入統一走 fetch_min（槽位每步初始化為 TILE_KEY_EMPTY），
+            // 正常路徑的槽位互斥 ⇒ 等同單純寫入；溢出路徑則自然完成「較近者勝」。
+            atomic_fetch_min_explicit(&prealloc_bins[tile_id * MAX_TILE_ELEMS + slot],
+                                      key, memory_order_relaxed);
         }
     }
 }
@@ -2086,7 +2117,7 @@ kernel void scatter_to_prealloc_bins_kernel(
 kernel void bitonic_sort_per_tile_kernel(
     constant int* tile_offsets          [[buffer(0)]],
     constant int* tile_counts_in        [[buffer(1)]],
-    constant uint64_t* prealloc_bins    [[buffer(2)]],
+    constant uint* prealloc_bins        [[buffer(2)]],
     device int32_t* gaussian_ids_out    [[buffer(3)]],
     constant uint& num_tiles            [[buffer(4)]],
     // Pack buffers (fused sort+pack: eliminates separate pack dispatch)
@@ -2119,24 +2150,24 @@ kernel void bitonic_sort_per_tile_kernel(
     int n = 1;
     while (n < count) n <<= 1;
 
-    threadgroup uint64_t data[MAX_TILE_ELEMS];
+    threadgroup uint data[MAX_TILE_ELEMS];
 
     // Load from pre-allocated bins
-    uint64_t bin_base = (uint64_t)tg_id * MAX_TILE_ELEMS;
+    uint bin_base = tg_id * MAX_TILE_ELEMS;
     for (int i = (int)tid; i < n; i += SORT_TG_SIZE) {
-        data[i] = (i < count) ? prealloc_bins[bin_base + i] : 0xFFFFFFFFFFFFFFFFULL;
+        data[i] = (i < count) ? prealloc_bins[bin_base + i] : TILE_KEY_EMPTY;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Bitonic sort (ascending on uint64 — depth in upper 32 bits)
+    // Bitonic sort (ascending on uint32 — 量化深度在高 12 位 ⇒ 由近到遠)
     for (int k = 2; k <= n; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
             for (int i = (int)tid; i < (n >> 1); i += SORT_TG_SIZE) {
                 int pos = 2 * i - (i & (j - 1));
                 int partner = pos ^ j;
                 bool ascending = ((pos & k) == 0);
-                uint64_t a = data[pos];
-                uint64_t b = data[partner];
+                uint a = data[pos];
+                uint b = data[partner];
                 if ((a > b) == ascending) {
                     data[pos] = b;
                     data[partner] = a;
@@ -2148,7 +2179,7 @@ kernel void bitonic_sort_per_tile_kernel(
 
     // Fused sort+pack: extract gaussian IDs, read per-gaussian data, write packed buffers
     for (int i = (int)tid; i < count; i += SORT_TG_SIZE) {
-        int32_t g_id = (int32_t)(data[i] & 0xFFFFFFFF);
+        int32_t g_id = (int32_t)(data[i] & TILE_KEY_ID_MASK);
         int global_idx = start + i;
         gaussian_ids_out[global_idx] = g_id;
         float2 xy = read_packed_float2(xys, g_id);

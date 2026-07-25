@@ -350,6 +350,10 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // Cached buffer pool — all intermediate GPU buffers are reused across iterations.
 // Sizes only change at densification (every 100 steps); between densifications
 // this eliminates all per-iteration GPU allocations.
+// 必須與 shader 的 MAX_TILE_ELEMS / TILE_KEY_ID_BITS 一致（msplat_metal.metal）。
+static constexpr int64_t MSPLAT_MAX_TILE_ELEMS = 512;
+static constexpr int     MSPLAT_TILE_KEY_MAX_POINTS = (1 << 20) - 1;   // 20-bit id 上限
+
 struct FusedTensorCache {
     int fwd_num_points = 0, capacity = 0, img_height = 0, img_width = 0, num_tiles = 0;
     int loss_height = 0, loss_width = 0;   // 損失緩衝獨立追蹤（純 render 不配置）
@@ -368,7 +372,7 @@ struct FusedTensorCache {
 
     // Tile-local sorting buffers
     MTensor tile_offsets, tile_scatter_counters;
-    MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
+    MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint32 key — pre-allocated per-tile bins
 
     // Multi-threadgroup prefix sum temp buffer
     MTensor block_totals;
@@ -442,7 +446,8 @@ struct FusedTensorCache {
             tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
             tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
-            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
+            // 與 shader 的 MAX_TILE_ELEMS/32-bit key 一致：nt×512×4B（原本 nt×2048×8B，1/8）
+            prealloc_bins = mtensor_empty(dev, {(int64_t)nt * MSPLAT_MAX_TILE_ELEMS}, DType::Int32);
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -544,6 +549,16 @@ static void forward_pipeline(
         }
     }
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    // tile bin key 的 id 欄位只有 20 bits；超過會 wrap → 渲染到錯的高斯（靜默污染）。
+    if (num_points > MSPLAT_TILE_KEY_MAX_POINTS) {
+        static bool key_warned = false;
+        if (!key_warned) {
+            fprintf(stderr, "FATAL: num_points %d exceeds 20-bit tile-bin id limit (%d). "
+                    "請降低高斯上限，否則畫面會出現錯誤的高斯。\n",
+                    num_points, MSPLAT_TILE_KEY_MAX_POINTS);
+            key_warned = true;
+        }
+    }
     uint32_t channels = 3;
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
@@ -780,6 +795,9 @@ static void forward_pipeline(
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
+            // atomic_fetch_min 需要哨兵：0xFF 填滿 ⇒ 每個 32-bit word = TILE_KEY_EMPTY(0xFFFFFFFF)。
+            // 不清零的話上一步殘留的舊 key（可能更小＝更近）會永遠勝出。fill ≈0.08ms，可接受。
+            [blit fillBuffer:g_tcache.prealloc_bins.buffer() range:NSMakeRange(0, g_tcache.prealloc_bins.nbytes()) value:0xFF];
             [blit endEncoding];
 
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
@@ -1243,6 +1261,7 @@ std::tuple<MTensor, float> msplat_train_step(
         if (g_app_enabled)
             [blit fillBuffer:g_tcache.appearance_grad.buffer() range:NSMakeRange(0, g_tcache.appearance_grad.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
+        [blit fillBuffer:g_tcache.prealloc_bins.buffer() range:NSMakeRange(0, g_tcache.prealloc_bins.nbytes()) value:0xFF];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];
