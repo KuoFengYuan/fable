@@ -150,6 +150,15 @@ static constexpr float kMcmcOpacityDecayTotal = 0.564f;  // 整場 σ 空間總�
 // LichtFeld 用 prune_scale3d=0.1（×場景範圍）真的「剪掉」超大高斯；我們無剪枝路徑，改用夾限
 // （較溫和：高斯留著但不得再長大），這是 MCMC 路徑唯一的尺寸上界。
 static constexpr float kMcmcMaxScaleFrac = 0.05f;
+// 場景範圍的百分位（對齊 LichtFeld bounds_percentile=0.8）。用百分位而非 RMS 是為了抗離群點
+// ——LiDAR 穿透窗戶/姿態漂移都會在遠處撒點，RMS 會被平方項放大到失真。
+static constexpr double kMcmcBoundsPercentile = 0.8;
+// scale 上限相對「局部點距」的倍率。這是主要基準：一顆高斯該多大是「局部」性質
+// （由局部表面細節決定），不該由「全域場景多大」決定——房間與體育館的牆面細節尺度相同。
+// 原版 3DGS 用 0.1×scene_extent 是因為其資料集中場景範圍與內容尺度相關；但手持掃描常同時
+// 含近處室內與穿透窗戶的遠景（實測 extent(p80)=16.5 而房間僅 5~7），全域範圍就成了壞代理。
+// 3.5 是回歸實測：畫質尚可的那次 maxScale/scaleRef ≈ 3.6。
+static constexpr float kMcmcMaxScaleRatio = 3.5f;
 
 // ── MRNF 密集化（LichtFeld-Studio 的 MRNF strategy）──
 // 取代原本「依 opacity 的 CDF 取樣 + 原地複製」。三個關鍵差異：
@@ -165,6 +174,9 @@ static constexpr float kMrnfLogMinScale     = -23.0258509f; // log(1e-10)：退�
 static constexpr float kMrnfLasLong    = 0.5f;   // LAS：長軸 ×0.5
 static constexpr float kMrnfLasOther   = 0.85f;  // LAS：其餘兩軸 ×0.85
 static constexpr float kMrnfLasOpacity = 0.6f;   // LAS：父子各 0.6×σ
+// 候選池比例。必須 >> 每次 refine 要挑的數量，否則 Gumbel top-k 沒有選擇餘地（實測 7% 時
+// split==cand，引導形同關閉）。取梯度最高的 30%：以 n_add≈6% 計，池子約為需求的 5 倍。
+static constexpr float kMrnfCandFraction = 0.30f;
 
 // Gumbel top-k：依權重 w 做「不重複」加權取樣（Gumbel-max trick, Vieira 2014）。
 // key_i = log(w_i) + G_i，G_i = −log(−log U_i) ⇒ 取 key 最大的 k 個
@@ -295,7 +307,26 @@ void Model::mcmcRefine(int step){
         const float* vc = visCounts.data<float>();
         const float* m2d = have2D ? max2DSize.data<float>() : nullptr;
         const float halfMaxDim = 0.5f * (float)std::max(lastWidth, lastHeight);
-        cand.reserve((size_t)N/4); cw.reserve((size_t)N/4);
+        // 門檻改為「百分位」而非絕對值。實測用絕對值 densifyGradThresh 時候選只佔 ~7%，
+        // 導致 nSplit == cand.size()（池子被抽乾）→ Gumbel top-k 退化成「全拿」→
+        // 權重完全不起作用 → 梯度/細節引導實質失效。池子必須顯著大於要挑的數量才有選擇壓力。
+        // 百分位還順帶修掉解析度相依性：avgGrad ∝ halfMaxDim，coarse-to-fine 在 ds 切換那一步
+        // 會讓固定門檻的選擇性突然跳 2 倍（實測 step 1000 候選數暴增 2.4 倍）。
+        {
+            std::vector<float> g; g.reserve((size_t)N);
+            for(int i=0;i<N;i++){
+                if(isDead[(size_t)i] || vc[i] <= 0.0f) continue;
+                g.push_back((gn[i]/vc[i]) * halfMaxDim);
+            }
+            if(!g.empty()){
+                const size_t keep = std::max<size_t>(1, (size_t)(g.size() * kMrnfCandFraction));
+                std::nth_element(g.begin(), g.begin()+(g.size()-keep), g.end());
+                mrnfGradCut = g[g.size()-keep];      // 取梯度最高的 kMrnfCandFraction 比例
+            } else {
+                mrnfGradCut = densifyGradThresh;
+            }
+        }
+        cand.reserve((size_t)N/3); cw.reserve((size_t)N/3);
         for(int i=0;i<N;i++){
             if(isDead[(size_t)i] || vc[i] <= 0.0f) continue;
             const float avg = (gn[i]/vc[i]) * halfMaxDim;
@@ -305,8 +336,8 @@ void Model::mcmcRefine(int step){
             // msplat 既有已校準的門檻（原本只有梯度啟發式路徑在用，MRNF 路徑白白忽略了它）。
             const float over = (m2d && splitScreenSize > 0.0f) ? (m2d[i] / splitScreenSize) : 0.0f;
             float w = avg;
-            if(over > 1.0f) w = std::max(avg, densifyGradThresh) * over;  // 超出越多、權重越高
-            else if(!(avg > densifyGradThresh)) continue;                 // 梯度低且螢幕不大 → 跳過
+            if(over > 1.0f) w = std::max(avg, mrnfGradCut) * over;  // 超出越多、權重越高
+            else if(!(avg >= mrnfGradCut)) continue;                // 梯度低且螢幕不大 → 跳過
             cand.push_back(i); cw.push_back(w);
         }
         // 細節圖引導：×(1 + 0.25·score/median)，與 LichtFeld edge_guidance_factor 同形式
@@ -383,23 +414,43 @@ void Model::mcmcComputeScaleRefs(){
     if(N <= 0) return;
     const float* mn = means_buf.data<float>();
     const float* sc = scales_buf.data<float>();
-    double cx=0, cy=0, cz=0, ssum=0;
-    for(int i=0;i<N;i++){ cx+=mn[i*3+0]; cy+=mn[i*3+1]; cz+=mn[i*3+2]; }
-    cx/=N; cy/=N; cz/=N;
-    double r2=0;
+
+    // 全部改用穩健統計（中位數 / 百分位），不用平均與 RMS。
+    // 原因（實測）：某次掃描 LiDAR 穿透窗戶產生遠處離群點，sceneRMS 從正常房間的 ~5–7
+    // 暴增到 20.4（RMS 是距離「平方」的平均，對離群點極度敏感）→ maxScale = 0.05×RMS
+    // 被拉到 1.02（正常應 ~0.3）→ 巨大高斯夾限對房間內容實質失效 → 1 公尺級高斯活下來
+    // → 覆蓋大量 tile → bin 滿載 + 糊。scaleRef 用平均也同樣被污染（離群點 kNN 距離很大）。
+    // 對齊 LichtFeld 的 bounds_percentile=0.8：中心取各軸中位數、範圍取距離的 80 百分位。
+    auto axisMedian = [&](int a){
+        std::vector<float> v((size_t)N);
+        for(int i=0;i<N;i++) v[(size_t)i] = mn[i*3+a];
+        std::nth_element(v.begin(), v.begin()+v.size()/2, v.end());
+        return v[v.size()/2];
+    };
+    const float cx = axisMedian(0), cy = axisMedian(1), cz = axisMedian(2);
+
+    std::vector<float> dist((size_t)N), slin((size_t)N*3);
     for(int i=0;i<N;i++){
-        double dx=mn[i*3+0]-cx, dy=mn[i*3+1]-cy, dz=mn[i*3+2]-cz;
-        r2 += dx*dx+dy*dy+dz*dz;
-        ssum += std::exp(sc[i*3+0]) + std::exp(sc[i*3+1]) + std::exp(sc[i*3+2]);
+        const float dx=mn[i*3+0]-cx, dy=mn[i*3+1]-cy, dz=mn[i*3+2]-cz;
+        dist[(size_t)i] = std::sqrt(dx*dx+dy*dy+dz*dz);
+        slin[(size_t)i*3+0]=std::exp(sc[i*3+0]);
+        slin[(size_t)i*3+1]=std::exp(sc[i*3+1]);
+        slin[(size_t)i*3+2]=std::exp(sc[i*3+2]);
     }
-    float rms = (float)std::sqrt(r2/(double)N);          // 場景 RMS 半徑
-    mcmcScaleRef = (float)(ssum/(3.0*(double)N));
+    const size_t kExt = (size_t)((double)N * kMcmcBoundsPercentile);
+    std::nth_element(dist.begin(), dist.begin()+std::min(kExt, dist.size()-1), dist.end());
+    const float extent = dist[std::min(kExt, dist.size()-1)];   // 80 百分位半徑（抗離群）
+
+    std::nth_element(slin.begin(), slin.begin()+slin.size()/2, slin.end());
+    mcmcScaleRef = slin[slin.size()/2];                          // 初始線性 scale 中位數
     if(!(mcmcScaleRef > 1e-9f)) mcmcScaleRef = 1e-3f;
-    // 下界綁在 3×scaleRef：小/薄場景不會被夾到無法表達平面（牆面等大平板仍可用）。
-    // 舊值 8× 讓下界永遠勝出（實測 8×0.0924=0.739 > 0.1×5.333=0.533）→ 夾限形同虛設。
-    mcmcMaxScale = std::max(kMcmcMaxScaleFrac * rms, mcmcScaleRef * 3.0f);
-    fprintf(stderr, "MCMC reg refs: N=%d sceneRMS=%.4f scaleRef=%.5f maxScale=%.5f (ratio %.1fx)\n",
-            N, rms, mcmcScaleRef, mcmcMaxScale, mcmcMaxScale / mcmcScaleRef);
+    // 取「較緊」的一個（min）：以局部點距為主基準，全域範圍只當天花板。
+    // 舊版用 max() 取較寬鬆者，離群點一污染 extent 就整個失效（實測 maxScale 被拉到 5.4×scaleRef）。
+    mcmcMaxScale = std::min(kMcmcMaxScaleRatio * mcmcScaleRef, kMcmcMaxScaleFrac * extent);
+    if(!(mcmcMaxScale > 0.0f)) mcmcMaxScale = kMcmcMaxScaleRatio * mcmcScaleRef;   // extent 退化時的保險
+    fprintf(stderr, "MCMC reg refs: N=%d extent(p%.0f)=%.4f scaleRef(med)=%.5f maxScale=%.5f (ratio %.1fx)\n",
+            N, kMcmcBoundsPercentile*100.0, extent, mcmcScaleRef, mcmcMaxScale,
+            mcmcMaxScale / mcmcScaleRef);
 }
 
 // opacity / scale 退火衰減 + 巨大高斯硬上限（形式對齊 LichtFeld MRNF，見上方常數推導）。

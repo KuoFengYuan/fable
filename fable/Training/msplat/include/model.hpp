@@ -105,6 +105,7 @@ struct Model{
   std::mt19937 mcmcRng{1234567u};
   void mcmcRefine(int step);          // MRNF 密集化：梯度引導候選 + Gumbel top-k + Long Axis Split
   void mrnfLongAxisSplit(int parent, int child);  // 沿最長軸切兩半並 ±偏移（取代原地複製）
+  float mrnfGradCut = 0.0f;           // 本次 refine 的梯度百分位切點（解析度無關）
 
   // ── 誤差圖引導（MRNF use_error_map 等價；per-gaussian 累加，無新 Metal kernel）──
   // 梯度引導回答「哪裡還沒重建好」，細節圖回答「哪裡本來就有紋理」——兩者互補。
