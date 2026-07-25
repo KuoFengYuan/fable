@@ -153,6 +153,12 @@ static constexpr float kMcmcMaxScaleFrac = 0.05f;
 // 場景範圍的百分位（對齊 LichtFeld bounds_percentile=0.8）。用百分位而非 RMS 是為了抗離群點
 // ——LiDAR 穿透窗戶/姿態漂移都會在遠處撒點，RMS 會被平方項放大到失真。
 static constexpr double kMcmcBoundsPercentile = 0.8;
+// scale 上限相對「局部點距」的倍率。這是主要基準：一顆高斯該多大是「局部」性質
+// （由局部表面細節決定），不該由「全域場景多大」決定——房間與體育館的牆面細節尺度相同。
+// 原版 3DGS 用 0.1×scene_extent 是因為其資料集中場景範圍與內容尺度相關；但手持掃描常同時
+// 含近處室內與穿透窗戶的遠景（實測 extent(p80)=16.5 而房間僅 5~7），全域範圍就成了壞代理。
+// 3.5 是回歸實測：畫質尚可的那次 maxScale/scaleRef ≈ 3.6。
+static constexpr float kMcmcMaxScaleRatio = 3.5f;
 
 // ── MRNF 密集化（LichtFeld-Studio 的 MRNF strategy）──
 // 取代原本「依 opacity 的 CDF 取樣 + 原地複製」。三個關鍵差異：
@@ -438,8 +444,10 @@ void Model::mcmcComputeScaleRefs(){
     std::nth_element(slin.begin(), slin.begin()+slin.size()/2, slin.end());
     mcmcScaleRef = slin[slin.size()/2];                          // 初始線性 scale 中位數
     if(!(mcmcScaleRef > 1e-9f)) mcmcScaleRef = 1e-3f;
-    // 下界綁在 3×scaleRef：小/薄場景不會被夾到無法表達平面（牆面等大平板仍可用）。
-    mcmcMaxScale = std::max(kMcmcMaxScaleFrac * extent, mcmcScaleRef * 3.0f);
+    // 取「較緊」的一個（min）：以局部點距為主基準，全域範圍只當天花板。
+    // 舊版用 max() 取較寬鬆者，離群點一污染 extent 就整個失效（實測 maxScale 被拉到 5.4×scaleRef）。
+    mcmcMaxScale = std::min(kMcmcMaxScaleRatio * mcmcScaleRef, kMcmcMaxScaleFrac * extent);
+    if(!(mcmcMaxScale > 0.0f)) mcmcMaxScale = kMcmcMaxScaleRatio * mcmcScaleRef;   // extent 退化時的保險
     fprintf(stderr, "MCMC reg refs: N=%d extent(p%.0f)=%.4f scaleRef(med)=%.5f maxScale=%.5f (ratio %.1fx)\n",
             N, kMcmcBoundsPercentile*100.0, extent, mcmcScaleRef, mcmcMaxScale,
             mcmcMaxScale / mcmcScaleRef);
