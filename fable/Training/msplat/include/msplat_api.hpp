@@ -33,6 +33,8 @@ struct Config {
     bool useMcmc = true;        // MCMC 密集化（取代梯度啟發式）
     bool useCameraOpt = true;   // 相機姿態優化（SE3 per-camera Adam）
     bool useAppearance = true;  // per-image 學習式仿射外觀校正
+    bool useDepthSupervision = true;  // LiDAR 深度監督
+    bool useEdgeGuidance = true;      // 誤差圖引導密集化（MRNF use_error_map）
     float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
 };
 

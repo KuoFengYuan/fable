@@ -1,3 +1,5 @@
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -100,12 +102,16 @@ Model::Model(const InputData &inputData, int numCameras,
         featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
     }
 
-    // Opacities: logit(0.1) = log(0.1/0.9)
+    // 初始 opacity。原版 3DGS（梯度啟發式）用 0.1；MCMC 系列一律用 0.5
+    // （3DGS-MCMC 論文、gsplat MCMC strategy、LichtFeld-Studio init_opacity=0.5）。
+    // 理由：MCMC 靠 relocate 重分配透明度，new_op = 1−(1−o)^(1/n)。從 0.1 起跳時
+    // n=2 只得到 0.051（幾乎貼著 0.005 死亡門檻），relocation 的 scale 修正也跟著失真；
+    // 從 0.5 起跳得到 0.293，才是這套公式設計的工作點。稀疏點雲(19k)下尤其明顯。
     {
-        float logit01 = std::log(0.1f / 0.9f);
+        float logitInit = std::log(0.5f / 0.5f);   // = 0
         opacities = gpu_empty({numPoints, 1}, DType::Float32);
         float *op = opacities.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) op[i] = logit01;
+        for (int64_t i = 0; i < numPoints; i++) op[i] = logitInit;
     }
 
     // Background color — default is magenta (high-contrast against typical scenes,
@@ -117,49 +123,134 @@ Model::Model(const InputData &inputData, int numCameras,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MCMC 密集化（3DGS-MCMC, arXiv:2404.09591）；relocation 公式對齊 gsplat compute_relocation。
+// MCMC / MRNF 密集化。基底是 3DGS-MCMC（arXiv:2404.09591）的 SGLD 噪聲探索，
+// 密集化本體改用 LichtFeld-Studio 的 MRNF strategy（見下方 kMrnf* 常數）。
 // msplat 的參數緩衝為 MTLStorageModeShared → 直接在 CPU 端操作（免新寫 Metal kernel，低風險）。
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int   kMcmcNMax    = 51;      // 二項式表大小 / ratio 上限
-static constexpr float kMcmcMinOpac = 0.005f;  // 死高斯門檻（sigmoid 後）
 static constexpr float kMcmcNoiseLr = 5e5f;    // SGLD 噪聲尺度（× 當前 means lr）
 static constexpr float kMcmcNoiseT  = 0.005f;  // 噪聲 opacity 閘門轉折點
 static constexpr float kMcmcNoiseK  = 100.0f;  // 噪聲 opacity 閘門銳度
-static constexpr float kMcmcGrowRate= 1.12f;   // 每 refine 成長倍率（手機短排程較 gsplat 5% 積極）
+static constexpr float kMcmcGrowRate= 1.12f;   // 成長倍率下界/回退值
+static constexpr float kMcmcGrowMax = 1.35f;   // 單次 refine 成長上限（避免一次暴衝）
+// 正則化：形式與強度對齊 LichtFeld-Studio 的 MRNF decay
+//   （src/training/kernels/mrnf_kernels.cu，MrNeRF/LichtFeld-Studio）：
+//     opac  = sigmoid(u) − opacity_decay·(1−t)      → 再 logit 回去（作用在「σ 空間」，非 logit）
+//     scale = exp(w) · (1 − scale_decay·(1−t))      → 乘性衰減（＝log 空間平移）
+//   (1−t) 隨訓練退火 ⇒ 後期收斂不再被壓縮，穩定。
+//
+// 關鍵：不能照抄它的 per-application 常數。它每次 refine 才 apply_decay（30000 步 / 245 次），
+// 我們是每 kMcmcCpuEvery 步施加（6000 步 / ~1375 次）→ 必須換算「整場總量」才等價。
+// LichtFeld 總量（refine 落在 600..24900，245 次，avg(1−t)=0.575）：
+//   scale  : ln∏(1−0.002·(1−t)) = −0.002×245×0.575 = −0.282  ⇒ 平均尺度縮至 75%
+//   opacity: Σ 0.004·(1−t)      =  0.004×245×0.575 =  0.564  ⇒ σ 總共減 0.564（壓力極大，
+//            刻意讓光度損失不護的高斯沉到死亡門檻 → 被 relocate 到需要的地方，這是 MCMC 的引擎）
+// 以「總量」定義常數、per-application 係數在執行期換算 → 改 maxSteps/攤提間隔都不會失準。
+static constexpr float kMcmcScaleShrinkTotal  = 0.282f;  // 整場 log 空間總收縮量
+static constexpr float kMcmcOpacityDecayTotal = 0.564f;  // 整場 σ 空間總衰減量
+// LichtFeld 用 prune_scale3d=0.1（×場景範圍）真的「剪掉」超大高斯；我們無剪枝路徑，改用夾限
+// （較溫和：高斯留著但不得再長大），這是 MCMC 路徑唯一的尺寸上界。
+static constexpr float kMcmcMaxScaleFrac = 0.05f;
+
+// ── MRNF 密集化（LichtFeld-Studio 的 MRNF strategy）──
+// 取代原本「依 opacity 的 CDF 取樣 + 原地複製」。三個關鍵差異：
+//   ① 候選由螢幕空間梯度引導：只在殘差大、且本輪真的被看到的地方長點
+//      （原本對全體依 opacity 取樣 → 點長在「已經很亮」的地方，跟「哪裡還沒重建好」無關）
+//   ② Gumbel top-k 不重複取樣（原本 CDF 可重複 → 同一顆被抽中 N 次 → 一堆完全重合的副本）
+//   ③ Long Axis Split：沿最長軸切成兩半並 ±偏移
+//      ← 這是畫面糊掉的根因。原地複製產生「位置相同、尺度相同」的子高斯，不帶任何新幾何
+//        資訊，只能靠 SGLD 噪聲推開，但噪聲閘門 sigmoid(-100(σ-0.005)) 只對接近死亡的高斯
+//        開啟 → 19k 長到 212k 實際上是每顆疊了 ~11 份 9cm 的重合副本。
+static constexpr float kMrnfPruneOpacityRaw = -5.54126358f; // logit(1/255)：剪枝門檻
+static constexpr float kMrnfLogMinScale     = -23.0258509f; // log(1e-10)：退化軸
+static constexpr float kMrnfLasLong    = 0.5f;   // LAS：長軸 ×0.5
+static constexpr float kMrnfLasOther   = 0.85f;  // LAS：其餘兩軸 ×0.85
+static constexpr float kMrnfLasOpacity = 0.6f;   // LAS：父子各 0.6×σ
+
+// Gumbel top-k：依權重 w 做「不重複」加權取樣（Gumbel-max trick, Vieira 2014）。
+// key_i = log(w_i) + G_i，G_i = −log(−log U_i) ⇒ 取 key 最大的 k 個
+//   ⇔ 依 w 不重複加權取樣。用 nth_element → O(M)，20 萬顆可接受。
+static void mrnfGumbelTopK(const std::vector<int>& cand, const std::vector<float>& w,
+                           int k, std::mt19937& rng, std::vector<int>& out){
+    out.clear();
+    const int M = (int)cand.size();
+    if(M <= 0 || k <= 0) return;
+    if(k >= M){ out = cand; return; }
+    std::vector<std::pair<float,int>> keys((size_t)M);
+    std::uniform_real_distribution<float> U(1e-12f, 1.0f);
+    for(int j=0;j<M;j++){
+        const float wj = w[(size_t)j];
+        const float key = (wj > 0.0f)
+            ? (std::log(wj) - std::log(-std::log(U(rng))))
+            : -std::numeric_limits<float>::infinity();
+        keys[(size_t)j] = {key, cand[(size_t)j]};
+    }
+    std::nth_element(keys.begin(), keys.begin()+k, keys.end(),
+                     [](const std::pair<float,int>& a, const std::pair<float,int>& b){
+                         return a.first > b.first;
+                     });
+    out.reserve((size_t)k);
+    for(int j=0;j<k;j++) if(std::isfinite(keys[(size_t)j].first)) out.push_back(keys[(size_t)j].second);
+}
+// CPU 端 O(N) 維護的攤提間隔。SGLD 是隨機漫步 → 位移變異數線性累加，
+// 「每 k 步、尺度 ×√k」與「每步、尺度 ×1」擴散係數相同（kσ²），CPU 成本卻只有 1/k。
+static constexpr int   kMcmcCpuEvery  = 4;
+static constexpr float kMcmcNoiseSqrtK = 2.0f;    // = √kMcmcCpuEvery
 
 static inline float mcmcSigmoid(float x){ return 1.0f/(1.0f+std::exp(-x)); }
 static inline float mcmcLogit(float p){ p=std::min(std::max(p,1e-7f),1.0f-1e-7f); return std::log(p/(1.0f-p)); }
 
-// 給定線性 opacity o、線性 scale s[3]（就地更新為 new_scale）、ratio n，回傳 new 線性 opacity。
-static float mcmcRelocate(const std::vector<float>& binoms, float o, float* s, int n){
-    if(n<1) n=1; if(n>=kMcmcNMax) n=kMcmcNMax-1;
-    float new_op = 1.0f - std::pow(1.0f - o, 1.0f/(float)n);
-    new_op = std::min(std::max(new_op, kMcmcMinOpac), 1.0f-1e-7f);
-    double denom=0.0;
-    for(int i=1;i<=n;i++)
-        for(int k=0;k<=i-1;k++){
-            double bin = binoms[(size_t)(i-1)*kMcmcNMax + k];   // C(i-1,k)
-            double sign = (k%2==0)?1.0:-1.0;
-            denom += bin * (sign/std::sqrt((double)(k+1))) * std::pow((double)new_op,(double)(k+1));
-        }
-    float coeff = (std::abs(denom)>1e-12) ? (float)((double)o/denom) : 1.0f;
-    for(int j=0;j<3;j++) s[j]*=coeff;
-    return new_op;
-}
-
-void Model::mcmcBuildBinoms(){
-    mcmcBinoms.assign((size_t)kMcmcNMax*kMcmcNMax, 0.0f);
-    for(int n=0;n<kMcmcNMax;n++)
-        for(int k=0;k<=n;k++)
-            mcmcBinoms[(size_t)n*kMcmcNMax+k] = (k==0||k==n) ? 1.0f
-                : mcmcBinoms[(size_t)(n-1)*kMcmcNMax+(k-1)] + mcmcBinoms[(size_t)(n-1)*kMcmcNMax+k];
-}
 
 void Model::mcmcCopyGaussian(int dst,int src){
     if(dst==src) return;
     int fr=(int)featuresRest_buf.stride0();
     auto cp=[&](MTensor& buf,int dim){ float* p=buf.data<float>(); std::memcpy(p+(size_t)dst*dim, p+(size_t)src*dim, (size_t)dim*sizeof(float)); };
     cp(means_buf,3); cp(scales_buf,3); cp(quats_buf,4); cp(featuresDc_buf,3); cp(featuresRest_buf,fr); cp(opacities_buf,1);
+}
+
+// Long Axis Split（LichtFeld densification_kernels.cu: long_axis_split_gaussians_inplace_kernel）
+// 沿最長主軸把一顆高斯切成兩顆：
+//   長軸 ×0.5、其餘兩軸 ×0.85、父子各 0.6×σ，位置沿該主軸的世界方向 ±exp(s_long)/2。
+// 父高斯就地變成其中一半，child slot 收另一半 → 一次呼叫真正細化了幾何。
+void Model::mrnfLongAxisSplit(int parent, int child){
+    float* mean = means_buf.data<float>();
+    float* scb  = scales_buf.data<float>();   // log
+    float* qtb  = quats_buf.data<float>();    // (w,x,y,z)
+    float* opb  = opacities_buf.data<float>();// logit
+
+    // 最長軸（log 單調 ⇒ 在 log 空間比較等價於線性空間比較）
+    int li = 0;
+    if(scb[parent*3+1] > scb[parent*3+li]) li = 1;
+    if(scb[parent*3+2] > scb[parent*3+li]) li = 2;
+    const float offMag = std::exp(scb[parent*3+li]) * 0.5f;
+
+    float qw=qtb[parent*4+0], qx=qtb[parent*4+1], qy=qtb[parent*4+2], qz=qtb[parent*4+3];
+    const float qn=std::sqrt(qw*qw+qx*qx+qy*qy+qz*qz);
+    if(qn>1e-9f){ const float iv=1.0f/qn; qw*=iv; qx*=iv; qy*=iv; qz*=iv; }
+    // row-major 3×3；取第 li 直行（R[li], R[li+3], R[li+6]）＝該主軸的世界方向
+    const float R[9]={
+        1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz),   2*(qx*qz+qw*qy),
+        2*(qx*qy+qw*qz),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx),
+        2*(qx*qz-qw*qy),   2*(qy*qz+qw*qx),   1-2*(qx*qx+qy*qy)
+    };
+    const float o0=R[li]*offMag, o1=R[li+3]*offMag, o2=R[li+6]*offMag;
+
+    // 新尺度（log 空間加常數 ＝ 線性空間乘常數）
+    const float lnLong=std::log(kMrnfLasLong), lnOther=std::log(kMrnfLasOther);
+    float ns[3];
+    for(int j=0;j<3;j++) ns[j] = scb[parent*3+j] + (j==li ? lnLong : lnOther);
+
+    const float newOp = mcmcLogit(mcmcSigmoid(opb[parent]) * kMrnfLasOpacity);
+
+    // 先存下原始位置，再複製（複製會把父的當前值搬過去）
+    const float p0=mean[parent*3+0], p1=mean[parent*3+1], p2=mean[parent*3+2];
+    mcmcCopyGaussian(child, parent);          // quat / SH / … 全部承襲
+
+    mean[parent*3+0]=p0+o0; mean[parent*3+1]=p1+o1; mean[parent*3+2]=p2+o2;
+    mean[child *3+0]=p0-o0; mean[child *3+1]=p1-o1; mean[child *3+2]=p2-o2;
+    for(int j=0;j<3;j++){ scb[parent*3+j]=ns[j]; scb[child*3+j]=ns[j]; }
+    opb[parent]=newOp; opb[child]=newOp;
+    // 父子的 Adam 動量都必須歸零（幾何被硬改，舊的一二階估計已失效）——與 LichtFeld 一致
+    mcmcResetAdam(parent); mcmcResetAdam(child);
 }
 
 void Model::mcmcResetAdam(int idx){
@@ -173,58 +264,174 @@ void Model::mcmcResetAdam(int idx){
 
 void Model::mcmcRefine(int step){
     const int N=num_active;
-    if(N<=1 || mcmcBinoms.empty()) return;
+    if(N<=1) return;
     float* opb=opacities_buf.data<float>();  // logit
     float* scb=scales_buf.data<float>();      // log
 
-    auto applyReloc=[&](int src,int count){
-        float o=mcmcSigmoid(opb[src]);
-        float sl[3]={std::exp(scb[src*3+0]),std::exp(scb[src*3+1]),std::exp(scb[src*3+2])};
-        float new_op=mcmcRelocate(mcmcBinoms,o,sl,count+1);
-        opb[src]=mcmcLogit(new_op);
-        scb[src*3+0]=std::log(std::max(sl[0],1e-9f));
-        scb[src*3+1]=std::log(std::max(sl[1],1e-9f));
-        scb[src*3+2]=std::log(std::max(sl[2],1e-9f));
-        mcmcResetAdam(src);
-    };
-    auto sampleByOpacity=[&](int cand_count,const int* cand,int n_samp,std::vector<int>& out,std::vector<int>& counts){
-        std::vector<double> cdf(cand_count);
-        double acc=0; for(int j=0;j<cand_count;j++){ int idx=cand?cand[j]:j; acc+=mcmcSigmoid(opb[idx]); cdf[j]=acc; }
-        std::uniform_real_distribution<double> U(0.0, acc>0?acc:1.0);
-        out.resize(n_samp);
-        for(int j=0;j<n_samp;j++){
-            double r=U(mcmcRng);
-            int lo=0,hi=cand_count-1;
-            while(lo<hi){int m=(lo+hi)/2; if(cdf[m]<r)lo=m+1; else hi=m;}
-            int idx=cand?cand[lo]:lo; out[j]=idx; counts[idx]++;
+    // ---- 1) 剪枝（MRNF refine 的條件）→ 產生可回收的 slot ----
+    // 我們的 num_active 是連續前綴、不能有洞，所以「回收」＝把 child 寫進死掉的 slot
+    // （功能等價於 LichtFeld 的 _free_mask soft-prune + fill_free_slots）。
+    std::vector<uint8_t> isDead((size_t)N, 0);
+    std::vector<int> dead; dead.reserve((size_t)N/8);
+    for(int i=0;i<N;i++){
+        bool bad = (opb[i] < kMrnfPruneOpacityRaw);
+        if(!bad){
+            const float smin = std::min(scb[i*3+0], std::min(scb[i*3+1], scb[i*3+2]));
+            bad = (smin < kMrnfLogMinScale);
         }
-    };
-
-    // ---- relocate：死高斯 → 依 opacity 取樣的存活高斯 ----
-    std::vector<int> dead, alive; dead.reserve(N/8); alive.reserve(N);
-    for(int i=0;i<N;i++){ (mcmcSigmoid(opb[i])<=kMcmcMinOpac ? dead : alive).push_back(i); }
-    int relocated=0;
-    if(!dead.empty() && !alive.empty()){
-        std::vector<int> srcs, counts(N,0);
-        sampleByOpacity((int)alive.size(), alive.data(), (int)dead.size(), srcs, counts);
-        for(int src:srcs){ if(counts[src]>0){ applyReloc(src,counts[src]); counts[src]=-1; } }
-        for(size_t j=0;j<dead.size();j++){ mcmcCopyGaussian(dead[j],srcs[j]); mcmcResetAdam(dead[j]); }
-        relocated=(int)dead.size();
+        if(bad){ isDead[(size_t)i] = 1; dead.push_back(i); }
     }
 
-    // ---- grow：依 opacity 取樣複製、append 到預算 ----
-    int n_target=std::min(buf_capacity,(int)std::ceil((double)N*kMcmcGrowRate));
-    int n_add=std::min(n_target-N, buf_capacity-N);
-    if(n_add>0){
-        std::vector<int> srcs, counts(N,0);
-        sampleByOpacity(N, nullptr, n_add, srcs, counts);
-        for(int src:srcs){ if(counts[src]>0){ applyReloc(src,counts[src]); counts[src]=-1; } }
-        for(int j=0;j<n_add;j++){ mcmcCopyGaussian(N+j,srcs[j]); mcmcResetAdam(N+j); }
-        num_active=N+n_add;
-        xysGradNorm.reset(); visCounts.reset(); max2DSize.reset();   // 隨新數量下步重配
+    // ---- 2) 候選集：MRNF 的 refine_candidates ----
+    //   (平均螢幕梯度 > densifyGradThresh) && (本輪可見)
+    //   avgGrad 與 msplat densify kernel 同單位：(Σ‖∇xy‖ / vis) × half_max_dim
+    //   → 直接沿用已校準的 densifyGradThresh，不用去換算 LichtFeld 的 0.003。
+    std::vector<int> cand; std::vector<float> cw;
+    const bool haveStats = xysGradNorm.defined() && visCounts.defined()
+                        && xysGradNorm.numel() >= N && visCounts.numel() >= N;
+    const bool have2D = max2DSize.defined() && max2DSize.numel() >= N;
+    if(haveStats){
+        const float* gn = xysGradNorm.data<float>();
+        const float* vc = visCounts.data<float>();
+        const float* m2d = have2D ? max2DSize.data<float>() : nullptr;
+        const float halfMaxDim = 0.5f * (float)std::max(lastWidth, lastHeight);
+        cand.reserve((size_t)N/4); cw.reserve((size_t)N/4);
+        for(int i=0;i<N;i++){
+            if(isDead[(size_t)i] || vc[i] <= 0.0f) continue;
+            const float avg = (gn[i]/vc[i]) * halfMaxDim;
+            // 螢幕空間過大者「優先分裂」而非剪枝：剪掉會留洞，LAS 切一半直接把螢幕面積砍 4×，
+            // 正是 per-tile overflow(>2048/tile) 的解。max2DSize 是視窗內最大正規化螢幕半徑
+            // （accumulate_grad_stats_kernel: radii × 1/max(H,W)），splitScreenSize=0.05 是
+            // msplat 既有已校準的門檻（原本只有梯度啟發式路徑在用，MRNF 路徑白白忽略了它）。
+            const float over = (m2d && splitScreenSize > 0.0f) ? (m2d[i] / splitScreenSize) : 0.0f;
+            float w = avg;
+            if(over > 1.0f) w = std::max(avg, densifyGradThresh) * over;  // 超出越多、權重越高
+            else if(!(avg > densifyGradThresh)) continue;                 // 梯度低且螢幕不大 → 跳過
+            cand.push_back(i); cw.push_back(w);
+        }
+        // 細節圖引導：×(1 + 0.25·score/median)，與 LichtFeld edge_guidance_factor 同形式
+        // （MRNF_EDGE_SCORE_WEIGHT=0.25，並以「正值中位數」正規化）。
+        if(useEdgeGuidance && (int)mrnfEdgeScore.size() >= N && !cand.empty()){
+            std::vector<float> es; es.reserve(cand.size());
+            for(int idx : cand){
+                const float c = mrnfEdgeCount[(size_t)idx];
+                es.push_back(c > 0.0f ? mrnfEdgeScore[(size_t)idx]/c : 0.0f);
+            }
+            std::vector<float> pos; pos.reserve(es.size());
+            for(float v : es) if(v > 0.0f) pos.push_back(v);
+            if(!pos.empty()){
+                std::nth_element(pos.begin(), pos.begin()+pos.size()/2, pos.end());
+                const float med = pos[pos.size()/2];
+                if(med > 1e-6f)
+                    for(size_t j=0;j<cw.size();j++) cw[j] *= (1.0f + 0.25f * (es[j]/med));
+            }
+        }
     }
-    std::cout << "MCMC step " << step << ": active=" << num_active
-              << " (relocated " << relocated << ", added " << n_add << ")" << std::endl;
+    // 首次 refine（統計剛重配、全為 0）時退回全體、權重用 opacity → 不會卡住成長。
+    if(cand.empty()){
+        cand.reserve((size_t)N); cw.reserve((size_t)N);
+        for(int i=0;i<N;i++){
+            if(isDead[(size_t)i]) continue;
+            cand.push_back(i); cw.push_back(mcmcSigmoid(opb[i]));
+        }
+    }
+
+    // ---- 3) 成長量：保留「在短排程內填滿預算」的自適應率 ----
+    // MRNF 原式是 候選數×grow_fraction(0.07)，那是為 145 次 refine 設計的；我們只有 24 次，
+    // 照抄會長不到預算（記憶體照付、畫質沒拿到）。改為解 rate^n = budget/N ⇒ rate=(budget/N)^(1/n)，
+    // 每次 refine 重算 → 自我修正，剛好在 stopSplitAt 前用滿。
+    int n_left = (stopSplitAt - 1 - step) / refineEvery + 1;   // 含本次，尚餘幾次 refine
+    if(n_left < 1) n_left = 1;
+    float rate = kMcmcGrowRate;
+    if(buf_capacity > N){
+        rate = (float)std::pow((double)buf_capacity/(double)N, 1.0/(double)n_left);
+        rate = std::min(std::max(rate, 1.02f), kMcmcGrowMax);
+    }
+    int n_add = std::min((int)std::ceil((double)N*rate) - N, buf_capacity - N);
+    if(n_add < 0) n_add = 0;
+
+    // ---- 4) Gumbel top-k 選 parent（不重複），每個 parent 做一次 Long Axis Split ----
+    int nSplit = std::min((int)dead.size() + n_add, (int)cand.size());
+    std::vector<int> parents;
+    mrnfGumbelTopK(cand, cw, nSplit, mcmcRng, parents);
+
+    int usedDead = 0, appended = 0;
+    for(int p : parents){
+        int childSlot;
+        if(usedDead < (int)dead.size())            childSlot = dead[(size_t)usedDead++];
+        else if(N + appended < buf_capacity)       childSlot = N + appended++;
+        else                                      break;
+        mrnfLongAxisSplit(p, childSlot);
+    }
+    num_active = N + appended;
+    if(!parents.empty()){
+        xysGradNorm.reset(); visCounts.reset(); max2DSize.reset();  // 下步重配並歸零累加窗
+    }
+    // 細節分也要歸零：它是「本 refine 視窗」的統計，跨窗累積會讓引導失去時效
+    if(!mrnfEdgeScore.empty()){
+        std::fill(mrnfEdgeScore.begin(), mrnfEdgeScore.end(), 0.0f);
+        std::fill(mrnfEdgeCount.begin(), mrnfEdgeCount.end(), 0.0f);
+    }
+    std::cout << "MRNF step " << step << ": active=" << num_active
+              << " (cand " << cand.size() << ", split " << parents.size()
+              << ", reused " << usedDead << ", appended " << appended << ")" << std::endl;
+}
+
+// 初始點雲統計 → 正則化的兩個參考量（只算一次；用初始值才不會隨訓練漂移）。
+void Model::mcmcComputeScaleRefs(){
+    const int N = num_active;
+    if(N <= 0) return;
+    const float* mn = means_buf.data<float>();
+    const float* sc = scales_buf.data<float>();
+    double cx=0, cy=0, cz=0, ssum=0;
+    for(int i=0;i<N;i++){ cx+=mn[i*3+0]; cy+=mn[i*3+1]; cz+=mn[i*3+2]; }
+    cx/=N; cy/=N; cz/=N;
+    double r2=0;
+    for(int i=0;i<N;i++){
+        double dx=mn[i*3+0]-cx, dy=mn[i*3+1]-cy, dz=mn[i*3+2]-cz;
+        r2 += dx*dx+dy*dy+dz*dz;
+        ssum += std::exp(sc[i*3+0]) + std::exp(sc[i*3+1]) + std::exp(sc[i*3+2]);
+    }
+    float rms = (float)std::sqrt(r2/(double)N);          // 場景 RMS 半徑
+    mcmcScaleRef = (float)(ssum/(3.0*(double)N));
+    if(!(mcmcScaleRef > 1e-9f)) mcmcScaleRef = 1e-3f;
+    // 下界綁在 3×scaleRef：小/薄場景不會被夾到無法表達平面（牆面等大平板仍可用）。
+    // 舊值 8× 讓下界永遠勝出（實測 8×0.0924=0.739 > 0.1×5.333=0.533）→ 夾限形同虛設。
+    mcmcMaxScale = std::max(kMcmcMaxScaleFrac * rms, mcmcScaleRef * 3.0f);
+    fprintf(stderr, "MCMC reg refs: N=%d sceneRMS=%.4f scaleRef=%.5f maxScale=%.5f (ratio %.1fx)\n",
+            N, rms, mcmcScaleRef, mcmcMaxScale, mcmcMaxScale / mcmcScaleRef);
+}
+
+// opacity / scale 退火衰減 + 巨大高斯硬上限（形式對齊 LichtFeld MRNF，見上方常數推導）。
+// 為什麼這同時提升品質與速度：
+//   · opacity 衰減把沒貢獻的高斯壓到死亡門檻 → 下次 refine 被 relocate 到真正需要的地方
+//     （＝固定預算用在刀口上，這是 MCMC 能贏梯度啟發式的核心機制）
+//   · scale 乘性衰減讓表面更薄 → 每顆觸及的 tile 更少（rasterize 成本是 O(觸及面積)）
+//   · 硬上限補上 MCMC 路徑完全缺失的尺寸控制（useMcmc 會 early-return 掉 checkHuge 剪枝）
+//     → 抑制覆蓋整幀的巨大高斯造成的 per-tile overflow(>2048/tile) 掉點與方塊感
+void Model::mcmcRegularize(int step){
+    const int N = num_active;
+    if(N <= 0 || mcmcMaxScale <= 0.0f) return;
+    // 把「整場總量」換算成本次施加的係數：總量 = c · Σ(1−t)，Σ(1−t) ≈ nApply · avg(1−t)。
+    const int nApply = std::max(1, (maxSteps - warmupLength) / kMcmcCpuEvery);
+    const float t0 = (float)warmupLength / (float)std::max(maxSteps, 1);
+    const float wSum = (float)nApply * (1.0f - 0.5f * (t0 + 1.0f));   // avg(1−t) = 1 − (t0+1)/2
+    if(wSum <= 1e-6f) return;
+    const float t = std::min(std::max((float)step / (float)std::max(maxSteps, 1), 0.0f), 1.0f);
+    const float tShrink = 1.0f - t;                                   // 退火：後期壓力趨零
+    const float od   =  (kMcmcOpacityDecayTotal / wSum) * tShrink;    // σ 空間減量
+    const float lnSf = -(kMcmcScaleShrinkTotal  / wSum) * tShrink;    // log 空間收縮量（乘性衰減）
+    float* opb = opacities_buf.data<float>();
+    float* scb = scales_buf.data<float>();
+    const float wMax = std::log(mcmcMaxScale);
+    for(int i=0;i<N;i++){
+        opb[i] = mcmcLogit(mcmcSigmoid(opb[i]) - od);   // mcmcLogit 已夾 [1e-7, 1−1e-7]
+        for(int j=0;j<3;j++){
+            float& w = scb[i*3+j];
+            w += lnSf;
+            if(w > wMax) w = wMax;
+        }
+    }
 }
 
 void Model::mcmcInjectNoise(float lr){
@@ -260,7 +467,6 @@ void Model::mcmcInjectNoise(float lr){
 
 void Model::setupOptimizers(){
     releaseOptimizers();
-    if(mcmcBinoms.empty()) mcmcBuildBinoms();
 
 
     num_active = means.size(0);
@@ -279,6 +485,7 @@ void Model::setupOptimizers(){
     allocBuf(featuresDc_buf, featuresDc);
     allocBuf(featuresRest_buf, featuresRest);
     allocBuf(opacities_buf, opacities);
+    if (mcmcScaleRef <= 0.0f) mcmcComputeScaleRefs();   // 用初始點雲統計；載入 checkpoint 後不重算
 
     static constexpr float lr_init[] = {0.00016f, 0.005f, 0.001f, 0.0025f, 0.000125f, 0.05f};
     MTensor *params[] = {&means, &scales, &quats, &featuresDc, &featuresRest, &opacities};
@@ -385,7 +592,14 @@ void Model::afterTrain(int step){
         // MCMC 路徑：取代梯度啟發式 clone/split/prune 與週期性 opacity reset。
         // 先 sync 確保本步 GPU Adam 已寫回 shared buffer，CPU 才能安全讀寫參數。
         msplat_gpu_sync();
-        if (step > warmupLength) mcmcInjectNoise(adam_lr[0]);   // 每步 SGLD 位置噪聲
+        // CPU 端 O(N) 維護攤提到每 kMcmcCpuEvery 步（速度）：
+        //   · SGLD 噪聲 ×√k → 擴散係數 kσ² 不變（隨機漫步變異數線性累加），統計行為等價
+        //   · 正則化 ×k    → 累積衰減量不變（單步衰減量極小，一階等價）
+        // 點數長到 300k 後這一趟正是成長最快的 O(N) 項，攤提剛好抵掉它。
+        if (step > warmupLength && step % kMcmcCpuEvery == 0) {
+            mcmcInjectNoise(adam_lr[0] * kMcmcNoiseSqrtK);
+            mcmcRegularize(step);
+        }
         if (step % refineEvery == 0 && step > warmupLength && step < stopSplitAt) {
             mcmcRefine(step);      // relocate 死高斯 + 成長到固定預算
             refreshViews();
@@ -831,6 +1045,89 @@ void Model::appearanceStep(Camera& cam, int step){
         cam.appAdamV[j] = kB2 * cam.appAdamV[j] + (1 - kB2) * g * g;
         float mh = cam.appAdamM[j] / bc1, vh = cam.appAdamV[j] / bc2;
         cam.appAffine[j] -= kLr * mh / (std::sqrt(vh) + kEps);
+    }
+}
+
+// LiDAR 深度監督（per-gaussian）：把近 LiDAR 表面的高斯沿光學軸拉到度量深度真值。
+// 使用修正後 viewmat（cam.cachedViewMat）；band 閘門確保只精修近表面高斯（安全）。
+// 誤差圖引導的累加（MRNF use_error_map 的等價實作）。
+// LichtFeld 的做法是 Canny → edge_rasterize（alpha 加權 splat 回高斯），需要一支新的光柵器 pass。
+// 這裡改成「投影取樣」：把高斯中心投到影像、直接讀 1/8 細節圖。差別是少了 alpha 加權，
+// 但這個量只當作 1.0~1.25 的權重乘數（不是損失項），點取樣的誤差不影響選點決策。
+// 好處：零新 Metal kernel、天然用到訓練當下的相機（等於 LichtFeld 的隨機取視角）。
+void Model::mrnfAccumEdge(Camera& cam, int step){
+    if (!useEdgeGuidance) return;
+    // 攤提：一個 refine 視窗(100 步)累積 ~12 個視角就足夠代表性，不必每步都掃 O(N)。
+    if (step % (kMcmcCpuEvery * 2) != 0) return;
+    if (!cam.edgeTried) cam.buildEdgeMap();        // lazy 建圖（每台相機只算一次）
+    if (cam.edgeW == 0 || !cam.cachedViewMat.defined()) return;
+
+    const int N = num_active;
+    if ((int)mrnfEdgeScore.size() < N){
+        mrnfEdgeScore.assign((size_t)buf_capacity, 0.0f);
+        mrnfEdgeCount.assign((size_t)buf_capacity, 0.0f);
+    }
+    const float* vm = (const float*)cam.cachedViewMat.data_ptr();  // world→cam (row-major)
+    const float W0=vm[0],W1=vm[1],W2=vm[2], W4=vm[4],W5=vm[5],W6=vm[6], W8=vm[8],W9=vm[9],W10=vm[10];
+    const float t0=vm[3],t1=vm[7],t2=vm[11];
+    const float fx=cam.fx, fy=cam.fy, cx=cam.cx, cy=cam.cy;
+    const int W=cam.width, H=cam.height;
+    if (W<=0 || H<=0) return;
+    const float* mean = means_buf.data<float>();
+    for (int i=0;i<N;i++){
+        const float x=mean[i*3], y=mean[i*3+1], z=mean[i*3+2];
+        const float vz = W8*x + W9*y + W10*z + t2;
+        if (vz <= 0.05f) continue;
+        const float px = fx*((W0*x + W1*y + W2*z + t0)/vz) + cx;
+        const float py = fy*((W4*x + W5*y + W6*z + t1)/vz) + cy;
+        if (px<0 || py<0 || px>=W || py>=H) continue;
+        // cam.fx/cx 是對「常駐(已裁上限)解析度 cam.width/height」校正過的 → 直接 /8 對到細節圖，
+        // 與訓練當下的 coarse-to-fine ds 無關。
+        const int eu = std::min((int)(px) / 8, cam.edgeW - 1);
+        const int ev = std::min((int)(py) / 8, cam.edgeH - 1);
+        mrnfEdgeScore[(size_t)i] += (float)cam.edgeMap[(size_t)ev * cam.edgeW + eu];
+        mrnfEdgeCount[(size_t)i] += 1.0f;
+    }
+}
+
+void Model::depthRefineStep(Camera& cam, int step){
+    if (!useDepthSupervision) return;
+    // 攤提（速度）：這是往 LiDAR 表面的收縮映射（每次施加把誤差砍 kLr），不是梯度累積 —— 少施加幾次
+    // 只影響收斂步數，不改收斂點。6000 步 ÷ 4 仍有 ~1400 次施加，遠超收斂所需。
+    if (step % kMcmcCpuEvery != 0) return;
+    if (!cam.lidarTried) cam.loadLidarDepth();     // lazy 載入
+    if (cam.lidarW == 0 || !cam.cachedViewMat.defined()) return;   // 無深度 / 無 viewmat
+    static constexpr float kBand = 0.10f;          // 只精修 |view_z - d_lidar| < 10cm 的高斯
+    static constexpr float kLr   = 0.5f;           // 每次校正誤差的比例
+    static constexpr float kMaxD = 8.0f;           // LiDAR 有效上限
+
+    const float* vm = (const float*)cam.cachedViewMat.data_ptr();  // world→cam (row-major)
+    const float W0=vm[0],W1=vm[1],W2=vm[2], W4=vm[4],W5=vm[5],W6=vm[6], W8=vm[8],W9=vm[9],W10=vm[10];
+    const float t0=vm[3],t1=vm[7],t2=vm[11];
+    const float fx=cam.fx, fy=cam.fy, cx=cam.cx, cy=cam.cy;
+    const int   W=cam.width, H=cam.height;
+    if (W<=0 || H<=0) return;
+    float* mean = means_buf.data<float>();
+    const int N = num_active;
+    for (int i=0;i<N;i++){
+        float x=mean[i*3], y=mean[i*3+1], z=mean[i*3+2];
+        float vz = W8*x + W9*y + W10*z + t2;                 // view-space depth
+        if (vz <= 0.05f) continue;
+        float vx = W0*x + W1*y + W2*z + t0;
+        float vy = W4*x + W5*y + W6*z + t1;
+        float px = fx*(vx/vz) + cx, py = fy*(vy/vz) + cy;    // 訓練影像像素座標
+        if (px<0 || py<0 || px>=W || py>=H) continue;
+        int lu = (int)(px / (float)W * cam.lidarW);          // → LiDAR 像素（FOV 不變的正規化對應）
+        int lv = (int)(py / (float)H * cam.lidarH);
+        if (lu<0 || lv<0 || lu>=cam.lidarW || lv>=cam.lidarH) continue;
+        int li = lv*cam.lidarW + lu;
+        if (!cam.lidarConf.empty() && cam.lidarConf[li] < 2) continue;   // 只用高信心
+        float d = cam.lidarDepth[li];
+        if (d <= 0.05f || d > kMaxD) continue;
+        float err = d - vz;
+        if (fabsf(err) > kBand) continue;                    // 只精修近表面高斯（安全閘門）
+        float dz = kLr * err;                                 // 沿光學軸移動：Δp = dz·(W row2)
+        mean[i*3+0] += dz*W8; mean[i*3+1] += dz*W9; mean[i*3+2] += dz*W10;
     }
 }
 

@@ -56,6 +56,23 @@ struct Camera {
     float datasetDownscale = 1.0f;   // 額外固定降採樣倍率（與 maxImageDim 取較強的縮小）
     bool calibrated = false;         // 內參校正只做一次
 
+    // LiDAR 深度監督用（度量真值）：depth/<stem>_depth.bin（ARKit sceneDepth 256×192 float32）+ _conf.bin。
+    // 由 filePath 推導路徑、lazy 載入；PINHOLE 才用（畸變 undistort 裁切會破壞 FOV 對應）。
+    std::vector<float> lidarDepth;
+    std::vector<uint8_t> lidarConf;
+    int lidarW = 0, lidarH = 0;
+    bool lidarTried = false;
+    void loadLidarDepth();
+
+    // 誤差圖引導（LichtFeld MRNF use_error_map 的等價實作，但不需要新的光柵器 pass）。
+    // 1/8 解析度的「高頻能量圖」：密集化只需要「這裡紋理多不多」的空間先驗，
+    // 不需要 Canny 的精確邊緣定位。1/8 → 200×150 uint8 ≈ 30KB/幀（120 幀約 3.6MB），
+    // 由常駐 pixels 一次算好後快取。見 Model::mrnfAccumEdge。
+    std::vector<uint8_t> edgeMap;
+    int edgeW = 0, edgeH = 0;
+    bool edgeTried = false;
+    void buildEdgeMap();
+
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);

@@ -14,6 +14,76 @@ using json = nlohmann::json;
 
 // ── Image loading ───────────────────────────────────────────────────────────
 
+// 高頻能量圖（MRNF use_error_map 的輕量等價物）。
+// 關鍵設計：在「全解析度」算梯度能量，再累加進 1/8 網格。
+// 不能先降採樣再算梯度——box filter 會把高頻抹掉，那正是我們要偵測的訊號。
+// 每格存該 8×8 區塊的平均梯度能量（正規化到 0..255）；只算一次、常駐。
+void Camera::buildEdgeMap() {
+    // 刻意「成功才設 edgeTried」：pixels 是訓練時 lazy 解碼的，若首次呼叫時還沒解碼完，
+    // 提前設 tried 會讓這台相機永遠拿不到細節圖（靜默失效）。重試成本只是一次 empty() 檢查。
+    if (pixels.empty() || width < 8 || height < 8) return;
+    edgeTried = true;
+    const int W = width, H = height;
+    edgeW = std::max(1, W / 8);
+    edgeH = std::max(1, H / 8);
+
+    std::vector<float> acc((size_t)edgeW * edgeH, 0.0f);
+    std::vector<uint32_t> cnt((size_t)edgeW * edgeH, 0u);
+
+    // 亮度的一階前向差分（|dI/dx| + |dI/dy|）；跳過最後一列/行避免越界
+    auto luma = [&](int x, int y) -> float {
+        const uint8_t* p = &pixels[((size_t)y * W + x) * 3];
+        return 0.299f * p[0] + 0.587f * p[1] + 0.114f * p[2];
+    };
+    for (int y = 0; y < H - 1; y++) {
+        const int by = std::min(y / 8, edgeH - 1);
+        for (int x = 0; x < W - 1; x++) {
+            const float c = luma(x, y);
+            const float e = std::fabs(luma(x + 1, y) - c) + std::fabs(luma(x, y + 1) - c);
+            const int bx = std::min(x / 8, edgeW - 1);
+            const size_t bi = (size_t)by * edgeW + bx;
+            acc[bi] += e;
+            cnt[bi] += 1u;
+        }
+    }
+
+    // 每格取平均，再依「本幀最大值」正規化到 0..255（跨幀的相對強度由
+    // mrnfAccumEdge 端的 median 正規化處理，這裡只要保住格內的相對關係）。
+    float mx = 0.0f;
+    for (size_t i = 0; i < acc.size(); i++) {
+        if (cnt[i]) acc[i] /= (float)cnt[i];
+        mx = std::max(mx, acc[i]);
+    }
+    edgeMap.assign(acc.size(), 0u);
+    if (mx <= 1e-6f) return;
+    const float inv = 255.0f / mx;
+    for (size_t i = 0; i < acc.size(); i++)
+        edgeMap[i] = (uint8_t)std::min(255.0f, acc[i] * inv);
+}
+
+void Camera::loadLidarDepth() {
+    lidarTried = true;
+    if (hasDistortion()) return;                  // undistort 裁切會破壞 FOV↔LiDAR 對應
+    fs::path img(filePath);                        // .../images/frame_XXXXX.jpg
+    fs::path depthDir = img.parent_path().parent_path() / "depth";
+    fs::path dpath = depthDir / (img.stem().string() + "_depth.bin");
+    std::error_code ec;
+    const int W = 256, H = 192;                    // ARKit sceneDepth 固定解析度
+    if (!fs::exists(dpath, ec) || fs::file_size(dpath, ec) != (uintmax_t)W * H * 4) return;
+    std::ifstream f(dpath, std::ios::binary);
+    lidarDepth.resize((size_t)W * H);
+    f.read(reinterpret_cast<char*>(lidarDepth.data()), (std::streamsize)W * H * 4);
+    if (!f) { lidarDepth.clear(); return; }
+    lidarW = W; lidarH = H;
+    fs::path cpath = depthDir / (img.stem().string() + "_conf.bin");
+    if (fs::exists(cpath, ec) && fs::file_size(cpath, ec) == (uintmax_t)W * H) {
+        std::ifstream cf(cpath, std::ios::binary);
+        lidarConf.resize((size_t)W * H);
+        cf.read(reinterpret_cast<char*>(lidarConf.data()), (std::streamsize)W * H);
+        if (!cf) lidarConf.clear();
+    }
+}
+
 void Camera::loadImage(float downscaleFactor) {
     Image raw = imreadRGB(filePath);
     if (raw.empty()) return;

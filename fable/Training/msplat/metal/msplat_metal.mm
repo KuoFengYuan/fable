@@ -352,6 +352,7 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // this eliminates all per-iteration GPU allocations.
 struct FusedTensorCache {
     int fwd_num_points = 0, capacity = 0, img_height = 0, img_width = 0, num_tiles = 0;
+    int loss_height = 0, loss_width = 0;   // 損失緩衝獨立追蹤（純 render 不配置）
     int bwd_num_points = 0, features_rest_bases = 0;
 
     // Forward intermediates
@@ -393,7 +394,7 @@ struct FusedTensorCache {
     // 預覽週期來回切換兩次，各洩漏 loss_intermediates(ih×iw×15 float，上百 MB) 等。這是記憶體線性爬升主因。
     // reset() 對在飛行中的 command buffer 安全：Metal 會自留資源直到 GPU 完成。
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
-                        id<MTLDevice> dev) {
+                        bool needLoss, id<MTLDevice> dev) {
         if (np != fwd_num_points) {
             fwd_num_points = np;
             xys.reset(); depths.reset(); radii_out.reset(); conics.reset();
@@ -418,15 +419,22 @@ struct FusedTensorCache {
         if (ih != img_height || iw != img_width) {
             img_height = ih; img_width = iw;
             out_img.reset(); final_Ts.reset(); final_idx.reset();
-            loss_intermediates.reset(); ssim_h_buf.reset(); v_rendered.reset();
             appearance_corrected.reset();
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
+            appearance_corrected = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        }
+        // 損失/反傳專用緩衝（15+15+3 = 33 float/px）只在真的要算損失時配置。
+        // 檢視器/預覽是純 forward render，卻會因為 ih/iw 改變（橫式訓練 → 直式全螢幕）
+        // 觸發這三顆重配：直式 ~3.16M px × 33 × 4B ≈ 417 MB，全是白花的。
+        // 疊在 300k 高斯的訓練常駐上就會讓 newBufferWithLength 回傳 nil → 綁 nil → 全黑。
+        if (needLoss && (ih != loss_height || iw != loss_width)) {
+            loss_height = ih; loss_width = iw;
+            loss_intermediates.reset(); ssim_h_buf.reset(); v_rendered.reset();
             loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            appearance_corrected = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         }
         if (nt != num_tiles) {
             num_tiles = nt;
@@ -539,7 +547,7 @@ static void forward_pipeline(
     uint32_t channels = 3;
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
-    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, compute_loss, ctx->device);
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
     MTensor &radii_out = g_tcache.radii_out;
@@ -855,8 +863,8 @@ std::tuple<MTensor, float> msplat_train_step(
     int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
     uint32_t channels = 3;
 
-    // --- Cached buffer pool ---
-    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    // --- Cached buffer pool ---（融合訓練步：一定會算損失＋反傳）
+    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, true, ctx->device);
     g_tcache.ensure_backward(num_points, features_rest_bases, ctx->device);
 
     MTensor &xys = g_tcache.xys;
