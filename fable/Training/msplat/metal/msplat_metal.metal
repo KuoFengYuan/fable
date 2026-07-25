@@ -2132,6 +2132,7 @@ kernel void bitonic_sort_per_tile_kernel(
     device float* packed_conic          [[buffer(10)]],
     device float* packed_rgb            [[buffer(11)]],
     device int* tile_bins               [[buffer(12)]],
+    constant uint& out_capacity         [[buffer(13)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
@@ -2142,12 +2143,28 @@ kernel void bitonic_sort_per_tile_kernel(
     int end = tile_offsets[tg_id];
     int start = end - count;
 
+    // 容量硬界。gaussian_ids_out / packed_* 只有 out_capacity 個 slot
+    // （= num_points × capacity_multiplier），但 tile_offsets 是 per-tile 計數的前綴和，
+    // 沒有任何機制保證「總和 ≤ out_capacity」——per-tile 夾限只限制單一 tile，不限制總和
+    // （最壞 num_tiles × MAX_TILE_ELEMS 遠大於 capacity）。
+    // 少了這道界，平均觸及 tile 數一旦超過 capacity_multiplier 就會越界寫，踩爛
+    // packed_xy_opac/conic/rgb → 光柵器讀到垃圾 → 整片 tile 顏色與形狀錯亂（＝方塊感）。
+    // 這裡改成「截斷」：超出預算的 tile 少畫一些高斯（畫面略缺），但絕不破壞記憶體。
+    if (start >= (int)out_capacity) {
+        if (tid == 0) write_packed_int2(tile_bins, tg_id, int2(0, 0));
+        return;
+    }
+    if (end > (int)out_capacity) {
+        end = (int)out_capacity;
+        count = end - start;
+    }
+
     // Write tile_bins for rasterizer
     if (tid == 0) {
         write_packed_int2(tile_bins, tg_id, int2(start, end));
     }
 
-    if (count == 0) return;
+    if (count <= 0) return;
 
     // Round up to next power of 2
     int n = 1;
