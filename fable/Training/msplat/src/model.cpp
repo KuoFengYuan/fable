@@ -150,6 +150,9 @@ static constexpr float kMcmcOpacityDecayTotal = 0.564f;  // 整場 σ 空間總�
 // LichtFeld 用 prune_scale3d=0.1（×場景範圍）真的「剪掉」超大高斯；我們無剪枝路徑，改用夾限
 // （較溫和：高斯留著但不得再長大），這是 MCMC 路徑唯一的尺寸上界。
 static constexpr float kMcmcMaxScaleFrac = 0.05f;
+// 場景範圍的百分位（對齊 LichtFeld bounds_percentile=0.8）。用百分位而非 RMS 是為了抗離群點
+// ——LiDAR 穿透窗戶/姿態漂移都會在遠處撒點，RMS 會被平方項放大到失真。
+static constexpr double kMcmcBoundsPercentile = 0.8;
 
 // ── MRNF 密集化（LichtFeld-Studio 的 MRNF strategy）──
 // 取代原本「依 opacity 的 CDF 取樣 + 原地複製」。三個關鍵差異：
@@ -405,23 +408,41 @@ void Model::mcmcComputeScaleRefs(){
     if(N <= 0) return;
     const float* mn = means_buf.data<float>();
     const float* sc = scales_buf.data<float>();
-    double cx=0, cy=0, cz=0, ssum=0;
-    for(int i=0;i<N;i++){ cx+=mn[i*3+0]; cy+=mn[i*3+1]; cz+=mn[i*3+2]; }
-    cx/=N; cy/=N; cz/=N;
-    double r2=0;
+
+    // 全部改用穩健統計（中位數 / 百分位），不用平均與 RMS。
+    // 原因（實測）：某次掃描 LiDAR 穿透窗戶產生遠處離群點，sceneRMS 從正常房間的 ~5–7
+    // 暴增到 20.4（RMS 是距離「平方」的平均，對離群點極度敏感）→ maxScale = 0.05×RMS
+    // 被拉到 1.02（正常應 ~0.3）→ 巨大高斯夾限對房間內容實質失效 → 1 公尺級高斯活下來
+    // → 覆蓋大量 tile → bin 滿載 + 糊。scaleRef 用平均也同樣被污染（離群點 kNN 距離很大）。
+    // 對齊 LichtFeld 的 bounds_percentile=0.8：中心取各軸中位數、範圍取距離的 80 百分位。
+    auto axisMedian = [&](int a){
+        std::vector<float> v((size_t)N);
+        for(int i=0;i<N;i++) v[(size_t)i] = mn[i*3+a];
+        std::nth_element(v.begin(), v.begin()+v.size()/2, v.end());
+        return v[v.size()/2];
+    };
+    const float cx = axisMedian(0), cy = axisMedian(1), cz = axisMedian(2);
+
+    std::vector<float> dist((size_t)N), slin((size_t)N*3);
     for(int i=0;i<N;i++){
-        double dx=mn[i*3+0]-cx, dy=mn[i*3+1]-cy, dz=mn[i*3+2]-cz;
-        r2 += dx*dx+dy*dy+dz*dz;
-        ssum += std::exp(sc[i*3+0]) + std::exp(sc[i*3+1]) + std::exp(sc[i*3+2]);
+        const float dx=mn[i*3+0]-cx, dy=mn[i*3+1]-cy, dz=mn[i*3+2]-cz;
+        dist[(size_t)i] = std::sqrt(dx*dx+dy*dy+dz*dz);
+        slin[(size_t)i*3+0]=std::exp(sc[i*3+0]);
+        slin[(size_t)i*3+1]=std::exp(sc[i*3+1]);
+        slin[(size_t)i*3+2]=std::exp(sc[i*3+2]);
     }
-    float rms = (float)std::sqrt(r2/(double)N);          // 場景 RMS 半徑
-    mcmcScaleRef = (float)(ssum/(3.0*(double)N));
+    const size_t kExt = (size_t)((double)N * kMcmcBoundsPercentile);
+    std::nth_element(dist.begin(), dist.begin()+std::min(kExt, dist.size()-1), dist.end());
+    const float extent = dist[std::min(kExt, dist.size()-1)];   // 80 百分位半徑（抗離群）
+
+    std::nth_element(slin.begin(), slin.begin()+slin.size()/2, slin.end());
+    mcmcScaleRef = slin[slin.size()/2];                          // 初始線性 scale 中位數
     if(!(mcmcScaleRef > 1e-9f)) mcmcScaleRef = 1e-3f;
     // 下界綁在 3×scaleRef：小/薄場景不會被夾到無法表達平面（牆面等大平板仍可用）。
-    // 舊值 8× 讓下界永遠勝出（實測 8×0.0924=0.739 > 0.1×5.333=0.533）→ 夾限形同虛設。
-    mcmcMaxScale = std::max(kMcmcMaxScaleFrac * rms, mcmcScaleRef * 3.0f);
-    fprintf(stderr, "MCMC reg refs: N=%d sceneRMS=%.4f scaleRef=%.5f maxScale=%.5f (ratio %.1fx)\n",
-            N, rms, mcmcScaleRef, mcmcMaxScale, mcmcMaxScale / mcmcScaleRef);
+    mcmcMaxScale = std::max(kMcmcMaxScaleFrac * extent, mcmcScaleRef * 3.0f);
+    fprintf(stderr, "MCMC reg refs: N=%d extent(p%.0f)=%.4f scaleRef(med)=%.5f maxScale=%.5f (ratio %.1fx)\n",
+            N, kMcmcBoundsPercentile*100.0, extent, mcmcScaleRef, mcmcMaxScale,
+            mcmcMaxScale / mcmcScaleRef);
 }
 
 // opacity / scale 退火衰減 + 巨大高斯硬上限（形式對齊 LichtFeld MRNF，見上方常數推導）。
