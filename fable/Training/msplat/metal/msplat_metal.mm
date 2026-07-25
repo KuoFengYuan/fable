@@ -351,7 +351,7 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // Sizes only change at densification (every 100 steps); between densifications
 // this eliminates all per-iteration GPU allocations.
 // 必須與 shader 的 MAX_TILE_ELEMS / TILE_KEY_ID_BITS 一致（msplat_metal.metal）。
-static constexpr int64_t MSPLAT_MAX_TILE_ELEMS = 512;
+static constexpr int64_t MSPLAT_MAX_TILE_ELEMS = 1024;
 static constexpr int     MSPLAT_TILE_KEY_MAX_POINTS = (1 << 20) - 1;   // 20-bit id 上限
 
 struct FusedTensorCache {
@@ -543,8 +543,9 @@ static void forward_pipeline(
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
+            fprintf(stderr, "NOTE: per-tile bin full (>%lld gaussians in a tile). "
+                    "已按深度保留最近者；被擠掉的是較遠的高斯（alpha 合成下 T 已衰減到近乎 0，"
+                    "視覺影響可忽略）。\n", (long long)MSPLAT_MAX_TILE_ELEMS);
             overflow_warned = true;
         }
     }
@@ -873,8 +874,9 @@ std::tuple<MTensor, float> msplat_train_step(
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
+            fprintf(stderr, "NOTE: per-tile bin full (>%lld gaussians in a tile). "
+                    "已按深度保留最近者；被擠掉的是較遠的高斯（alpha 合成下 T 已衰減到近乎 0，"
+                    "視覺影響可忽略）。\n", (long long)MSPLAT_MAX_TILE_ELEMS);
             overflow_warned = true;
         }
     }

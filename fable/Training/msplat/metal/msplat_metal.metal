@@ -2040,12 +2040,15 @@ kernel void pack_sorted_gaussians_kernel(
 // Eliminates count→prefix_sum→scatter pipeline (3 dispatches + 3 barriers saved).
 
 #define SORT_TG_SIZE 256
-// per-tile 槽位數。從 2048 降到 512：bitonic sort 的 threadgroup 陣列是靜態配置的
-// （2048×8B = 16KB，Apple GPU 每核心 32KB → 只能駐留 2 個 threadgroup，延遲隱藏極差），
-// 512×4B = 2KB → 可駐留 8 個。prealloc_bins 也從 nt×2048×8B 降到 nt×512×4B（1/8）。
-// 之所以敢降：alpha 合成中第 k 顆（由近到遠）的貢獻 ∝ T_k = ∏(1-α_j) 幾何衰減，
-// 典型 α~0.1~0.5 時約 100 顆後 T<1e-5 → 512 已在看不見的尾巴裡。前提是「丟遠的、留近的」。
-#define MAX_TILE_ELEMS 512
+// per-tile 槽位數 2048 → 1024。bitonic sort 的 threadgroup 陣列是靜態配置的：
+// 原本 2048×8B = 16KB，Apple GPU 每核心 32KB ⇒ 只能駐留 2 個 threadgroup，延遲隱藏極差。
+// 改 uint32 key 後 1024×4B = 4KB ⇒ 可駐留 8 個；prealloc_bins 也從 nt×2048×8B 降到
+// nt×1024×4B（1/4）。再往下砍到 512 對佔用率幾乎沒幫助（已被其他上限卡住），卻會少一半深度餘裕。
+// 餘裕估算：141k 顆 × ~9 tiles / 7500 tiles ≈ 169 顆/tile 平均，1024 約為平均的 6×。
+// alpha 合成中第 k 顆（由近到遠）的貢獻 ∝ T_k = ∏(1-α_j)：α~0.1~0.5 時約 100 顆後 T<1e-5，
+// 但 MCMC 會產生大量低透明度高斯，α~0.005 時 T_512=0.077（背景會透出）、T_1024=0.006。
+// 前提仍是「丟遠的、留近的」—— 見下方 atomic_fetch_min。
+#define MAX_TILE_ELEMS 1024
 // 32-bit bin key = (12-bit 量化深度) << 20 | (20-bit gaussian id)。
 // 為何非得壓到 32 bits：實測本工具鏈完全不支援 64-bit atomic（load / CAS / fetch_min 皆
 // 編譯失敗），而「保留較近者」需要對 key 做原子比較。32-bit 的 atomic_fetch_min 可用，
