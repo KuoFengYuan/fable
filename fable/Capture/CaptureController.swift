@@ -35,6 +35,9 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var assessment = QualityAssessment()
     @Published var keyframeCount = 0
     @Published var pointCount = 0
+    /// 融合完成度：已被足夠多幀觀測的表面占比。場景模式沒有涵蓋率圓頂，
+    /// 這是唯一能回答「掃夠了沒」的訊號；也比幀數有意義（站原地拍 100 幀是沒用的）。
+    @Published var fusionCompleteness: Double = 0
     @Published var coverage: Double = 0
     @Published var coverageHint: String?   // 缺角提醒：往哪補掃（物件模式圓頂）
     @Published var exportedZip: URL?
@@ -764,6 +767,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             visualizer?.updateTile(tile, transform: xform)
         }
         pointCount = await accumulator.count
+        fusionCompleteness = await accumulator.fusionCompleteness
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {

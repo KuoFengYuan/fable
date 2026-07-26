@@ -86,7 +86,11 @@ nonisolated struct TiledFusedGrid {
                 cell.color += (rgb - cell.color) * (w / total)
                 cell.weight = min(total, weightCap)
                 cell.bestScore = max(cell.bestScore, pt.score)
-                if cell.obs < 255 { cell.obs += 1 }
+                if cell.obs < 255 {
+                    cell.obs += 1
+                    // 跨過門檻的那一次才計數 → O(1) 維護，不必每幀掃全部 cell
+                    if cell.obs == UInt8(Self.kFullObs) { wellObserved += 1 }
+                }
                 tiles[tileKey]!.cells[cellKey] = cell
             } else {
                 tiles[tileKey]!.cells[cellKey] = FusedVoxelGrid.Cell(
@@ -120,6 +124,10 @@ nonisolated struct TiledFusedGrid {
             tiles[tileKey]!.cells = merged
             totalCells += merged.count
             dirtyTiles.insert(tileKey)
+        }
+        // 合併改變了 obs 分佈 → 重算。coarsen 很少發生，O(N) 可接受。
+        wellObserved = tiles.values.reduce(0) { acc, tile in
+            acc + tile.cells.values.reduce(0) { $1.obs >= UInt8(Self.kFullObs) ? $0 + 1 : $0 }
         }
         print("[PointCloud] 自動粗化 → voxel \(voxelSize * 100)cm，剩 \(totalCells) 點")
     }
@@ -168,8 +176,16 @@ nonisolated struct TiledFusedGrid {
                               indices: indices.withUnsafeBufferPointer { Data(buffer: $0) })
     }
 
-    /// 「觀測充分」的次數門檻（融合品質熱圖用）
+    /// 「觀測充分」的次數門檻（融合品質熱圖 / 完成度共用）
     static let kFullObs: Float = 6
+
+    /// 已達 kFullObs 次觀測的 cell 數（O(1) 維護）
+    private(set) var wellObserved = 0
+    /// 融合完成度：已充分觀測的表面占比。
+    /// 比「幀數」更有意義——100 幀站在原地拍是沒用的，這個量直接反映「表面被看夠了沒」。
+    var fusionCompleteness: Double {
+        totalCells > 0 ? Double(wellObserved) / Double(totalCells) : 0
+    }
 
     /// 全部磚標記為待重畫 —— 切換上色模式時必須重送幾何，否則只有之後變動的磚會換色
     mutating func markAllDirty() {

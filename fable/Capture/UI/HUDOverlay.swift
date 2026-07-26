@@ -138,6 +138,14 @@ struct HUDOverlay: View {
                     Label(String(format: "涵蓋 %.0f%%", controller.coverage * 100),
                           systemImage: "globe.asia.australia.fill")
                 }
+                // 融合完成度：場景模式沒有涵蓋率圓頂，這是唯一的「掃夠了沒」訊號。
+                // 顏色即結論——紅/橘代表大部分表面觀測不足，別急著停。
+                if controller.phase == .scanning {
+                    let f = controller.fusionCompleteness
+                    Label(String(format: "融合 %.0f%%", f * 100),
+                          systemImage: "square.stack.3d.up.fill")
+                        .foregroundStyle(f < 0.3 ? .red : (f < 0.6 ? .orange : .green))
+                }
                 Label(storageEstimate, systemImage: "internaldrive")
                 if !controller.hasLiDAR {
                     Label("無 LiDAR", systemImage: "exclamationmark.triangle")

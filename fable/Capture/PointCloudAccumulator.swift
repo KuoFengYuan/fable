@@ -142,6 +142,7 @@ actor PointCloudAccumulator {
     }
 
     var count: Int { grid.count }
+    var fusionCompleteness: Double { grid.fusionCompleteness }
 
     /// 反投影 + 過濾 + 融合（全部在 actor 執行緒，不佔 delegate 回呼）。
     /// anchorTransforms：各磚錨點當下變換（主執行緒每幀擷取），用於世界↔局部換算。
