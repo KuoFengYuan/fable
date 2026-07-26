@@ -130,6 +130,12 @@ final class CaptureController: NSObject, ObservableObject {
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
                 cfg.frameSemantics.insert(.smoothedSceneDepth)  // 平滑深度：點雲融合用
             }
+            // 場景重建網格：ARKit 以每一幀（60fps）的深度做 TSDF 融合並隨漂移修正更新。
+            // 我們的重融合只吃 ~120 個關鍵幀 → mesh 能補上關鍵幀漏掉的表面（天花板/角落）。
+            if config.useSceneMesh,
+               ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+                cfg.sceneReconstruction = .mesh
+            }
         }
         return cfg
     }
@@ -188,12 +194,13 @@ final class CaptureController: NSObject, ObservableObject {
         statusText = nil
         UIApplication.shared.isIdleTimerDisabled = false
         let refined = snapshotRefinedTransforms()   // 必須在 pause 前讀 anchors
+        let meshVerts = snapshotMeshVertices()      // 同上：pause 後 anchors 就讀不到了
         arView?.session.pause()                     // review 期間停止追蹤，省電省熱
         monitor.stop()
-        Task { await processScan(refinedTransforms: refined) }
+        Task { await processScan(refinedTransforms: refined, meshVertices: meshVerts) }
     }
 
-    private func processScan(refinedTransforms: [Int: [Double]]) async {
+    private func processScan(refinedTransforms: [Int: [Double]], meshVertices: [SIMD3<Float>]) async {
         guard let writer, let accumulator, let dir = sessionDir else {
             phase = .idle
             return
@@ -217,8 +224,10 @@ final class CaptureController: NSObject, ObservableObject {
             let onProg: @Sendable (Double) -> Void = { p in
                 Task { @MainActor [weak self] in self?.exportProgress = p }
             }
+            let mesh = meshVertices
             points = await Task.detached(priority: .userInitiated) {
-                RefusionEngine.refuse(records: records, sessionDir: dir, config: cfg, progress: onProg)
+                RefusionEngine.refuse(records: records, sessionDir: dir, config: cfg,
+                                      meshVertices: mesh, progress: onProg)
             }.value
         }
         if points.isEmpty {                          // 無 LiDAR / 無深度時退回即時累積雲
@@ -510,6 +519,29 @@ final class CaptureController: NSObject, ObservableObject {
         var out: [Int: [Double]] = [:]
         for (index, id) in keyframeAnchors {
             if let t = byID[id] { out[index] = MatrixUtil.rowMajor16(t) }
+        }
+        return out
+    }
+
+    /// 讀取 ARKit 場景重建網格的世界座標頂點（停止前呼叫，與姿態快照同一時機）。
+    /// 注意：ARGeometrySource 的頂點是 packed float3（stride 12B），
+    /// 不可直接 bind 成 SIMD3<Float>（Swift 的 SIMD3<Float> 佔 16B）—— 必須逐分量讀。
+    private func snapshotMeshVertices() -> [SIMD3<Float>] {
+        guard config.useSceneMesh,
+              let anchors = arView?.session.currentFrame?.anchors else { return [] }
+        var out: [SIMD3<Float>] = []
+        for case let mesh as ARMeshAnchor in anchors {
+            let src = mesh.geometry.vertices
+            guard src.format == .float3 else { continue }
+            let base = src.buffer.contents()
+            let m = mesh.transform
+            out.reserveCapacity(out.count + src.count)
+            for i in 0..<src.count {
+                let p = base.advanced(by: src.offset + i * src.stride)
+                              .assumingMemoryBound(to: Float.self)
+                let w = m * SIMD4<Float>(p[0], p[1], p[2], 1)
+                out.append(SIMD3<Float>(w.x, w.y, w.z))
+            }
         }
         return out
     }
