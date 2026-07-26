@@ -66,11 +66,22 @@ nonisolated struct CaptureConfig: Sendable {
     /// 想要最高細節設 0.01；房間尺度 3DGS 初始化 2cm 已足夠且更乾淨。
     var refuseVoxelSizeM: Float = 0.02
     /// 用單目深度（Depth Anything V2 Small, Core ML）補上 LiDAR 沒有回波的區域。
-    /// 只補洞、不取代任何 LiDAR 觀測 —— ARKit LiDAR 對 2cm voxel 其實是過取樣的
-    /// （256×192 → 每像素 5.36mrad，2m 處間距 10.7mm < 20mm voxel），
-    /// 拿推論值稀釋量測值只有壞處。真正缺的是「LiDAR 根本沒回波」的地方：
-    /// 低信心區、深色吸光表面、玻璃鏡面、超過 pointMaxDepthM。模型不在 bundle 時自動略過。
-    var useMDEHoleFill = true
+    ///
+    /// **預設關閉 —— 實測會產生殘影，而且是精度層級的問題，不是調參能解決的。**
+    /// 多幀 voxel 融合要不殘影，每幀深度誤差須遠小於 voxel(2cm)：3m 處的 2cm ＝ 0.67% 相對誤差。
+    /// MDE 經仿射對齊後的典型相對誤差是 5~10%（室內未見場景），樂觀取 2% 也有 6cm ＝ 3 個 voxel。
+    /// 差一個數量級，且誤差隨視角改變 —— 沒有機制讓不同幀對同一表面達成 2cm 內的共識，
+    /// 於是同一表面被各幀放到不同深度、疊成多層殼。LiDAR 則是 σ≈1cm@2m、多幀平均後 sub-cm，
+    /// 剛好在門檻內。
+    ///
+    /// 另一個結構性問題：能可靠填的洞沒價值，有價值的洞填不了 ——
+    ///   小洞（被 LiDAR 包圍）可靠，但相鄰高斯本來就會蓋過去；
+    ///   大洞（窗戶/鏡面/>5m）才是真正缺的，卻正是沒有 LiDAR 錨定、最不可靠的地方。
+    ///
+    /// 程式碼與守衛都保留（見 RefusionEngine.mdeHoleFill、DepthScaleFit），要實驗可打開。
+    /// 若要讓它真的可用，正解是「以洞的邊界 LiDAR 做局部仿射錨定」而非全幀單一 (a,b)，
+    /// 但那只改善小洞——即上表中沒價值的那一類。
+    var useMDEHoleFill = false
     /// 仿射對齊（1/z ≈ a·d + b）所需的最少 LiDAR 監督樣本數；不足則該幀不用 MDE
     var mdeMinSamples = 200
     /// 對齊殘差上限（逆深度空間，1/m）。超過代表該幀 MDE 與 LiDAR 不一致（反光/透明面誤導），
