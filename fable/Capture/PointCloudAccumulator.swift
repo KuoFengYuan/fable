@@ -148,15 +148,18 @@ actor PointCloudAccumulator {
     /// anchorTransforms：各磚錨點當下變換（主執行緒每幀擷取），用於世界↔局部換算。
     func integrate(_ packet: PointExtractor.FramePacket,
                    anchorTransforms: [Int64: simd_float4x4]) {
+        let camPos = SIMD3<Float>(packet.c2w.columns.3.x, packet.c2w.columns.3.y,
+                                  packet.c2w.columns.3.z)
         grid.insert(PointExtractor.extract(packet, config: config),
-                    anchorTransforms: anchorTransforms)
+                    anchorTransforms: anchorTransforms, cameraPosition: camPos)
     }
 
     /// 無 LiDAR 機種退路：累積 ARKit 稀疏特徵點（無色 → 中性灰、中等分數）
-    func integrateSparse(points: [SIMD3<Float>], anchorTransforms: [Int64: simd_float4x4]) {
+    func integrateSparse(points: [SIMD3<Float>], anchorTransforms: [Int64: simd_float4x4],
+                         cameraPosition: SIMD3<Float>) {
         grid.insert(points.map { CloudPoint(x: $0.x, y: $0.y, z: $0.z,
                                             r: 160, g: 160, b: 160, score: 0.5) },
-                    anchorTransforms: anchorTransforms)
+                    anchorTransforms: anchorTransforms, cameraPosition: cameraPosition)
     }
 
     /// 取走待建錨磚（主執行緒據此建立 ARAnchor）

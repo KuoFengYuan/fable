@@ -710,9 +710,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
                   frame.timestamp - lastSparseIntegration > 1.0 {
             lastSparseIntegration = frame.timestamp
             let points = featurePoints.points
+            let camPos = MatrixUtil.position(frame.camera.transform)
             previewInFlight = true
             Task {
-                await accumulator.integrateSparse(points: points, anchorTransforms: anchorSnapshot)
+                await accumulator.integrateSparse(points: points, anchorTransforms: anchorSnapshot,
+                                                  cameraPosition: camPos)
                 await self.flushTiles()
                 self.previewInFlight = false
             }

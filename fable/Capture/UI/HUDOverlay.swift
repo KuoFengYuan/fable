@@ -62,14 +62,15 @@ struct HUDOverlay: View {
         }
     }
 
-    /// 融合品質熱圖的圖例。只在熱圖模式顯示 —— 顏色本身要能自我解釋，
-    /// 否則使用者只會看到「畫面變紅色」而不知道那代表要補掃。
+    /// 熱圖圖例。只在熱圖模式顯示 —— 顏色本身要能自我解釋。
+    /// 量的是「從幾個不同方向看過」而非次數：站著不動連拍不會讓顏色前進，
+    /// 因為視差為零、幾何沒有被約束。
     @ViewBuilder
     private var fusionLegend: some View {
         if controller.phase == .scanning, controller.showPointCloud,
            controller.colorMode == .fusionQuality {
             HStack(spacing: 8) {
-                Text("融合").font(.caption2.weight(.semibold))
+                Text("視角").font(.caption2.weight(.semibold))
                 HStack(spacing: 3) {
                     ForEach(0..<7) { i in
                         let q = Double(i) / 6
@@ -80,7 +81,7 @@ struct HUDOverlay: View {
                             .frame(width: 14, height: 8)
                     }
                 }
-                Text("不足 → 充分").font(.caption2)
+                Text("單一角度 → 多角度").font(.caption2)
             }
             .foregroundStyle(.white)
             .padding(.horizontal, 12).padding(.vertical, 6)
@@ -147,8 +148,8 @@ struct HUDOverlay: View {
                 // 顏色即結論——紅/橘代表大部分表面觀測不足，別急著停。
                 if controller.phase == .scanning {
                     let f = controller.fusionCompleteness
-                    Label(String(format: "融合 %.0f%%", f * 100),
-                          systemImage: "square.stack.3d.up.fill")
+                    Label(String(format: "視角 %.0f%%", f * 100),
+                          systemImage: "arrow.triangle.turn.up.right.diamond.fill")
                         .foregroundStyle(f < 0.3 ? .red : (f < 0.6 ? .orange : .green))
                 }
                 Label(storageEstimate, systemImage: "internaldrive")
