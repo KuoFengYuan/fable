@@ -165,9 +165,12 @@ nonisolated enum RefusionEngine {
 
     /// 由磁碟上的關鍵幀（深度 .bin + JPEG + 修正後姿態）重建高品質融合點雲。
     /// 在背景執行緒同步執行；progress ∈ 0...1。
+    /// - meshVertices: ARKit 場景重建網格的世界座標頂點（可空）。用來補上關鍵幀沒拍到的表面
+    ///   —— ARKit 的 mesh 融合每一幀（60fps）的深度，而本函式只吃 ~120 個關鍵幀。
     static func refuse(records: [FrameRecord], sessionDir: URL, config: CaptureConfig,
+                       meshVertices: [SIMD3<Float>] = [],
                        progress: @Sendable (Double) -> Void) -> [CloudPoint] {
-        var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM, maxCells: config.maxPoints)
+        var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM, maxCells: config.refuseMaxCells)
         let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
         let imagesDir = sessionDir.appendingPathComponent("images", isDirectory: true)
         let total = max(1, records.count)
@@ -194,9 +197,34 @@ nonisolated enum RefusionEngine {
             grid.insert(unprojectStored(depth: depth, conf: conf, rgba: rgba,
                                         dw: dw, dh: dh, K: K, c2w: c2w,
                                         config: config, sharpness: sharpness))
+            // mesh 頂點：投影進本幀取色。同一頂點會被多幀命中 → 由 voxel 加權平均做多視角混色。
+            if !meshVertices.isEmpty {
+                grid.insert(projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
+                                        K: K, c2w: c2w, config: config, sharpness: sharpness))
+            }
         }
-        return grid.exportPoints(target: config.exportMaxPoints,
-                                 minNeighbors: config.refuseMinNeighbors)
+        // 診斷：這條鏈上有三處會悄悄粗化解析度（融合格觸頂、匯出擇優下採樣、訓練高斯預算），
+        // 而初始點距直接決定初始高斯大小（msplat 的初始 scale = 3-NN 距離）。
+        // 過去完全沒有數字，訓練端看到 15cm 的初始高斯卻無從得知是哪一段造成的。
+        let rawCells = grid.count
+        let gridVoxel = grid.voxelSize
+        let out = grid.exportPoints(target: config.exportMaxPoints,
+                                    minNeighbors: config.refuseMinNeighbors)
+        var msg = "Refusion: \(records.count) frames"
+        if !meshVertices.isEmpty { msg += " + \(meshVertices.count) mesh verts" }
+        msg += " -> \(rawCells) cells @ "
+        msg += String(format: "%.3f", gridVoxel) + "m"
+        if gridVoxel > config.refuseVoxelSizeM {
+            let steps = Int((log2(Double(gridVoxel / config.refuseVoxelSizeM))).rounded())
+            msg += String(format: " (觸頂粗化 %d 次，設定值 %.3fm)", steps, config.refuseVoxelSizeM)
+        }
+        msg += " -> 匯出 \(out.count) 點（上限 \(config.exportMaxPoints)）"
+        if out.count < rawCells {
+            msg += String(format: "，匯出端又粗化 %.1fx",
+                          (Double(rawCells) / Double(max(1, out.count))).squareRoot())
+        }
+        FileHandle.standardError.write(Data((msg + "\n").utf8))
+        return out
     }
 
     static func float4x4(rowMajor m: [Double]) -> simd_float4x4 {
@@ -209,6 +237,47 @@ nonisolated enum RefusionEngine {
 
     /// 與 PointExtractor 相同的過濾/評分（信心、範圍、飛點、中心/距離/清晰分數），
     /// 來源改為緊湊 Data（無 stride padding）
+    /// 把 mesh 頂點投影進一個關鍵幀取色，並用該幀的深度圖做可見性檢核。
+    /// 分數刻意壓低（×kMeshScore）：同格若有 LiDAR 直接觀測，加權平均由 LiDAR 主導；
+    /// mesh 只在「關鍵幀沒拍到」的空格補洞，不會稀釋既有的良好觀測。
+    private static let kMeshScore: Float = 0.25
+    private static func projectMesh(_ verts: [SIMD3<Float>], depth: Data, rgba: [UInt8],
+                                    dw: Int, dh: Int, K: CameraIntrinsics,
+                                    c2w: simd_float4x4, config: CaptureConfig,
+                                    sharpness: Float) -> [CloudPoint] {
+        let fx = Float(K.fx), fy = Float(K.fy), cx = Float(K.cx), cy = Float(K.cy)
+        let w2c = c2w.inverse
+        let minD = config.pointMinDepthM, maxD = config.pointMaxDepthM
+        let tol = config.meshColorDepthTolM
+
+        return depth.withUnsafeBytes { raw -> [CloudPoint] in
+            let d = raw.bindMemory(to: Float32.self)
+            var out: [CloudPoint] = []
+            out.reserveCapacity(verts.count / 8)
+            for p in verts {
+                let cam = w2c * SIMD4<Float>(p, 1)
+                // 相機系為 GL 慣例（-Z 前方）→ 可視深度 z = -cam.z
+                let z = -cam.z
+                if !(z > minD && z < maxD) { continue }
+                let u = fx * (cam.x / z) + cx
+                let v = fy * (-cam.y / z) + cy
+                let iu = Int(u), iv = Int(v)
+                if iu < 0 || iv < 0 || iu >= dw || iv >= dh { continue }
+                // 可見性：與該幀量到的深度一致才算「這一幀真的看到它」，否則是被遮擋的背面
+                let zm = d[iv * dw + iu]
+                if !zm.isFinite || abs(zm - z) > tol { continue }
+                let px = (iv * dw + iu) * 4
+                let ru = (u - cx) / Float(dw), rv = (v - cy) / Float(dh)
+                let central = 1 - min(1, (ru * ru + rv * rv).squareRoot() * 1.4) * 0.5
+                let near = 1 / (0.2 + z * z)
+                out.append(CloudPoint(x: p.x, y: p.y, z: p.z,
+                                      r: rgba[px], g: rgba[px + 1], b: rgba[px + 2],
+                                      score: central * near * sharpness * kMeshScore))
+            }
+            return out
+        }
+    }
+
     private static func unprojectStored(depth: Data, conf: [UInt8]?, rgba: [UInt8],
                                         dw: Int, dh: Int, K: CameraIntrinsics,
                                         c2w: simd_float4x4, config: CaptureConfig,
