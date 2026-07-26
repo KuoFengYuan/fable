@@ -84,6 +84,8 @@ final class CaptureController: NSObject, ObservableObject {
     private var frameCounter = 0
     private var pendingWrites = 0
     private var previewInFlight = false
+    /// 本幀是否已進過預覽融合（關鍵幀路徑與 10Hz 路徑可能落在同一幀，避免 obs 重複累加）
+    private var lastPreviewFrame = -1
     private var pixelBufferPool: CVPixelBufferPool?
     private var lastWarningHaptic: TimeInterval = 0
     private var lastSparseIntegration: TimeInterval = 0
@@ -673,6 +675,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
            !a.captureBlocked, a.blurPixels <= config.previewMaxBlurPixels,
            a.angularSpeedRadS <= config.previewMaxAngularSpeedRadS,
            a.linearSpeedMS <= config.previewMaxLinearSpeedMS {
+            lastPreviewFrame = frameCounter
             integratePreview(frame, blurPixels: a.blurPixels)
         }
 
@@ -690,6 +693,15 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         guard shutter.shouldCapture(pose: frame.camera.transform,
                                     time: frame.timestamp,
                                     config: config) else { return }
+        // 關鍵幀一律也進預覽融合。預覽的閘門比關鍵幀嚴很多
+        // （10Hz 取樣 + 角速度 0.6 vs 1.0、線速度 0.5 vs 0.8、模糊 12 vs 16），
+        // 所以會出現「掃了、關鍵幀也存了，但預覽沒點」——停止後重融合才冒出來。
+        // 這會讓融合熱圖說謊：把其實會有點的區域標成缺點，害使用者去重掃已經夠的地方。
+        // 讓預覽的覆蓋 ⊇ 重融合會用到的，熱圖才有參考價值。
+        if frameCounter != lastPreviewFrame {
+            lastPreviewFrame = frameCounter
+            integratePreview(frame, blurPixels: a.blurPixels)
+        }
         captureKeyframe(frame, assessment: a)
     }
 
