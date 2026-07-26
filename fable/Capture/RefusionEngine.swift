@@ -68,6 +68,10 @@ nonisolated struct FusedVoxelGrid {
         var color: SIMD3<Float>     // 加權平均顏色（0-255）
         var weight: Float           // 累積權重（封頂 → 指數移動平均，晚到的好觀測仍能修正）
         var bestScore: Float
+        /// 是否曾收到「量測」點（LiDAR 直接反投影）。false ＝ 這格只有推論來源（mesh/MDE）撐著。
+        /// 用來量化補充來源的實際貢獻：只有 measured==false 的格子才是真的補到新覆蓋。
+        /// 預設 true —— 即時預覽的 TiledFusedGrid 共用本型別但不追蹤來源。
+        var measured: Bool = true
     }
 
     private(set) var cells: [Int64: Cell] = [:]
@@ -81,8 +85,11 @@ nonisolated struct FusedVoxelGrid {
     }
 
     var count: Int { cells.count }
+    /// 只有推論來源（mesh/MDE）覆蓋、LiDAR 完全沒打到的格子數 ＝ 補充來源的實際新增覆蓋
+    var inferredOnlyCount: Int { cells.values.reduce(0) { $1.measured ? $0 : $0 + 1 } }
 
-    mutating func insert(_ candidates: [CloudPoint]) {
+    /// - measured: true ＝ LiDAR 直接反投影（量測）；false ＝ mesh / MDE（推論）
+    mutating func insert(_ candidates: [CloudPoint], measured: Bool = true) {
         for pt in candidates {
             let pos = SIMD3<Float>(pt.x, pt.y, pt.z)
             guard let key = PointCloudMath.voxelKey(pos, size: voxelSize) else { continue }
@@ -94,10 +101,12 @@ nonisolated struct FusedVoxelGrid {
                 cell.color += (rgb - cell.color) * (w / total)
                 cell.weight = min(total, weightCap)
                 cell.bestScore = max(cell.bestScore, pt.score)
+                cell.measured = cell.measured || measured
                 cells[key] = cell
             } else {
                 cells[key] = Cell(mean: pos, color: rgb,
-                                  weight: max(0.01, pt.score), bestScore: pt.score)
+                                  weight: max(0.01, pt.score), bestScore: pt.score,
+                                  measured: measured)
                 if cells.count >= maxCells { coarsen() }
             }
         }
@@ -115,6 +124,7 @@ nonisolated struct FusedVoxelGrid {
                 m.color += (cell.color - m.color) * (cell.weight / total)
                 m.weight = min(total, weightCap)
                 m.bestScore = max(m.bestScore, cell.bestScore)
+                m.measured = m.measured || cell.measured
                 merged[key] = m
             } else {
                 merged[key] = cell
@@ -203,7 +213,8 @@ nonisolated enum RefusionEngine {
             // mesh 頂點：投影進本幀取色。同一頂點會被多幀命中 → 由 voxel 加權平均做多視角混色。
             if !meshVertices.isEmpty {
                 grid.insert(projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
-                                        K: K, c2w: c2w, config: config, sharpness: sharpness))
+                                        K: K, c2w: c2w, config: config, sharpness: sharpness),
+                            measured: false)
             }
             // MDE 補洞：只在 LiDAR 無回波處產生點
             if let mde, config.useMDEHoleFill,
@@ -216,13 +227,14 @@ nonisolated enum RefusionEngine {
                                       c2w: c2w, config: config, sharpness: sharpness)
                 mdeAccepted += pts.isEmpty ? 0 : 1
                 mdePoints += pts.count
-                grid.insert(pts)
+                grid.insert(pts, measured: false)
             }
         }
         // 診斷：這條鏈上有三處會悄悄粗化解析度（融合格觸頂、匯出擇優下採樣、訓練高斯預算），
         // 而初始點距直接決定初始高斯大小（msplat 的初始 scale = 3-NN 距離）。
         // 過去完全沒有數字，訓練端看到 15cm 的初始高斯卻無從得知是哪一段造成的。
         let rawCells = grid.count
+        let inferredOnly = grid.inferredOnlyCount
         let gridVoxel = grid.voxelSize
         let out = grid.exportPoints(target: config.exportMaxPoints,
                                     minNeighbors: config.refuseMinNeighbors)
@@ -239,6 +251,11 @@ nonisolated enum RefusionEngine {
             msg += String(format: " (觸頂粗化 %d 次，設定值 %.3fm)", steps, config.refuseVoxelSizeM)
         }
         msg += " -> 匯出 \(out.count) 點（上限 \(config.exportMaxPoints)）"
+        if inferredOnly > 0 {
+            let pct = Double(inferredOnly) * 100 / Double(max(1, rawCells))
+            msg += String(format: "；其中 %d 格(%.1f%%) 是 LiDAR 沒覆蓋、只靠 mesh/MDE 撐著",
+                          inferredOnly, pct)
+        }
         if out.count < rawCells {
             msg += String(format: "，匯出端又粗化 %.1fx",
                           (Double(rawCells) / Double(max(1, out.count))).squareRoot())
