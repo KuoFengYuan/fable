@@ -65,6 +65,21 @@ nonisolated struct CaptureConfig: Sendable {
     /// 重融合 voxel 尺寸：比即時預覽（1cm）略粗，把遠距深度雜訊造成的「厚牆」塌成薄面。
     /// 想要最高細節設 0.01；房間尺度 3DGS 初始化 2cm 已足夠且更乾淨。
     var refuseVoxelSizeM: Float = 0.02
+    /// 用單目深度（Depth Anything V2 Small, Core ML）補上 LiDAR 沒有回波的區域。
+    /// 只補洞、不取代任何 LiDAR 觀測 —— ARKit LiDAR 對 2cm voxel 其實是過取樣的
+    /// （256×192 → 每像素 5.36mrad，2m 處間距 10.7mm < 20mm voxel），
+    /// 拿推論值稀釋量測值只有壞處。真正缺的是「LiDAR 根本沒回波」的地方：
+    /// 低信心區、深色吸光表面、玻璃鏡面、超過 pointMaxDepthM。模型不在 bundle 時自動略過。
+    var useMDEHoleFill = true
+    /// 仿射對齊（1/z ≈ a·d + b）所需的最少 LiDAR 監督樣本數；不足則該幀不用 MDE
+    var mdeMinSamples = 200
+    /// 對齊殘差上限（逆深度空間，1/m）。超過代表該幀 MDE 與 LiDAR 不一致（反光/透明面誤導），
+    /// 寧可放棄該幀也不要注入錯誤幾何
+    var mdeMaxRMSE: Float = 0.08
+    /// MDE 補洞點的分數倍率（LiDAR = 1.0、mesh = 0.25）。推論值，故低於量測值
+    var mdeScore: Float = 0.4
+    /// 每幀補洞點數上限（ROI-aware 取樣後）。避免大片無回波區灌爆點數預算
+    var mdeMaxPointsPerFrame = 8000
     /// 併入 ARKit 場景重建網格（ARMeshAnchor）的頂點作為補充幾何。
     /// 價值不在「更準」，而在**覆蓋率**：ARKit 的 mesh 融合的是每一幀（60fps）的深度，
     /// 而重融合只用 ~120 個關鍵幀 → mesh 會涵蓋關鍵幀沒拍到的表面（天花板/角落黑塊的主因）。

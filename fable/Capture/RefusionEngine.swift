@@ -174,6 +174,9 @@ nonisolated enum RefusionEngine {
         let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
         let imagesDir = sessionDir.appendingPathComponent("images", isDirectory: true)
         let total = max(1, records.count)
+        // 模型不在 bundle 裡就是 nil → 整條 MDE 路徑靜默略過，行為與改動前相同
+        let mde: DepthDensifier? = config.useMDEHoleFill ? DepthDensifier() : nil
+        var mdeAccepted = 0, mdePoints = 0
 
         for (i, r) in records.enumerated() {
             defer { progress(Double(i + 1) / Double(total)) }
@@ -202,6 +205,19 @@ nonisolated enum RefusionEngine {
                 grid.insert(projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
                                         K: K, c2w: c2w, config: config, sharpness: sharpness))
             }
+            // MDE 補洞：只在 LiDAR 無回波處產生點
+            if let mde, config.useMDEHoleFill,
+               let hiRGBA = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
+                                       width: mde.width, height: mde.height),
+               let disp = mde.inferDisparity(rgba: hiRGBA) {
+                let hiK = r.intrinsics.scaled(toWidth: mde.width, height: mde.height)
+                let pts = mdeHoleFill(disp: disp, hiRGBA: hiRGBA, mw: mde.width, mh: mde.height,
+                                      hiK: hiK, depth: depth, conf: conf, dw: dw, dh: dh,
+                                      c2w: c2w, config: config, sharpness: sharpness)
+                mdeAccepted += pts.isEmpty ? 0 : 1
+                mdePoints += pts.count
+                grid.insert(pts)
+            }
         }
         // 診斷：這條鏈上有三處會悄悄粗化解析度（融合格觸頂、匯出擇優下採樣、訓練高斯預算），
         // 而初始點距直接決定初始高斯大小（msplat 的初始 scale = 3-NN 距離）。
@@ -212,6 +228,10 @@ nonisolated enum RefusionEngine {
                                     minNeighbors: config.refuseMinNeighbors)
         var msg = "Refusion: \(records.count) frames"
         if !meshVertices.isEmpty { msg += " + \(meshVertices.count) mesh verts" }
+        if config.useMDEHoleFill {
+            msg += mde == nil ? " (MDE: 模型未載入)"
+                              : " + MDE \(mdePoints) 點/\(mdeAccepted) 幀"
+        }
         msg += " -> \(rawCells) cells @ "
         msg += String(format: "%.3f", gridVoxel) + "m"
         if gridVoxel > config.refuseVoxelSizeM {
@@ -237,6 +257,83 @@ nonisolated enum RefusionEngine {
 
     /// 與 PointExtractor 相同的過濾/評分（信心、範圍、飛點、中心/距離/清晰分數），
     /// 來源改為緊湊 Data（無 stride padding）
+    /// MDE 補洞：用同幀 LiDAR 擬合仿射還原（1/z ≈ a·d + b），只在 LiDAR 無回波處產生點。
+    ///
+    /// ROI-aware 取樣（論文用語意分割，我們用更便宜的等價物）：補洞點的取樣密度 ∝ 局部
+    /// RGB 梯度能量 —— 平坦牆面補稀、紋理複雜處補密。同一個訊號也用在 MRNF 的細節引導上。
+    private static func mdeHoleFill(disp: [Float], hiRGBA: [UInt8], mw: Int, mh: Int,
+                                    hiK: CameraIntrinsics,
+                                    depth: Data, conf: [UInt8]?, dw: Int, dh: Int,
+                                    c2w: simd_float4x4, config: CaptureConfig,
+                                    sharpness: Float) -> [CloudPoint] {
+        let minD = config.pointMinDepthM, maxD = config.pointMaxDepthM
+        let minConf = config.minDepthConfidence
+
+        return depth.withUnsafeBytes { raw -> [CloudPoint] in
+            let d = raw.bindMemory(to: Float32.self)
+
+            // ── 1) 收集監督配對：LiDAR 有效的像素 → (相對逆深度, 度量深度) ──
+            @inline(__always) func lidarAt(_ mu: Int, _ mv: Int) -> Float {
+                let u = mu * dw / mw, v = mv * dh / mh
+                guard u >= 0, v >= 0, u < dw, v < dh else { return .nan }
+                let i = v * dw + u
+                let z = d[i]
+                guard z.isFinite, z > minD, z < maxD, (conf?[i] ?? 2) >= minConf else { return .nan }
+                return z
+            }
+            var pairs: [(d: Float, z: Float)] = []
+            pairs.reserveCapacity(4096)
+            var mv = 0
+            while mv < mh {                     // 取樣擬合即可，不需全像素
+                var mu = 0
+                while mu < mw {
+                    let z = lidarAt(mu, mv)
+                    if z.isFinite { pairs.append((disp[mv * mw + mu], z)) }
+                    mu += 4
+                }
+                mv += 4
+            }
+            guard let fit = DepthScaleFit.fit(pairs: pairs, minSamples: config.mdeMinSamples),
+                  fit.rmse <= config.mdeMaxRMSE else { return [] }
+
+            // ── 2) 只在 LiDAR 無效處補點，密度依局部梯度能量 ──
+            let fx = Float(hiK.fx), fy = Float(hiK.fy), cx = Float(hiK.cx), cy = Float(hiK.cy)
+            @inline(__always) func luma(_ i: Int) -> Float {
+                let p = i * 4
+                return 0.299 * Float(hiRGBA[p]) + 0.587 * Float(hiRGBA[p + 1]) + 0.114 * Float(hiRGBA[p + 2])
+            }
+            var out: [CloudPoint] = []
+            out.reserveCapacity(config.mdeMaxPointsPerFrame)
+            // 基礎步長：讓「整幀都是洞」的最壞情況剛好落在每幀上限內
+            let base = max(2, Int((Float(mw * mh) / Float(max(1, config.mdeMaxPointsPerFrame))).squareRoot()))
+            var v = 1
+            while v < mh - 1 && out.count < config.mdeMaxPointsPerFrame {
+                var u = 1
+                while u < mw - 1 && out.count < config.mdeMaxPointsPerFrame {
+                    let i = v * mw + u
+                    if lidarAt(u, v).isFinite { u += base; continue }   // 有 LiDAR → 不碰
+                    guard let z = fit.depth(disp[i]), z > minD, z < maxD else { u += base; continue }
+                    // CV 反投影 → 翻 Y/Z 回 GL 相機系 → 世界（與 unprojectStored 同慣例）
+                    let xc = (Float(u) - cx) / fx * z
+                    let yc = (Float(v) - cy) / fy * z
+                    let w4 = c2w * SIMD4<Float>(xc, -yc, -z, 1)
+                    let px = i * 4
+                    let ru = (Float(u) - cx) / Float(mw), rv = (Float(v) - cy) / Float(mh)
+                    let central = 1 - min(1, (ru * ru + rv * rv).squareRoot() * 1.4) * 0.5
+                    let near = 1 / (0.2 + z * z)
+                    out.append(CloudPoint(x: w4.x, y: w4.y, z: w4.z,
+                                          r: hiRGBA[px], g: hiRGBA[px + 1], b: hiRGBA[px + 2],
+                                          score: central * near * sharpness * config.mdeScore))
+                    // ROI-aware：梯度能量高 → 步長縮到一半（補密）；平坦區維持基礎步長
+                    let e = abs(luma(i + 1) - luma(i)) + abs(luma(i + mw) - luma(i))
+                    u += e > 12 ? max(1, base / 2) : base
+                }
+                v += base
+            }
+            return out
+        }
+    }
+
     /// 把 mesh 頂點投影進一個關鍵幀取色，並用該幀的深度圖做可見性檢核。
     /// 分數刻意壓低（×kMeshScore）：同格若有 LiDAR 直接觀測，加權平均由 LiDAR 主導；
     /// mesh 只在「關鍵幀沒拍到」的空格補洞，不會稀釋既有的良好觀測。
