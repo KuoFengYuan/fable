@@ -17,6 +17,7 @@ struct HUDOverlay: View {
                 header
                 warningBanner
                 coverageHintBanner
+                fusionLegend
                 speedGauge
                 Spacer()
                 statusLine
@@ -56,6 +57,32 @@ struct HUDOverlay: View {
         }
     }
 
+    /// 融合品質熱圖的圖例。只在熱圖模式顯示 —— 顏色本身要能自我解釋，
+    /// 否則使用者只會看到「畫面變紅色」而不知道那代表要補掃。
+    @ViewBuilder
+    private var fusionLegend: some View {
+        if controller.phase == .scanning, controller.showPointCloud,
+           controller.colorMode == .fusionQuality {
+            HStack(spacing: 8) {
+                Text("融合").font(.caption2.weight(.semibold))
+                HStack(spacing: 3) {
+                    ForEach(0..<7) { i in
+                        let q = Double(i) / 6
+                        Rectangle()
+                            .fill(Color(red: q < 0.5 ? 1 : 2 * (1 - q),
+                                        green: q < 0.5 ? 2 * q : 1,
+                                        blue: 0.15))
+                            .frame(width: 14, height: 8)
+                    }
+                }
+                Text("不足 → 充分").font(.caption2)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+
     // MARK: - 頂部：關閉鍵 + 點雲開關 + 統計面板
 
     private var header: some View {
@@ -83,6 +110,21 @@ struct HUDOverlay: View {
                             .background(.ultraThinMaterial, in: Circle())
                     }
                     .foregroundStyle(controller.showPointCloud ? .cyan : .white)
+
+                    // 融合品質熱圖：直接把「這塊還沒掃夠」畫在表面上，
+                    // 比任何數字或文字提示都直觀 —— 使用者看到紅色就知道要再繞一次。
+                    if controller.showPointCloud {
+                        Button {
+                            controller.toggleColorMode()
+                        } label: {
+                            Image(systemName: controller.colorMode == .fusionQuality
+                                  ? "thermometer.medium" : "paintpalette")
+                                .font(.headline)
+                                .padding(10)
+                                .background(.ultraThinMaterial, in: Circle())
+                        }
+                        .foregroundStyle(controller.colorMode == .fusionQuality ? .orange : .white)
+                    }
                 }
             }
 

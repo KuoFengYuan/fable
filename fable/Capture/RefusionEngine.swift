@@ -72,6 +72,10 @@ nonisolated struct FusedVoxelGrid {
         /// 用來量化補充來源的實際貢獻：只有 measured==false 的格子才是真的補到新覆蓋。
         /// 預設 true —— 即時預覽的 TiledFusedGrid 共用本型別但不追蹤來源。
         var measured: Bool = true
+        /// 這格被幾幀觀測到（飽和於 255）。刻意與 weight 分開：weight 混了距離與清晰度
+        /// （近點單次觀測權重就很高），無法回答使用者真正想知道的「這塊我掃夠了沒」。
+        /// 融合雜訊隨觀測數 ~1/√N 收斂，所以次數才是「融合品質」的正確代理量。
+        var obs: UInt8 = 1
     }
 
     private(set) var cells: [Int64: Cell] = [:]

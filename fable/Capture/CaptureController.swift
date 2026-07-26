@@ -42,6 +42,9 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var domePlaced = false
     @Published var trackingReady = false
     @Published var showPointCloud = true
+    /// 預覽點雲上色模式。掃描當下使用者最需要知道的不是顏色對不對，
+    /// 而是「這塊融合夠了沒、要不要再繞一次」——熱圖直接把觀測不足的表面標紅。
+    @Published var colorMode: PointColorMode = .rgb
     /// 掃描期間鎖定對焦 / 曝光 / 白平衡（預設開啟）：
     /// 內參穩定、色彩一致、避免 AF 拉風箱造成的模糊與追蹤擾動
     @Published var lockCameraParams = true
@@ -477,6 +480,13 @@ final class CaptureController: NSObject, ObservableObject {
         visualizer?.setPointCloudHidden(!showPointCloud)
     }
 
+    /// 切換「真實顏色 / 融合品質熱圖」。切換後必須把所有磚標記重畫，
+    /// 否則只有之後才變動的磚會換色、畫面兩種配色混在一起。
+    func toggleColorMode() {
+        colorMode = (colorMode == .rgb) ? .fusionQuality : .rgb
+        Task { await accumulator?.markAllDirty() }
+    }
+
     func resetForNewScan() {
         guard phase == .done || phase == .idle else { return }
         cleanupToIdle()
@@ -733,7 +743,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             }
             latestTileTransforms[key] = t     // 錨點回呼前的初始變換（= 磚中心）
         }
-        let tiles = await accumulator.dirtyTileRenderData(limit: 2)
+        let tiles = await accumulator.dirtyTileRenderData(limit: 2, mode: colorMode)
         for tile in tiles {
             let xform = latestTileTransforms[tile.key]
                 ?? { var m = matrix_identity_float4x4
