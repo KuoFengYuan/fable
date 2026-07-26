@@ -19,6 +19,11 @@ struct HUDOverlay: View {
                 coverageHintBanner
                 fusionLegend
                 speedGauge
+                HStack {
+                    Spacer()
+                    CameraControlBar(controls: controller.cameraControls,
+                                     enabled: controller.phase == .idle)
+                }
                 Spacer()
                 statusLine
                 bottomControls

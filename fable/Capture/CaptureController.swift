@@ -72,6 +72,10 @@ final class CaptureController: NSObject, ObservableObject {
     private var orbitInFlight = false
     private var orbitPending = false
 
+    /// 相機手動調整（曝光補償/快門/ISO/白平衡/對焦）。預設全自動；
+    /// 使用者調整後，startScan 只鎖定「還在自動」的項目，手動值原樣帶進整段掃描 ——
+    /// 也就是「預設鎖定，但可以調整完再鎖」。
+    let cameraControls = CameraControls()
     let config = CaptureConfig()
     let hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
@@ -184,6 +188,7 @@ final class CaptureController: NSObject, ObservableObject {
             return
         }
         if lockCameraParams { applyCameraLocks() }
+        cameraControls.expanded = nil   // 掃描中收合：中途改曝光會讓前後幀成像不一致
         shutter.reset()
         frameIndex = 0
         keyframeCount = 0
@@ -586,43 +591,12 @@ final class CaptureController: NSObject, ObservableObject {
     /// 相機三鎖：對焦（內參穩定、AF 不拉風箱）、曝光（ISO/快門固定 → 亮度一致、
     /// 模糊可預測）、白平衡（色彩一致 → 融合不閃色、3DGS 訓練色彩乾淨）。
     /// 在使用者取景完成、按下快門的當下鎖定 —— AE/AF 已收斂於目標物。
-    private func applyCameraLocks() {
-        guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.locked) {
-                device.focusMode = .locked
-            }
-            if device.isExposureModeSupported(.locked) {
-                device.exposureMode = .locked
-            }
-            if device.isWhiteBalanceModeSupported(.locked) {
-                device.whiteBalanceMode = .locked
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("[Camera] 參數鎖定失敗: \(error)")
-        }
-    }
+    /// 開始掃描時鎖定相機參數。委派給 CameraControls —— 它只凍結「還在自動」的項目，
+    /// 使用者手動指定過的（快門/ISO/白平衡/對焦）維持自訂值。
+    /// 「預設鎖定」與「調整完再鎖」因此是同一條路徑，不會互相覆蓋。
+    private func applyCameraLocks() { cameraControls.lockForScan() }
 
-    private func releaseCameraLocks() {
-        guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
-            }
-            if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            }
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                device.whiteBalanceMode = .continuousAutoWhiteBalance
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("[Camera] 參數解鎖失敗: \(error)")
-        }
-    }
+    private func releaseCameraLocks() { cameraControls.unlock() }
 
     nonisolated private static func deviceModel() -> String {
         var sys = utsname()
