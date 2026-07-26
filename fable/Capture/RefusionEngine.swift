@@ -296,6 +296,39 @@ nonisolated enum RefusionEngine {
             guard let fit = DepthScaleFit.fit(pairs: pairs, minSamples: config.mdeMinSamples),
                   fit.rmse <= config.mdeMaxRMSE else { return [] }
 
+            // ── 只做「內插」，不做「外插」──
+            // 每幀各自擬合 (a,b)。有 LiDAR 的地方擬合被錨定 → 各幀一致；但在整片沒有回波的
+            // 區域（窗戶/鏡面/>maxD）沒有任何約束讓不同幀一致 → 同一表面被各幀放到不同深度
+            // → 落進不同 voxel → 疊成多層殼，也就是殘影。兩道局部守衛：
+            //   (1) 深度必須落在本幀 LiDAR 實際觀測到的範圍內（外插到窗外就擋掉）
+            //   (2) 該像素附近必須有 LiDAR 回波（＝這是被已知深度包圍的小洞，不是大片未知區）
+            var zLo = Float.greatestFiniteMagnitude, zHi: Float = 0
+            for p in pairs { zLo = min(zLo, p.z); zHi = max(zHi, p.z) }
+            guard zHi > zLo else { return [] }
+            zLo *= 0.8; zHi *= 1.2                      // 留一點外插餘裕，但不放行到無限遠
+
+            // LiDAR 有效遮罩（深度解析度），供鄰域支撐檢核
+            var valid = [Bool](repeating: false, count: dw * dh)
+            for i in 0..<(dw * dh) {
+                let z = d[i]
+                valid[i] = z.isFinite && z > minD && z < maxD && (conf?[i] ?? 2) >= minConf
+            }
+            let r = config.mdeSupportRadiusPx
+            @inline(__always) func hasNearbyLiDAR(_ mu: Int, _ mv: Int) -> Bool {
+                let du = mu * dw / mw, dv = mv * dh / mh
+                var y = max(0, dv - r)
+                let yEnd = min(dh - 1, dv + r), xEnd = min(dw - 1, du + r)
+                while y <= yEnd {
+                    var x = max(0, du - r)
+                    while x <= xEnd {
+                        if valid[y * dw + x] { return true }
+                        x += 1
+                    }
+                    y += 1
+                }
+                return false
+            }
+
             // ── 2) 只在 LiDAR 無效處補點，密度依局部梯度能量 ──
             let fx = Float(hiK.fx), fy = Float(hiK.fy), cx = Float(hiK.cx), cy = Float(hiK.cy)
             @inline(__always) func luma(_ i: Int) -> Float {
@@ -312,7 +345,10 @@ nonisolated enum RefusionEngine {
                 while u < mw - 1 && out.count < config.mdeMaxPointsPerFrame {
                     let i = v * mw + u
                     if lidarAt(u, v).isFinite { u += base; continue }   // 有 LiDAR → 不碰
-                    guard let z = fit.depth(disp[i]), z > minD, z < maxD else { u += base; continue }
+                    guard let z = fit.depth(disp[i]), z > minD, z < maxD,
+                          z >= zLo, z <= zHi,            // (1) 不外插到本幀沒量到的深度
+                          hasNearbyLiDAR(u, v)           // (2) 必須是被已知深度包圍的小洞
+                    else { u += base; continue }
                     // CV 反投影 → 翻 Y/Z 回 GL 相機系 → 世界（與 unprojectStored 同慣例）
                     let xc = (Float(u) - cx) / fx * z
                     let yc = (Float(v) - cy) / fy * z

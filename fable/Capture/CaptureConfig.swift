@@ -80,6 +80,12 @@ nonisolated struct CaptureConfig: Sendable {
     var mdeScore: Float = 0.4
     /// 每幀補洞點數上限（ROI-aware 取樣後）。避免大片無回波區灌爆點數預算
     var mdeMaxPointsPerFrame = 8000
+    /// 鄰域支撐半徑（深度圖像素）：補洞像素附近須有 LiDAR 回波才採用。
+    /// 這道守衛把 MDE 限制成「內插」——只補被已知深度包圍的小洞，不碰整片無回波區。
+    /// 沒有它的話，窗戶/鏡面那種大片無回波區會由每幀各自的仿射擬合給出彼此不一致的深度
+    /// （沒有 LiDAR 錨定），同一表面在不同幀落到不同 voxel → 疊成多層殼＝殘影。
+    /// 3 個深度像素在 256×192 下約對應 2° 視角；調大會補更多但殘影風險上升。
+    var mdeSupportRadiusPx = 3
     /// 併入 ARKit 場景重建網格（ARMeshAnchor）的頂點作為補充幾何。
     /// 價值不在「更準」，而在**覆蓋率**：ARKit 的 mesh 融合的是每一幀（60fps）的深度，
     /// 而重融合只用 ~120 個關鍵幀 → mesh 會涵蓋關鍵幀沒拍到的表面（天花板/角落黑塊的主因）。
