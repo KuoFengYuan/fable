@@ -11,6 +11,13 @@ import simd
 
 /// 一塊空間磚的渲染資料（actor 端打包完成，主執行緒只做 O(1) 包裝）。
 /// positions 為「錨點局部座標」，渲染時由節點變換（= 該磚錨點當下變換）帶回世界。
+/// 預覽點雲的上色模式。
+/// 掃描當下使用者最需要知道的不是「顏色對不對」，而是「這塊融合夠了沒、要不要再繞一次」。
+nonisolated enum PointColorMode: Sendable {
+    case rgb            // 真實顏色
+    case fusionQuality  // 融合品質熱圖（紅＝觀測不足，綠＝已充分）
+}
+
 nonisolated struct TileRenderData: Sendable {
     let key: Int64
     let center: SIMD3<Float>
@@ -79,6 +86,11 @@ nonisolated struct TiledFusedGrid {
                 cell.color += (rgb - cell.color) * (w / total)
                 cell.weight = min(total, weightCap)
                 cell.bestScore = max(cell.bestScore, pt.score)
+                if cell.obs < 255 {
+                    cell.obs += 1
+                    // 跨過門檻的那一次才計數 → O(1) 維護，不必每幀掃全部 cell
+                    if cell.obs == UInt8(Self.kFullObs) { wellObserved += 1 }
+                }
                 tiles[tileKey]!.cells[cellKey] = cell
             } else {
                 tiles[tileKey]!.cells[cellKey] = FusedVoxelGrid.Cell(
@@ -113,6 +125,10 @@ nonisolated struct TiledFusedGrid {
             totalCells += merged.count
             dirtyTiles.insert(tileKey)
         }
+        // 合併改變了 obs 分佈 → 重算。coarsen 很少發生，O(N) 可接受。
+        wellObserved = tiles.values.reduce(0) { acc, tile in
+            acc + tile.cells.values.reduce(0) { $1.obs >= UInt8(Self.kFullObs) ? $0 + 1 : $0 }
+        }
         print("[PointCloud] 自動粗化 → voxel \(voxelSize * 100)cm，剩 \(totalCells) 點")
     }
 
@@ -130,7 +146,7 @@ nonisolated struct TiledFusedGrid {
     }
 
     /// 打包整磚為 GPU-ready Data（位置即錨點局部座標，渲染時由節點變換帶回世界）
-    func tileRenderData(_ tileKey: Int64) -> TileRenderData? {
+    func tileRenderData(_ tileKey: Int64, mode: PointColorMode = .rgb) -> TileRenderData? {
         guard let tile = tiles[tileKey], !tile.cells.isEmpty else { return nil }
         var positions = [Float](); positions.reserveCapacity(tile.cells.count * 3)
         var colors = [Float](); colors.reserveCapacity(tile.cells.count * 3)
@@ -138,9 +154,19 @@ nonisolated struct TiledFusedGrid {
         var n: Int32 = 0
         for c in tile.cells.values {
             positions.append(c.mean.x); positions.append(c.mean.y); positions.append(c.mean.z)
-            colors.append(min(1, max(0, c.color.x / 255)))
-            colors.append(min(1, max(0, c.color.y / 255)))
-            colors.append(min(1, max(0, c.color.z / 255)))
+            switch mode {
+            case .rgb:
+                colors.append(min(1, max(0, c.color.x / 255)))
+                colors.append(min(1, max(0, c.color.y / 255)))
+                colors.append(min(1, max(0, c.color.z / 255)))
+            case .fusionQuality:
+                // 紅 → 黃 → 綠。kFullObs 次觀測視為充分（10Hz 融合下約停留 0.6 秒）；
+                // 融合雜訊 ~1/√N，6 次已把單幀 σ≈1-2cm 壓到 <1cm，與 2cm voxel 相稱。
+                let q = min(1, Float(c.obs) / Self.kFullObs)
+                colors.append(q < 0.5 ? 1 : 2 * (1 - q))
+                colors.append(q < 0.5 ? 2 * q : 1)
+                colors.append(0.15)
+            }
             indices.append(n); n += 1
         }
         guard n > 0 else { return nil }
@@ -148,6 +174,22 @@ nonisolated struct TiledFusedGrid {
                               positions: positions.withUnsafeBufferPointer { Data(buffer: $0) },
                               colors: colors.withUnsafeBufferPointer { Data(buffer: $0) },
                               indices: indices.withUnsafeBufferPointer { Data(buffer: $0) })
+    }
+
+    /// 「觀測充分」的次數門檻（融合品質熱圖 / 完成度共用）
+    static let kFullObs: Float = 6
+
+    /// 已達 kFullObs 次觀測的 cell 數（O(1) 維護）
+    private(set) var wellObserved = 0
+    /// 融合完成度：已充分觀測的表面占比。
+    /// 比「幀數」更有意義——100 幀站在原地拍是沒用的，這個量直接反映「表面被看夠了沒」。
+    var fusionCompleteness: Double {
+        totalCells > 0 ? Double(wellObserved) / Double(totalCells) : 0
+    }
+
+    /// 全部磚標記為待重畫 —— 切換上色模式時必須重送幾何，否則只有之後變動的磚會換色
+    mutating func markAllDirty() {
+        for key in tiles.keys { dirtyTiles.insert(key) }
     }
 
     func tileCenter(_ tileKey: Int64) -> SIMD3<Float> {

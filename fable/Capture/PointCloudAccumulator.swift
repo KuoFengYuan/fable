@@ -142,6 +142,7 @@ actor PointCloudAccumulator {
     }
 
     var count: Int { grid.count }
+    var fusionCompleteness: Double { grid.fusionCompleteness }
 
     /// 反投影 + 過濾 + 融合（全部在 actor 執行緒，不佔 delegate 回呼）。
     /// anchorTransforms：各磚錨點當下變換（主執行緒每幀擷取），用於世界↔局部換算。
@@ -164,9 +165,12 @@ actor PointCloudAccumulator {
     }
 
     /// 取出至多 limit 個待刷新磚的 GPU-ready 渲染資料
-    func dirtyTileRenderData(limit: Int) -> [TileRenderData] {
-        grid.popDirtyTiles(limit: limit).compactMap { grid.tileRenderData($0) }
+    func dirtyTileRenderData(limit: Int, mode: PointColorMode = .rgb) -> [TileRenderData] {
+        grid.popDirtyTiles(limit: limit).compactMap { grid.tileRenderData($0, mode: mode) }
     }
+
+    /// 切換上色模式後呼叫：把所有磚標記為待重畫（否則只有之後變動的磚會換色）
+    func markAllDirty() { grid.markAllDirty() }
 
     /// 匯出用擇優下採樣（無 LiDAR 時的備援輸出；LiDAR 路徑以 RefusionEngine 重融合為準）
     func bestPoints(target: Int) -> [CloudPoint] {

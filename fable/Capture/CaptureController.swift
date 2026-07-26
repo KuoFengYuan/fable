@@ -35,6 +35,9 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var assessment = QualityAssessment()
     @Published var keyframeCount = 0
     @Published var pointCount = 0
+    /// 融合完成度：已被足夠多幀觀測的表面占比。場景模式沒有涵蓋率圓頂，
+    /// 這是唯一能回答「掃夠了沒」的訊號；也比幀數有意義（站原地拍 100 幀是沒用的）。
+    @Published var fusionCompleteness: Double = 0
     @Published var coverage: Double = 0
     @Published var coverageHint: String?   // 缺角提醒：往哪補掃（物件模式圓頂）
     @Published var exportedZip: URL?
@@ -42,6 +45,9 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var domePlaced = false
     @Published var trackingReady = false
     @Published var showPointCloud = true
+    /// 預覽點雲上色模式。掃描當下使用者最需要知道的不是顏色對不對，
+    /// 而是「這塊融合夠了沒、要不要再繞一次」——熱圖直接把觀測不足的表面標紅。
+    @Published var colorMode: PointColorMode = .rgb
     /// 掃描期間鎖定對焦 / 曝光 / 白平衡（預設開啟）：
     /// 內參穩定、色彩一致、避免 AF 拉風箱造成的模糊與追蹤擾動
     @Published var lockCameraParams = true
@@ -66,6 +72,10 @@ final class CaptureController: NSObject, ObservableObject {
     private var orbitInFlight = false
     private var orbitPending = false
 
+    /// 相機手動調整（曝光補償/快門/ISO/白平衡/對焦）。預設全自動；
+    /// 使用者調整後，startScan 只鎖定「還在自動」的項目，手動值原樣帶進整段掃描 ——
+    /// 也就是「預設鎖定，但可以調整完再鎖」。
+    let cameraControls = CameraControls()
     let config = CaptureConfig()
     let hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
@@ -81,6 +91,8 @@ final class CaptureController: NSObject, ObservableObject {
     private var frameCounter = 0
     private var pendingWrites = 0
     private var previewInFlight = false
+    /// 本幀是否已進過預覽融合（關鍵幀路徑與 10Hz 路徑可能落在同一幀，避免 obs 重複累加）
+    private var lastPreviewFrame = -1
     private var pixelBufferPool: CVPixelBufferPool?
     private var lastWarningHaptic: TimeInterval = 0
     private var lastSparseIntegration: TimeInterval = 0
@@ -176,6 +188,9 @@ final class CaptureController: NSObject, ObservableObject {
             return
         }
         if lockCameraParams { applyCameraLocks() }
+        // 掃描中收合：中途改曝光會讓前後幀成像不一致（外觀校正要修的正是這個）
+        cameraControls.expanded = nil
+        cameraControls.railExpanded = false
         shutter.reset()
         frameIndex = 0
         keyframeCount = 0
@@ -477,6 +492,13 @@ final class CaptureController: NSObject, ObservableObject {
         visualizer?.setPointCloudHidden(!showPointCloud)
     }
 
+    /// 切換「真實顏色 / 融合品質熱圖」。切換後必須把所有磚標記重畫，
+    /// 否則只有之後才變動的磚會換色、畫面兩種配色混在一起。
+    func toggleColorMode() {
+        colorMode = (colorMode == .rgb) ? .fusionQuality : .rgb
+        Task { await accumulator?.markAllDirty() }
+    }
+
     func resetForNewScan() {
         guard phase == .done || phase == .idle else { return }
         cleanupToIdle()
@@ -571,43 +593,12 @@ final class CaptureController: NSObject, ObservableObject {
     /// 相機三鎖：對焦（內參穩定、AF 不拉風箱）、曝光（ISO/快門固定 → 亮度一致、
     /// 模糊可預測）、白平衡（色彩一致 → 融合不閃色、3DGS 訓練色彩乾淨）。
     /// 在使用者取景完成、按下快門的當下鎖定 —— AE/AF 已收斂於目標物。
-    private func applyCameraLocks() {
-        guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.locked) {
-                device.focusMode = .locked
-            }
-            if device.isExposureModeSupported(.locked) {
-                device.exposureMode = .locked
-            }
-            if device.isWhiteBalanceModeSupported(.locked) {
-                device.whiteBalanceMode = .locked
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("[Camera] 參數鎖定失敗: \(error)")
-        }
-    }
+    /// 開始掃描時鎖定相機參數。委派給 CameraControls —— 它只凍結「還在自動」的項目，
+    /// 使用者手動指定過的（快門/ISO/白平衡/對焦）維持自訂值。
+    /// 「預設鎖定」與「調整完再鎖」因此是同一條路徑，不會互相覆蓋。
+    private func applyCameraLocks() { cameraControls.lockForScan() }
 
-    private func releaseCameraLocks() {
-        guard let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { return }
-        do {
-            try device.lockForConfiguration()
-            if device.isFocusModeSupported(.continuousAutoFocus) {
-                device.focusMode = .continuousAutoFocus
-            }
-            if device.isExposureModeSupported(.continuousAutoExposure) {
-                device.exposureMode = .continuousAutoExposure
-            }
-            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
-                device.whiteBalanceMode = .continuousAutoWhiteBalance
-            }
-            device.unlockForConfiguration()
-        } catch {
-            print("[Camera] 參數解鎖失敗: \(error)")
-        }
-    }
+    private func releaseCameraLocks() { cameraControls.unlock() }
 
     nonisolated private static func deviceModel() -> String {
         var sys = utsname()
@@ -663,6 +654,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
            !a.captureBlocked, a.blurPixels <= config.previewMaxBlurPixels,
            a.angularSpeedRadS <= config.previewMaxAngularSpeedRadS,
            a.linearSpeedMS <= config.previewMaxLinearSpeedMS {
+            lastPreviewFrame = frameCounter
             integratePreview(frame, blurPixels: a.blurPixels)
         }
 
@@ -672,10 +664,23 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         }
 
         guard a.allowCapture else { return }
+        // 速度閘門：blur 擋不住「亮處快速移動」（曝光短 → 模糊低，但 VIO 姿態仍有延遲誤差）。
+        // 關鍵幀姿態會同時進入重融合的反投影與 3DGS 訓練的相機外參，錯了兩邊一起壞。
+        guard a.angularSpeedRadS <= config.keyframeMaxAngularSpeedRadS,
+              a.linearSpeedMS <= config.keyframeMaxLinearSpeedMS else { return }
         guard pendingWrites < config.maxPendingWrites else { return }
         guard shutter.shouldCapture(pose: frame.camera.transform,
                                     time: frame.timestamp,
                                     config: config) else { return }
+        // 關鍵幀一律也進預覽融合。預覽的閘門比關鍵幀嚴很多
+        // （10Hz 取樣 + 角速度 0.6 vs 1.0、線速度 0.5 vs 0.8、模糊 12 vs 16），
+        // 所以會出現「掃了、關鍵幀也存了，但預覽沒點」——停止後重融合才冒出來。
+        // 這會讓融合熱圖說謊：把其實會有點的區域標成缺點，害使用者去重掃已經夠的地方。
+        // 讓預覽的覆蓋 ⊇ 重融合會用到的，熱圖才有參考價值。
+        if frameCounter != lastPreviewFrame {
+            lastPreviewFrame = frameCounter
+            integratePreview(frame, blurPixels: a.blurPixels)
+        }
         captureKeyframe(frame, assessment: a)
     }
 
@@ -729,7 +734,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             }
             latestTileTransforms[key] = t     // 錨點回呼前的初始變換（= 磚中心）
         }
-        let tiles = await accumulator.dirtyTileRenderData(limit: 2)
+        let tiles = await accumulator.dirtyTileRenderData(limit: 2, mode: colorMode)
         for tile in tiles {
             let xform = latestTileTransforms[tile.key]
                 ?? { var m = matrix_identity_float4x4
@@ -738,6 +743,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             visualizer?.updateTile(tile, transform: xform)
         }
         pointCount = await accumulator.count
+        fusionCompleteness = await accumulator.fusionCompleteness
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {

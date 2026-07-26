@@ -25,6 +25,15 @@ nonisolated struct CaptureConfig: Sendable {
     var keyframeRotationDeg: Float = 6.0
     /// 兩關鍵幀最小時間間隔，避免手震造成原地連拍
     var minKeyframeInterval: TimeInterval = 0.15
+    /// 關鍵幀的相機速度閘門。與即時融合同理但門檻放寬：
+    /// 模糊值受曝光時間影響（亮處曝光短 → 快速移動仍判定為低模糊），無法反映「姿態延遲/誤差」，
+    /// 所以只靠 blockBlurPixels 擋不住「亮處快速移動」的壞姿態。
+    /// 關鍵幀的姿態同時進入 (a) 重融合點雲的反投影 (b) 3DGS 訓練的相機外參，
+    /// 錯了會同時污染幾何與訓練，比即時融合的後果嚴重。
+    /// 門檻刻意比預覽(0.6/0.5)寬：關鍵幀本來就是在移動中觸發的（位移 0.1m 或轉角 6°），
+    /// 太嚴會抓不到幀。1.0 rad/s ≈ 57°/s、0.8 m/s ≈ 快走，正常掃描不會觸及。
+    var keyframeMaxAngularSpeedRadS: Float = 1.0
+    var keyframeMaxLinearSpeedMS: Float = 0.8
     /// 背景寫入佇列上限（背壓）：滿載時跳過本幀，下一幀條件仍成立會再觸發
     var maxPendingWrites = 3
 
