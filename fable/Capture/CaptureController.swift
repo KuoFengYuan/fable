@@ -188,7 +188,9 @@ final class CaptureController: NSObject, ObservableObject {
             return
         }
         if lockCameraParams { applyCameraLocks() }
-        cameraControls.expanded = nil   // 掃描中收合：中途改曝光會讓前後幀成像不一致
+        // 掃描中收合：中途改曝光會讓前後幀成像不一致（外觀校正要修的正是這個）
+        cameraControls.expanded = nil
+        cameraControls.railExpanded = false
         shutter.reset()
         frameIndex = 0
         keyframeCount = 0

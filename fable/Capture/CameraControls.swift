@@ -49,6 +49,9 @@ final class CameraControls: ObservableObject {
     /// 1/60s 在正常掃描速度下已接近 maxBlurPixels，再長就是必糊。
     static let kMaxShutter: Double = 1.0 / 60
 
+    /// 控制列是否展開。預設收合成一顆 A —— 絕大多數情況全自動就夠，
+    /// 平常不該讓五個圖示佔住取景畫面。
+    @Published var railExpanded = false
     @Published var expanded: Item?          // 目前展開的滑桿（nil = 收合）
     @Published var ev: Float = 0            // EV 補償（stops）
     @Published var isoManual = false

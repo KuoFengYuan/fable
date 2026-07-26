@@ -12,18 +12,46 @@ struct CameraControlBar: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            if let item = controls.expanded { slider(for: item) }
-            iconRail
+            if controls.railExpanded, let item = controls.expanded { slider(for: item) }
+            if controls.railExpanded { iconRail } else { collapsedBadge }
         }
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.4)
         .animation(.easeInOut(duration: 0.2), value: controls.expanded)
+        .animation(.easeInOut(duration: 0.2), value: controls.railExpanded)
+    }
+
+    /// 收合狀態：一顆徽章。字母本身就是狀態 —— A ＝ 全自動、M ＝ 有手動覆寫，
+    /// 所以收起來也還看得出相機是不是被改過。
+    private var collapsedBadge: some View {
+        Button {
+            controls.syncFromDevice()
+            controls.railExpanded = true
+        } label: {
+            Text(controls.hasManualOverride ? "M" : "A")
+                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .frame(width: 44, height: 44)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .foregroundStyle(controls.hasManualOverride ? .yellow : .white)
     }
 
     // MARK: - 圖示列
 
     private var iconRail: some View {
         VStack(spacing: 6) {
+            // 頂端同一顆徽章 → 點一下收合（與展開是同一個位置，手指不用移動）
+            Button {
+                controls.expanded = nil
+                controls.railExpanded = false
+            } label: {
+                Text(controls.hasManualOverride ? "M" : "A")
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .frame(width: 40, height: 40)
+            }
+            .foregroundStyle(controls.hasManualOverride ? .yellow : .white)
+            Divider().frame(width: 24).overlay(.white.opacity(0.3))
+
             ForEach(CameraControls.Item.allCases) { item in
                 Button {
                     controls.syncFromDevice()
