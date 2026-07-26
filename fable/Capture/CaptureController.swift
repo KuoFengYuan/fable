@@ -672,6 +672,10 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         }
 
         guard a.allowCapture else { return }
+        // 速度閘門：blur 擋不住「亮處快速移動」（曝光短 → 模糊低，但 VIO 姿態仍有延遲誤差）。
+        // 關鍵幀姿態會同時進入重融合的反投影與 3DGS 訓練的相機外參，錯了兩邊一起壞。
+        guard a.angularSpeedRadS <= config.keyframeMaxAngularSpeedRadS,
+              a.linearSpeedMS <= config.keyframeMaxLinearSpeedMS else { return }
         guard pendingWrites < config.maxPendingWrites else { return }
         guard shutter.shouldCapture(pose: frame.camera.transform,
                                     time: frame.timestamp,
