@@ -37,6 +37,10 @@ nonisolated struct FrameRecord: Codable, Sendable {
     var exposureOffsetEV: Double
     var ambientLux: Double?
     var estimatedBlurPx: Double
+    /// 影像清晰度的直接量測（歸一化二階差分能量）與其相對基準線的比例。
+    /// 離線挑幀用：同一區域拍到多張時，可據此選最鋭利的餵給訓練。
+    var sharpness: Double = 0
+    var sharpnessRatio: Double = 1
     var imageFile: String
     var depthFile: String?
     var confidenceFile: String?

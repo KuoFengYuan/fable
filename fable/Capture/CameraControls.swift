@@ -182,13 +182,39 @@ final class CameraControls: ObservableObject {
         syncFromDevice()
     }
 
+    /// 讓自動曝光**不准**用超過 kMaxShutter 的曝光時間（改為拉 ISO）。
+    /// 室內昏暗處自動測光會直接把快門放長到 1/15~1/30s，此時動態模糊 ≈ 角速度 × 焦距 × 曝光時間
+    /// 隨曝光線性上升：0.3 rad/s（很慢的平移）在 1/15s 下就是 30 px 模糊，等於整段掃描沒有一張能用。
+    /// 拉 ISO 換來的雜訊對 3DGS 遠比模糊便宜 —— 雜訊在多視角平均下會消掉，模糊不會。
+    /// 掃描開始前就要設好，讓 AE 有時間在上限內收斂。
+    func capExposureDuration() {
+        withDevice { d in
+            let lo = CMTimeGetSeconds(d.activeFormat.minExposureDuration)
+            d.activeMaxExposureDuration =
+                CMTimeMakeWithSeconds(max(Self.kMaxShutter, lo), preferredTimescale: 1_000_000)
+        }
+    }
+
     /// 開始掃描時鎖定。已被使用者手動指定的項目維持其自訂值，
     /// 只把「還在自動」的項目凍結在當下 —— 這就是「調整完後再鎖定」。
+    ///
+    /// **對焦刻意不鎖。** 鎖定＝把鏡頭凍結在「按下快門那一刻」的對焦距離，
+    /// 而掃描過程中被攝距離一直在變。iPhone 主鏡（f/1.78、實際焦長 ~6.9mm）的超焦距約 5.3m，
+    /// 於是景深是：鎖在 3m → 清晰 1.9~6.9m（還算堪用）；鎖在 0.5m → **清晰 0.46~0.55m**。
+    /// 使用者習慣先把物件framing好再按開始，正好落在後者 —— 一旦離開那 10cm，整段掃描全糊。
+    /// 曝光/白平衡鎖定是為了「光度一致」（3DGS 的光度損失要對齊），
+    /// 但對焦不影響光度、只影響鋭利度，而 3DGS 最怕的就是不鋭利。
+    /// 對焦改變帶來的內參呼吸（focus breathing）另有解法：
+    /// 每幀內參本來就存在 FrameRecord 裡，COLMAP 匯出改成一張影像一組內參即可完全吸收。
     func lockForScan() {
+        capExposureDuration()
         withDevice { d in
-            if !focusManual, d.isFocusModeSupported(.locked) { d.focusMode = .locked }
             if !isoManual, !shutterManual, d.isExposureModeSupported(.locked) { d.exposureMode = .locked }
             if !wbManual, d.isWhiteBalanceModeSupported(.locked) { d.whiteBalanceMode = .locked }
+            // 對焦維持連續自動（除非使用者手動指定了鏡位）
+            if !focusManual, d.isFocusModeSupported(.continuousAutoFocus) {
+                d.focusMode = .continuousAutoFocus
+            }
         }
     }
 

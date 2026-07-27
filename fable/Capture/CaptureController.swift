@@ -48,8 +48,10 @@ final class CaptureController: NSObject, ObservableObject {
     /// 預覽點雲上色模式。掃描當下使用者最需要知道的不是顏色對不對，
     /// 而是「這塊融合夠了沒、要不要再繞一次」——熱圖直接把觀測不足的表面標紅。
     @Published var colorMode: PointColorMode = .rgb
-    /// 掃描期間鎖定對焦 / 曝光 / 白平衡（預設開啟）：
-    /// 內參穩定、色彩一致、避免 AF 拉風箱造成的模糊與追蹤擾動
+    /// 掃描期間鎖定曝光 / 白平衡（預設開啟）：光度一致，3DGS 的光度損失才對齊得起來。
+    /// **對焦不鎖**（見 CameraControls.lockForScan：鎖了會把整段掃描凍在起始那一刻的景深，
+    /// 鏡頭一離開就糊）。代價是連續對焦會拉焦，拉焦當下那幾幀確實不清晰 ——
+    /// 由 QualityMonitor 的清晰度閘門（直接量影像，不是推估）擋掉，不讓它們變成關鍵幀。
     @Published var lockCameraParams = true
     @Published var exportProgress: Double = 0
     /// Review 階段顯示（＝實際將匯出）的重融合點雲與修正後軌跡
@@ -88,6 +90,8 @@ final class CaptureController: NSObject, ObservableObject {
     private var accumulator: PointCloudAccumulator?
     private var sessionDir: URL?
     private var frameIndex = 0
+    /// 因清晰度不足而放棄抓幀的次數（診斷用：拿來判斷門檻是否過嚴）
+    private var sharpnessRejects = 0
     private var frameCounter = 0
     private var pendingWrites = 0
     private var previewInFlight = false
@@ -137,6 +141,7 @@ final class CaptureController: NSObject, ObservableObject {
         cfg.worldAlignment = .gravity          // 世界 +Y = 反重力 → 3DGS 場景天然正立
         cfg.planeDetection = [.horizontal]     // 供物件模式 raycast 放置圓頂
         cfg.environmentTexturing = .none       // 省下環境貼圖的 GPU/散熱成本
+        cfg.isAutoFocusEnabled = true          // 明示：對焦交給 ARKit 連續自動（見 CameraControls.lockForScan）
         if hasLiDAR {
             cfg.frameSemantics.insert(.sceneDepth)          // 原始深度：存檔用
             if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
@@ -152,8 +157,26 @@ final class CaptureController: NSObject, ObservableObject {
         return cfg
     }
 
+    /// 印出本機可用的 ARKit 影像格式。顆粒感的解法之一是「用更高解析度拍、訓練前降採樣」
+    /// （降採樣會平均掉雜訊：4K→1600 是 2.4× 線性，雜訊約降 2.4 倍），
+    /// 但值不值得取決於本機到底有沒有「高解析度又維持 60fps」的格式 —— 只能實機問。
+    private func logVideoFormats() {
+        let cur = arView?.session.configuration?.videoFormat
+        for f in ARWorldTrackingConfiguration.supportedVideoFormats {
+            let r = f.imageResolution
+            let mark = (f == cur) ? "  ← 目前使用" : ""
+            print(String(format: "[VideoFormat] %.0f×%.0f @ %dfps  %@%@",
+                         r.width, r.height, f.framesPerSecond,
+                         f.captureDeviceType.rawValue, mark))
+        }
+    }
+
     private func runSession() {
         arView?.session.run(makeARConfig(), options: [.resetTracking, .removeExistingAnchors])
+        logVideoFormats()
+        // 曝光上限要在取景階段就設好，AE 才有時間在上限內收斂；
+        // session.run 會重設裝置設定，故必須在 run 之後。
+        cameraControls.capExposureDuration()
     }
 
     // MARK: - 物件模式：點擊放置涵蓋圓頂
@@ -195,6 +218,7 @@ final class CaptureController: NSObject, ObservableObject {
         frameIndex = 0
         keyframeCount = 0
         pointCount = 0
+        sharpnessRejects = 0
         phase = .scanning
         statusText = nil
         UIApplication.shared.isIdleTimerDisabled = true   // 掃描中不鎖屏
@@ -221,6 +245,15 @@ final class CaptureController: NSObject, ObservableObject {
             return
         }
         let raw = await writer.snapshotRecords()
+        if !raw.isEmpty {
+            let sharp = raw.map(\.sharpnessRatio).sorted()
+            let blur = raw.map(\.estimatedBlurPx).sorted()
+            print(String(format:
+                "清晰度: %d 幀，清晰度比中位數 %.2f / 最差 %.2f；模糊估計中位數 %.1fpx / 最差 %.1fpx；" +
+                "另有 %d 次因不夠清晰而放棄抓幀",
+                raw.count, sharp[sharp.count / 2], sharp[0],
+                blur[blur.count / 2], blur[blur.count - 1], sharpnessRejects))
+        }
         var corrected = 0
         refinedRecords = raw.map { record in
             var r = record
@@ -528,7 +561,7 @@ final class CaptureController: NSObject, ObservableObject {
         latestTileTransforms = [:]
         visualizer?.reset()
         runSession()          // reset tracking（review/done 期間 session 已暫停）
-        releaseCameraLocks()  // 回到 idle 恢復自動對焦/曝光，方便取景
+        releaseCameraLocks()  // 回到 idle 恢復自動曝光/白平衡，方便取景
         monitor.start()
         phase = .idle
     }
@@ -668,6 +701,13 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         // 關鍵幀姿態會同時進入重融合的反投影與 3DGS 訓練的相機外參，錯了兩邊一起壞。
         guard a.angularSpeedRadS <= config.keyframeMaxAngularSpeedRadS,
               a.linearSpeedMS <= config.keyframeMaxLinearSpeedMS else { return }
+        // 清晰度閘門：上面兩道都是「由運動推估模糊」，對失焦與 AF 拉焦完全盲目
+        // （手機靜止、對焦跑掉 → 推估值 0，照樣存檔）。這道直接量影像本身。
+        // 被擋下只是等幾幀：SmartShutter 的觸發條件在拍成之前一直成立。
+        guard a.sharpnessRatio >= config.minSharpnessRatio else {
+            sharpnessRejects += 1
+            return
+        }
         guard pendingWrites < config.maxPendingWrites else { return }
         guard shutter.shouldCapture(pose: frame.camera.transform,
                                     time: frame.timestamp,
@@ -710,9 +750,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
                   frame.timestamp - lastSparseIntegration > 1.0 {
             lastSparseIntegration = frame.timestamp
             let points = featurePoints.points
+            let camPos = MatrixUtil.position(frame.camera.transform)
             previewInFlight = true
             Task {
-                await accumulator.integrateSparse(points: points, anchorTransforms: anchorSnapshot)
+                await accumulator.integrateSparse(points: points, anchorTransforms: anchorSnapshot,
+                                                  cameraPosition: camPos)
                 await self.flushTiles()
                 self.previewInFlight = false
             }
@@ -788,6 +830,8 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             exposureOffsetEV: Double(camera.exposureOffset),
             ambientLux: frame.lightEstimate.map { Double($0.ambientIntensity) },
             estimatedBlurPx: Double(a.blurPixels),
+            sharpness: Double(a.sharpness),
+            sharpnessRatio: Double(a.sharpnessRatio),
             imageFile: name + ".jpg",
             depthFile: depthData != nil ? name + "_depth.bin" : nil,
             confidenceFile: confData != nil ? name + "_conf.bin" : nil,

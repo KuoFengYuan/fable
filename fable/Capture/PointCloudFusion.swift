@@ -61,9 +61,13 @@ nonisolated struct TiledFusedGrid {
 
     /// anchorTransforms：主執行緒傳入的各磚錨點「當下」變換（漂移修正後）。
     /// 缺席（新磚尚未建錨）時退回 translate(磚中心)，與稍後建立的錨點初始值一致。
-    mutating func insert(_ candidates: [CloudPoint], anchorTransforms: [Int64: simd_float4x4]) {
+    /// - cameraPosition: 本幀相機的世界座標。用來算「這格是從哪個方向被看到的」——
+    ///   融合品質改以方向多樣性衡量，不是觀測次數（同一角度看再多次，視差仍為零）。
+    mutating func insert(_ candidates: [CloudPoint], anchorTransforms: [Int64: simd_float4x4],
+                         cameraPosition: SIMD3<Float>) {
         for pt in candidates {
             let world = SIMD3<Float>(pt.x, pt.y, pt.z)
+            let dirBit = Self.directionBit(cameraPosition - world)
             guard let tileKey = PointCloudMath.voxelKey(world, size: tileSize) else { continue }
 
             let origin = anchorTransforms[tileKey] ?? Self.translation(tileCenter(tileKey))
@@ -86,15 +90,16 @@ nonisolated struct TiledFusedGrid {
                 cell.color += (rgb - cell.color) * (w / total)
                 cell.weight = min(total, weightCap)
                 cell.bestScore = max(cell.bestScore, pt.score)
-                if cell.obs < 255 {
-                    cell.obs += 1
-                    // 跨過門檻的那一次才計數 → O(1) 維護，不必每幀掃全部 cell
-                    if cell.obs == UInt8(Self.kFullObs) { wellObserved += 1 }
-                }
+                let before = cell.dirMask
+                cell.dirMask |= dirBit
+                // 跨過門檻的那一次才計數 → O(1) 維護，不必每幀掃全部 cell
+                if before.nonzeroBitCount < Self.kFullDirs,
+                   cell.dirMask.nonzeroBitCount >= Self.kFullDirs { wellObserved += 1 }
                 tiles[tileKey]!.cells[cellKey] = cell
             } else {
                 tiles[tileKey]!.cells[cellKey] = FusedVoxelGrid.Cell(
-                    mean: local, color: rgb, weight: max(0.01, pt.score), bestScore: pt.score)
+                    mean: local, color: rgb, weight: max(0.01, pt.score), bestScore: pt.score,
+                    dirMask: dirBit)
                 totalCells += 1
                 if totalCells >= maxCells { coarsen() }
             }
@@ -125,9 +130,11 @@ nonisolated struct TiledFusedGrid {
             totalCells += merged.count
             dirtyTiles.insert(tileKey)
         }
-        // 合併改變了 obs 分佈 → 重算。coarsen 很少發生，O(N) 可接受。
+        // 合併改變了方向分佈 → 重算。coarsen 很少發生，O(N) 可接受。
         wellObserved = tiles.values.reduce(0) { acc, tile in
-            acc + tile.cells.values.reduce(0) { $1.obs >= UInt8(Self.kFullObs) ? $0 + 1 : $0 }
+            acc + tile.cells.values.reduce(0) {
+                $1.dirMask.nonzeroBitCount >= Self.kFullDirs ? $0 + 1 : $0
+            }
         }
         print("[PointCloud] 自動粗化 → voxel \(voxelSize * 100)cm，剩 \(totalCells) 點")
     }
@@ -160,9 +167,9 @@ nonisolated struct TiledFusedGrid {
                 colors.append(min(1, max(0, c.color.y / 255)))
                 colors.append(min(1, max(0, c.color.z / 255)))
             case .fusionQuality:
-                // 紅 → 黃 → 綠。kFullObs 次觀測視為充分（10Hz 融合下約停留 0.6 秒）；
-                // 融合雜訊 ~1/√N，6 次已把單幀 σ≈1-2cm 壓到 <1cm，與 2cm voxel 相稱。
-                let q = min(1, Float(c.obs) / Self.kFullObs)
+                // 紅 → 黃 → 綠，依「看過幾個不同方向」而非次數。
+                // 站著不動時連續幀落在同一個 bin → 顏色不會前進，這正是要的行為。
+                let q = min(1, Float(c.dirMask.nonzeroBitCount) / Float(Self.kFullDirs))
                 colors.append(q < 0.5 ? 1 : 2 * (1 - q))
                 colors.append(q < 0.5 ? 2 * q : 1)
                 colors.append(0.15)
@@ -176,13 +183,25 @@ nonisolated struct TiledFusedGrid {
                               indices: indices.withUnsafeBufferPointer { Data(buffer: $0) })
     }
 
-    /// 「觀測充分」的次數門檻（融合品質熱圖 / 完成度共用）
-    static let kFullObs: Float = 6
+    /// 「觀測充分」的門檻：看過幾個不同方向（熱圖 / 完成度共用）。
+    /// 3 個 bin ＝ 至少約 90° 的方位跨度，足以三角化出可靠的深度。
+    static let kFullDirs = 3
 
-    /// 已達 kFullObs 次觀測的 cell 數（O(1) 維護）
+    /// 觀測方向量化成 16 個 bin（方位 8 × 仰角 2）。世界 +Y 為上（worldAlignment = .gravity）。
+    /// 粗量化是刻意的：目的是分辨「有沒有換位置看」，不是精確測角。
+    static func directionBit(_ d: SIMD3<Float>) -> UInt16 {
+        let n = simd_length(d) > 1e-6 ? d / simd_length(d) : SIMD3<Float>(0, 1, 0)
+        let azi = atan2(n.z, n.x)                                  // -π…π
+        var a = Int(((azi + .pi) / (2 * .pi) * 8).rounded(.down))
+        a = min(max(a, 0), 7)
+        let e = n.y > 0.35 ? 1 : 0                                 // 俯視 vs 水平/仰視
+        return UInt16(1) << UInt16(e * 8 + a)
+    }
+
+    /// 已達 kFullDirs 個觀測方向的 cell 數（O(1) 維護）
     private(set) var wellObserved = 0
-    /// 融合完成度：已充分觀測的表面占比。
-    /// 比「幀數」更有意義——100 幀站在原地拍是沒用的，這個量直接反映「表面被看夠了沒」。
+    /// 融合完成度：已從足夠多「不同方向」看過的表面占比。
+    /// 比幀數與觀測次數都更有意義——100 幀站在原地拍，兩者都會給滿分，但視差為零。
     var fusionCompleteness: Double {
         totalCells > 0 ? Double(wellObserved) / Double(totalCells) : 0
     }

@@ -7,7 +7,7 @@
 //      scan_x/
 //      ├── images/                  ← 訓練影像
 //      └── sparse/0/
-//          ├── cameras.bin          ← PINHOLE 內參
+//          ├── cameras.bin          ← PINHOLE 內參（逐幀一組，吸收連續對焦的內參呼吸）
 //          ├── images.bin           ← w2c 姿態（qw qx qy qz + t，OpenCV 相機慣例）
 //          └── points3D.bin         ← LiDAR 彩色點雲（3DGS 初始化）
 //  二進位編排與 COLMAP scripts/python/read_write_model.py 完全一致。
@@ -62,22 +62,29 @@ nonisolated enum ExportManager {
         return (q, -(rW2C * t))
     }
 
+    /// 一張影像一組 PINHOLE 內參（camera_id = image_id）。
+    ///
+    /// 不用「取中位數做單一相機」：那個做法只在對焦被鎖住時成立，而我們刻意讓對焦保持連續自動
+    /// （鎖對焦會把整段掃描凍在起始那一刻的景深裡，離開就糊 —— 見 CameraControls.lockForScan）。
+    /// 連續對焦會帶來內參呼吸（focus breathing）：鏡組移動使有效焦長變化，iPhone 主鏡由無限遠
+    /// 到近距約 1~2%，在 1920 寬的畫面邊緣就是 10~19 px 的重投影誤差 —— 遠大於可以忽略的程度。
+    /// 但這是**可修的**：ARKit 每幀都給了當下的內參，FrameRecord 也早就逐幀存下來了。
+    /// COLMAP 格式原生支援一張影像一組相機，msplat 的 loader 也是逐影像查 camId
+    /// （load_colmap.cpp: `cameras.find(img.camId)`），所以逐幀輸出的成本是零。
+    /// 於是「失焦模糊」（不可修）被換成「內參變動」（完全吸收）。
     private static func writeCamerasBin(records: [FrameRecord], to url: URL) throws {
-        // 對焦鎖定後內參漂移 <0.1%，取中位數做單一 PINHOLE 相機
-        func median(_ values: [Double]) -> Double {
-            let s = values.sorted()
-            return s[s.count / 2]
+        var data = Data(capacity: records.count * 48 + 8)
+        data.appendLE(UInt64(records.count))                  // num_cameras
+        for r in records {
+            data.appendLE(Int32(r.id))                        // camera_id = image_id
+            data.appendLE(Int32(1))                           // model_id: PINHOLE
+            data.appendLE(UInt64(r.intrinsics.width))
+            data.appendLE(UInt64(r.intrinsics.height))
+            data.appendLE(r.intrinsics.fx)
+            data.appendLE(r.intrinsics.fy)
+            data.appendLE(r.intrinsics.cx)
+            data.appendLE(r.intrinsics.cy)
         }
-        var data = Data()
-        data.appendLE(UInt64(1))                              // num_cameras
-        data.appendLE(Int32(1))                               // camera_id
-        data.appendLE(Int32(1))                               // model_id: PINHOLE
-        data.appendLE(UInt64(records[0].intrinsics.width))
-        data.appendLE(UInt64(records[0].intrinsics.height))
-        data.appendLE(median(records.map { $0.intrinsics.fx }))
-        data.appendLE(median(records.map { $0.intrinsics.fy }))
-        data.appendLE(median(records.map { $0.intrinsics.cx }))
-        data.appendLE(median(records.map { $0.intrinsics.cy }))
         try data.write(to: url, options: [.atomic])
     }
 
@@ -95,7 +102,7 @@ nonisolated enum ExportManager {
             data.appendLE(t.x)
             data.appendLE(t.y)
             data.appendLE(t.z)
-            data.appendLE(Int32(1))                           // camera_id
+            data.appendLE(Int32(r.id))                        // camera_id = image_id（逐幀內參）
             data.append(r.imageFile.data(using: .utf8)!)
             data.append(0)                                    // name 結尾 \0
             data.appendLE(UInt64(0))                          // num_points2D（無 SfM 觀測）

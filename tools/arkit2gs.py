@@ -278,10 +278,13 @@ def write_colmap(out_dir: Path, records, c2ws, Ks, wh, xyz, rgb, scan_dir, trans
     sparse.mkdir(parents=True, exist_ok=True)
     w, h = wh
 
-    # 內參逐幀差異極小（AF 鎖定後），取中位數做單一 PINHOLE 相機
-    fls = np.array(Ks)
-    cam = colmap_io.Camera(id=1, model="PINHOLE", width=w, height=h,
-                           params=[float(np.median(fls[:, i])) for i in range(4)])
+    # 一張影像一組 PINHOLE 內參（camera_id = image_id）。
+    # 採集端刻意不鎖對焦（鎖了會把整段掃描凍在起始景深裡，離開就糊），
+    # 連續對焦的內參呼吸在 1920 寬畫面邊緣可達 10~19 px —— 但每幀內參都在 poses.jsonl 裡，
+    # 逐幀輸出即完全吸收。與 nerfstudio 輸出路徑（本來就逐幀）一致。
+    cams = [colmap_io.Camera(id=i, model="PINHOLE", width=w, height=h,
+                             params=[float(v) for v in K])
+            for i, K in enumerate(Ks, start=1)]
 
     # 世界上方向對齊 COLMAP 慣例（ARKit +Y-up 直接匯入 3DGS 會上下顛倒）；
     # 姿態與點雲成對翻轉、幾何一致
@@ -292,7 +295,7 @@ def write_colmap(out_dir: Path, records, c2ws, Ks, wh, xyz, rgb, scan_dir, trans
     for i, (r, c2w) in enumerate(zip(records, c2ws), start=1):
         qvec, tvec = G.colmap_qt_from_c2w_gl(c2w)    # → w2c（CV 慣例）
         images.append(colmap_io.Image(id=i, qvec=qvec, tvec=tvec,
-                                      camera_id=1, name=r["imageFile"]))
+                                      camera_id=i, name=r["imageFile"]))
 
     if xyz is None:
         # 沒有點雲時以相機包圍盒內的隨機點替代（Inria loader 需要非空 points3D）
@@ -303,11 +306,11 @@ def write_colmap(out_dir: Path, records, c2ws, Ks, wh, xyz, rgb, scan_dir, trans
     elif flip_world_up:
         xyz = G.flip_world_up_points(xyz)
 
-    colmap_io.write_cameras_bin(sparse / "cameras.bin", [cam])
+    colmap_io.write_cameras_bin(sparse / "cameras.bin", cams)
     colmap_io.write_images_bin(sparse / "images.bin", images)
     colmap_io.write_points3D_bin(sparse / "points3D.bin", xyz, rgb)
     if also_txt:
-        colmap_io.write_cameras_txt(sparse / "cameras.txt", [cam])
+        colmap_io.write_cameras_txt(sparse / "cameras.txt", cams)
         colmap_io.write_images_txt(sparse / "images.txt", images)
         colmap_io.write_points3D_txt(sparse / "points3D.txt", xyz, rgb)
     print(f"✅ COLMAP 資料集 → {out_dir}（{len(images)} 幀，{len(xyz):,} 點）")
