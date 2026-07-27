@@ -157,8 +157,23 @@ final class CaptureController: NSObject, ObservableObject {
         return cfg
     }
 
+    /// 印出本機可用的 ARKit 影像格式。顆粒感的解法之一是「用更高解析度拍、訓練前降採樣」
+    /// （降採樣會平均掉雜訊：4K→1600 是 2.4× 線性，雜訊約降 2.4 倍），
+    /// 但值不值得取決於本機到底有沒有「高解析度又維持 60fps」的格式 —— 只能實機問。
+    private func logVideoFormats() {
+        let cur = arView?.session.configuration?.videoFormat
+        for f in ARWorldTrackingConfiguration.supportedVideoFormats {
+            let r = f.imageResolution
+            let mark = (f == cur) ? "  ← 目前使用" : ""
+            print(String(format: "[VideoFormat] %.0f×%.0f @ %dfps  %@%@",
+                         r.width, r.height, f.framesPerSecond,
+                         f.captureDeviceType.rawValue, mark))
+        }
+    }
+
     private func runSession() {
         arView?.session.run(makeARConfig(), options: [.resetTracking, .removeExistingAnchors])
+        logVideoFormats()
         // 曝光上限要在取景階段就設好，AE 才有時間在上限內收斂；
         // session.run 會重設裝置設定，故必須在 run 之後。
         cameraControls.capExposureDuration()

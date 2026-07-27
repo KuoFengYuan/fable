@@ -52,8 +52,19 @@ nonisolated struct CaptureConfig: Sendable {
     ///
     /// 用相對值而非絕對值：清晰度與場景紋理量綁死（白牆對到極清晰也只有雜訊級的值），
     /// 絕對門檻在白牆上會全擋、在書架上會全過。
-    /// 0.6 ≈ 允許三分之一的細節損失。調高更嚴（可能抓不到幀）、調低更寬鬆。
-    var minSharpnessRatio: Float = 0.6
+    /// 值由離線校準決定（tools/test_sharpness.py，粉紅雜訊合成場景 + 已知模糊核）：
+    ///   真的該擋的：AF 拉焦（σ 8px）比值 0.03~0.27；單幀手震（σ 4px）0.05
+    ///   不該擋的：平移過均勻紋理 1.00；1.5s 內從書架平移到白牆，最低 0.53
+    /// 0.4 落在兩群中間 —— 對真模糊有 ~2.5× 餘裕，離自然變化的地板還有 ~1.3× 空間。
+    /// （原本設 0.6，校準後發現它只對應 σ≈0.6px 的模糊，等於要求近乎完美清晰，過嚴。）
+    var minSharpnessRatio: Float = 0.4
+    /// CMOS 捲簾快門讀完整幀所需時間（秒）。這**不是**曝光時間，是逐列讀出的跨度：
+    /// 這段時間內相機還在動 → 幀內上下兩端對應不同姿態 = 剪切變形，縮短曝光救不到。
+    /// 少了這一項，明亮環境（AE 縮到 1/250s）的快速轉動會被系統性低估 3 倍以上。
+    /// iPhone 主鏡 video 模式實測約 8~15ms，取 10ms。
+    /// 想校準：拍直立的門框並水平快速平移，量畫面上下兩端的傾斜角 θ，
+    /// 則 readout ≈ tan(θ) × 畫面寬 / (角速度 × fx)。
+    var rollingShutterReadoutS: Double = 1.0 / 100
     /// 環境照度下限（lux，ARKit lightEstimate；1000 為標準室內）
     var minAmbientLux: CGFloat = 150
     /// 環境照度上限（正對強光 / 戶外直射易過曝）
@@ -64,7 +75,17 @@ nonisolated struct CaptureConfig: Sendable {
     var maxTargetDistanceM: Float = 4.0
 
     // MARK: - 影像 / 深度輸出
-    var jpegQuality: Double = 0.90
+    /// JPEG 品質。0.90 在「有雜訊的輸入」上會讓 8×8 區塊的量化誤差變成塊狀色斑，
+    /// 看起來比底下的感光元件雜訊還醜 —— 而 ARKit 影像本來就有雜訊（見下）。
+    /// 感光雜訊是零均值的、多視角平均會消掉；JPEG 量化誤差是固定在該幀的系統性誤差，
+    /// 對光度損失是實打實的偏差。攝影測量慣例是 ≥0.95，故調上來（120 幀約 48MB → 72MB）。
+    ///
+    /// 顆粒感的**主因不在這裡**：ARKit 的 capturedImage 是 video 幀，完全繞過 iOS 的
+    /// 運算攝影堆疊（沒有 Deep Fusion / Smart HDR / 多幀降噪）。相機 App 的照片乾淨是因為
+    /// 那是 ~9 幀融合的結果；單張 video 幀在室內 ISO 400~800 下就是這個樣子，
+    /// Scaniverse / Polycam 也一樣。訓練前還會 area-average 降到 1600（雜訊再降 ~1.2×），
+    /// 且 3DGS 對同一表面吃 10~30 個視角、雜訊以 √N 收斂 —— 最終成品比任一單張都乾淨得多。
+    var jpegQuality: Double = 0.95
     var saveDepth = true
     // 相機參數鎖定（曝光/白平衡；對焦維持連續自動）為使用者可切換選項，
     // 見 CaptureController.lockCameraParams（預設開啟）

@@ -85,6 +85,9 @@ final class QualityMonitor {
     /// 短暫的不清晰（AF 拉一下焦、鏡頭掃過紋理量差很多的兩片表面）由閘門靜靜擋掉就好，
     /// 跳一個紅字出來只會讓使用者以為壞了。持續不清晰（鏡頭有指紋、AF 卡住、太暗）才值得說。
     private static let kNotSharpFrames = 15
+    /// 角速度超過此值就凍結清晰度基準線（見 assess 內說明）。
+    /// 0.2 rad/s ≈ 11°/s：比「手持自然晃動」高、比任何刻意的轉動低。
+    private static let kPeakFreezeRadS: Float = 0.2
 
     private let motion = CMMotionManager()
     private var lastPose: simd_float4x4?
@@ -116,11 +119,25 @@ final class QualityMonitor {
 
         // 2. 角速度 / 線速度（EMA 平滑，避免單幀抖動觸發警告）
         let dt = lastTime > 0 ? Float(frame.timestamp - lastTime) : 0
+        // 角速度優先取 ARKit 姿態差分，陀螺儀只當補強 —— 順序與直覺相反，理由是**時間對齊**：
+        //
+        //   陀螺儀輪詢拿到的是「現在」的角速度，但手上這一幀是 30~50ms 前曝光的
+        //   （ARKit 帶 sceneDepth 的管線延遲）。轉彎「結束」時最致命：手已經停了、
+        //   陀螺儀讀到接近 0，可是正在送進來的那一幀是轉彎峰值時曝的，而 SmartShutter
+        //   的「轉角 ≥ 6°」條件剛好在此刻滿足 → 精準地把整段最糊的那一幀存成關鍵幀。
+        //   這就是「視角轉彎時最容易出現模糊照片」的成因。
+        //
+        //   姿態差分量的是 frame k-1 → k 之間的平均角速度，而 frame.camera.transform
+        //   本來就屬於該幀的時刻，天然對齊，量到的正是那個曝光窗實際抹過的角度。
+        //   2 rad/s 的轉動在 16.7ms 內是 1.9°，遠高於 ARKit 的旋轉雜訊（~0.05°），SNR 沒問題。
+        //   再取 max(姿態差分, 陀螺儀) 補上「正在加速進轉彎」——那時陀螺儀跑在前面。
         var angular: Float = 0
-        if let rate = motion.deviceMotion?.rotationRate {
-            angular = Float((rate.x * rate.x + rate.y * rate.y + rate.z * rate.z).squareRoot())
-        } else if let lp = lastPose, dt > 0 {
+        if let lp = lastPose, dt > 0 {
             angular = MatrixUtil.rotationAngleDeg(lp, camera.transform) * .pi / 180 / dt
+        }
+        if let rate = motion.deviceMotion?.rotationRate {
+            angular = max(angular,
+                          Float((rate.x * rate.x + rate.y * rate.y + rate.z * rate.z).squareRoot()))
         }
         var linear: Float = 0
         if let lp = lastPose, dt > 0 {
@@ -139,12 +156,21 @@ final class QualityMonitor {
             a.centerDepthM = Self.centerMedianDepth(depthMap)
         }
 
-        // 4. 動態模糊估計：像素位移 ≈ (ω + v/z) × fx × 曝光時間
-        //    旋轉是主要殺手（rolling shutter 亦然），平移項以中心景深歸一化
+        // 4. 幾何劣化估計：像素位移 ≈ (ω + v/z) × fx × (曝光時間 + 捲簾讀出時間)
+        //    平移項以中心景深歸一化。
+        //
+        //    為什麼要加上捲簾讀出時間 —— 原本只算曝光時間，於是「亮處」被系統性低估：
+        //    明亮辦公室 AE 會縮到 1/250s，1 rad/s 的轉動只估出 6px，看起來完全合格；
+        //    但 CMOS 是逐列讀出的，整幀跨越約 10ms，這段時間內相機仍在轉 →
+        //    畫面上下兩端對應不同的相機姿態，變成剪切變形（skew），
+        //    對 3DGS 是直接違反針孔模型，而且**縮短曝光完全救不到**。
+        //    1 rad/s + 1/250s 曝光的實際劣化是 6px 模糊 ＋ 14px 剪切 ≈ 20px，不是 6px。
+        //    兩者是不同的成因（一個是曝光內抹動、一個是幀內姿態不一致），
+        //    但對「這一幀能不能當訓練影像」的影響同向，故合成單一保守指標。
         let fx = Float(camera.intrinsics[0][0])
         var flow = a.angularSpeedRadS
         if a.centerDepthM > 0 { flow += a.linearSpeedMS / a.centerDepthM }
-        a.blurPixels = flow * fx * Float(camera.exposureDuration)
+        a.blurPixels = flow * fx * Float(camera.exposureDuration + config.rollingShutterReadoutS)
         if a.blurPixels > config.maxBlurPixels {
             a.issues.append(.tooFast)
         }
@@ -153,7 +179,20 @@ final class QualityMonitor {
         //     絕對值與場景紋理量綁死，故拿它跟「近 0.5s 內同場景的最佳值」比。
         let sharp = Self.sharpness(frame.capturedImage)
         if sharp >= 0 {
-            sharpPeak = max(sharp, sharpPeak * Self.kSharpPeakDecay)
+            // 相機轉得快時**凍結**基準線，不讓它衰減。
+            //
+            // 這是這道閘門原本的致命缺口：sharpPeak 只有 ~0.5s 的記憶，
+            // 而轉彎掃描是「持續」糊 1~2 秒 —— 峰值會一路降到糊的水準，比值回到 1.0，
+            // 於是整段轉彎都被放行。離線模擬（tools/test_sharpness.py）量到的是：
+            // 持續 20px 模糊的 90 幀裡，轉彎開始 267ms 後比值就爬回門檻以上，82% 放行。
+            // 對照組（手震 0.1s）則 100% 擋掉 —— 它只抓得到「短暫」模糊。
+            //
+            // 凍結後，基準線保留的是「上次拿穩時這個場景有多清晰」，
+            // 整段轉彎都會被拿去跟那個值比，持續模糊再也騙不過去。
+            // 代價：轉彎後停在低紋理表面時基準線偏高（誤擋），但只持續到動作停下後 ~0.5s
+            // 衰減恢復為止，而且那時本來就該補拍一張清晰的。
+            let moving = a.angularSpeedRadS > Self.kPeakFreezeRadS
+            sharpPeak = max(sharp, sharpPeak * (moving ? 1.0 : Self.kSharpPeakDecay))
             a.sharpness = sharp
             a.sharpnessRatio = sharpPeak > 1e-6 ? sharp / sharpPeak : 1
             if a.sharpnessRatio < config.minSharpnessRatio {
