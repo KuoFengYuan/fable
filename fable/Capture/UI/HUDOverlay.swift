@@ -251,9 +251,10 @@ struct HUDOverlay: View {
     private var bottomControls: some View {
         VStack(spacing: 14) {
             if controller.phase == .idle {
-                // 相機參數鎖定開關（預設開啟）：按快門當下鎖定對焦/曝光/白平衡
+                // 相機參數鎖定開關（預設開啟）：按快門當下鎖定曝光/白平衡。
+                // 對焦刻意不在此列 —— 鎖對焦＝凍結景深，離開起始距離就糊。
                 Toggle(isOn: $controller.lockCameraParams) {
-                    Label("鎖定對焦 / 曝光 / 白平衡",
+                    Label("鎖定曝光 / 白平衡",
                           systemImage: controller.lockCameraParams ? "lock.fill" : "lock.open")
                         .font(.caption.weight(.medium))
                 }

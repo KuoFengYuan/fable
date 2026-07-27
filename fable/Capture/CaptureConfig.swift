@@ -43,6 +43,17 @@ nonisolated struct CaptureConfig: Sendable {
     var maxBlurPixels: Float = 8.0
     /// 模糊遮斷門檻：超過才紅色警告＋暫停抓幀（1/60s 曝光下約等於角速度 0.66 rad/s 的甩動）
     var blockBlurPixels: Float = 16.0
+    /// 關鍵幀的清晰度門檻：本幀清晰度 ÷「近 0.5s 內同場景的最佳清晰度」須達此比例。
+    ///
+    /// 為什麼需要它 —— blockBlurPixels 是**推估**（角速度 × 曝光時間），只涵蓋動態模糊，
+    /// 對「失焦」完全盲目：手機靜止不動、對焦跑掉的畫面，推估值是 0，照樣被存成關鍵幀。
+    /// 失焦與 AF 拉焦（重新啟用連續自動對焦後必然會發生）是「有些照片糊掉」的主因，
+    /// 只有直接量影像才擋得住。
+    ///
+    /// 用相對值而非絕對值：清晰度與場景紋理量綁死（白牆對到極清晰也只有雜訊級的值），
+    /// 絕對門檻在白牆上會全擋、在書架上會全過。
+    /// 0.6 ≈ 允許三分之一的細節損失。調高更嚴（可能抓不到幀）、調低更寬鬆。
+    var minSharpnessRatio: Float = 0.6
     /// 環境照度下限（lux，ARKit lightEstimate；1000 為標準室內）
     var minAmbientLux: CGFloat = 150
     /// 環境照度上限（正對強光 / 戶外直射易過曝）
@@ -55,7 +66,7 @@ nonisolated struct CaptureConfig: Sendable {
     // MARK: - 影像 / 深度輸出
     var jpegQuality: Double = 0.90
     var saveDepth = true
-    // 相機參數鎖定（對焦/曝光/白平衡）為使用者可切換選項，
+    // 相機參數鎖定（曝光/白平衡；對焦維持連續自動）為使用者可切換選項，
     // 見 CaptureController.lockCameraParams（預設開啟）
 
     // MARK: - 點雲累積（3DGS 初始化 + 即時預覽共用）
