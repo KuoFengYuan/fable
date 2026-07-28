@@ -157,9 +157,14 @@ final class CaptureController: NSObject, ObservableObject {
         return cfg
     }
 
-    /// 印出本機可用的 ARKit 影像格式。顆粒感的解法之一是「用更高解析度拍、訓練前降採樣」
-    /// （降採樣會平均掉雜訊：4K→1600 是 2.4× 線性，雜訊約降 2.4 倍），
-    /// 但值不值得取決於本機到底有沒有「高解析度又維持 60fps」的格式 —— 只能實機問。
+    /// 印出本機可用的 ARKit 影像格式。
+    ///
+    /// 訂正一個先前寫錯的推論：我原本說「4K 拍再降到 1600，雜訊降 2.4 倍」。
+    /// 那對固定 sensor 不成立 —— iPhone 輸出 1920×1440 時本來就已經在 sensor 上做 binning，
+    /// 4K 只是少 bin 一點；降採樣回同一尺寸後 SNR 大致打平。
+    /// **高解析度買到的是細節，不是低雜訊。** 顆粒感要靠 ISO（見 denoiseISOThreshold）解。
+    /// 這份清單留著是為了知道有沒有「更高解析度又維持 60fps」的選項可換細節（不換雜訊），
+    /// 以及確認目前跑在哪個格式 —— 只能實機問。
     private func logVideoFormats() {
         let cur = arView?.session.configuration?.videoFormat
         for f in ARWorldTrackingConfiguration.supportedVideoFormats {
@@ -248,11 +253,16 @@ final class CaptureController: NSObject, ObservableObject {
         if !raw.isEmpty {
             let sharp = raw.map(\.sharpnessRatio).sorted()
             let blur = raw.map(\.estimatedBlurPx).sorted()
+            let iso = raw.map(\.iso).sorted()
+            let expo = raw.map(\.exposureDuration).sorted()
+            let m = raw.count / 2
             print(String(format:
                 "清晰度: %d 幀，清晰度比中位數 %.2f / 最差 %.2f；模糊估計中位數 %.1fpx / 最差 %.1fpx；" +
                 "另有 %d 次因不夠清晰而放棄抓幀",
-                raw.count, sharp[sharp.count / 2], sharp[0],
-                blur[blur.count / 2], blur[blur.count - 1], sharpnessRejects))
+                raw.count, sharp[m], sharp[0], blur[m], blur[raw.count - 1], sharpnessRejects))
+            print(String(format:
+                "曝光: ISO 中位數 %.0f / 最高 %.0f，快門中位數 1/%.0fs / 最長 1/%.0fs（上限 1/60s）",
+                iso[m], iso[raw.count - 1], 1 / expo[m], 1 / expo[raw.count - 1]))
         }
         var corrected = 0
         refinedRecords = raw.map { record in
@@ -262,6 +272,16 @@ final class CaptureController: NSObject, ObservableObject {
                 r.transform = t
             }
             return r
+        }
+        // 模糊幀全域複核。必須在姿態修正**之後**：BlurFilter 靠位置/朝向找「看同一片表面」
+        // 的鄰居，用未修正的姿態會找錯鄰居。判定寫回紀錄而非直接刪除，
+        // poses_refined.jsonl 與 images/ 都保留完整，可回頭檢查判定對不對。
+        refinedRecords = BlurFilter.annotate(refinedRecords)
+        let dropped = refinedRecords.filter { $0.blurVerdict == .drop }.count
+        let demoted = refinedRecords.filter { $0.blurVerdict == .demote }.count
+        if dropped + demoted > 0 {
+            print("模糊複核: \(refinedRecords.count) 幀 → 排除 \(dropped) 幀（幾何不可信，點雲也不用）"
+                  + "、\(demoted) 幀（顏色糊，不進訓練但深度仍以降權併入點雲）")
         }
 
         // 重融合：用修正後姿態把所有關鍵幀原始深度重新反投影 + 加權平均
@@ -296,7 +316,9 @@ final class CaptureController: NSObject, ObservableObject {
               let dir = sessionDir else { return }
         phase = .exporting
         statusText = "打包中…"
-        let records = refinedRecords
+        // 訓練/匯出只吃 .keep：.drop 幾何不可信、.demote 顏色糊，兩者都不該當訓練影像。
+        // （能走到這裡的 .demote 都是「鄰居夠多」才被判的，排除它不會少掉任何視角。）
+        let records = refinedRecords.filter { $0.blurVerdict == .keep }
         let points = reviewPoints
         Task {
             _ = await writer?.finish()
@@ -370,7 +392,7 @@ final class CaptureController: NSObject, ObservableObject {
 
         let cancel = CancelFlag()
         trainingCancel = cancel
-        let records = refinedRecords
+        let records = refinedRecords.filter { $0.blurVerdict == .keep }
         let points = reviewPoints
         let cfg = config
         let wantPreview = showTrainingProcess
@@ -612,7 +634,9 @@ final class CaptureController: NSObject, ObservableObject {
 
         writer = try FrameWriter(sessionDir: dir,
                                  saveDepth: config.saveDepth && hasLiDAR,
-                                 jpegQuality: config.jpegQuality)
+                                 jpegQuality: config.jpegQuality,
+                                 denoiseISOThreshold: config.denoiseISOThreshold,
+                                 denoiseMaxNoiseLevel: config.denoiseMaxNoiseLevel)
         accumulator = PointCloudAccumulator(config: config)
 
         let meta = SessionMeta(device: Self.deviceModel(),
@@ -828,6 +852,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
                                          width: w, height: h),
             exposureDuration: camera.exposureDuration,
             exposureOffsetEV: Double(camera.exposureOffset),
+            iso: cameraControls.currentISO,
             ambientLux: frame.lightEstimate.map { Double($0.ambientIntensity) },
             estimatedBlurPx: Double(a.blurPixels),
             sharpness: Double(a.sharpness),

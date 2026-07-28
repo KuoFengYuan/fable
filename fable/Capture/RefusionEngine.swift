@@ -210,9 +210,19 @@ nonisolated enum RefusionEngine {
             guard let rgba = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
                                         width: dw, height: dh) else { continue }
 
+            // 幾何不可信的幀直接跳過：它的深度會被反投影到錯的世界座標，疊出殘影／雙層殼。
+            // 殘影比破洞更糟 —— 破洞看得出來，殘影會被當成真的幾何。
+            // 注意這裡**不**跳過 .demote：那些只是顏色糊，幾何來自 LiDAR、照樣可信，
+            // 丟了只會白白開洞。它們改以降權併入（見下）。
+            if r.blurVerdict == .drop { continue }
+
             let K = r.intrinsics.scaled(toWidth: dw, height: dh)
             let c2w = float4x4(rowMajor: r.transform)
-            let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
+            // 權重同時吃兩個來源：估計的幾何劣化（運動/捲簾）與實測的清晰度判定。
+            // 原本只看 estimatedBlurPx，於是「相機拿得很穩但失焦」的幀拿到滿分權重，
+            // 它糊掉的顏色會主導那格的加權平均 —— 這是實測清晰度才看得到的破口。
+            var sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
+            if r.blurVerdict == .demote { sharpness *= kDemotedColorWeight }
             grid.insert(unprojectStored(depth: depth, conf: conf, rgba: rgba,
                                         dw: dw, dh: dh, K: K, c2w: c2w,
                                         config: config, sharpness: sharpness))
@@ -397,6 +407,11 @@ nonisolated enum RefusionEngine {
     /// 分數刻意壓低（×kMeshScore）：同格若有 LiDAR 直接觀測，加權平均由 LiDAR 主導；
     /// mesh 只在「關鍵幀沒拍到」的空格補洞，不會稀釋既有的良好觀測。
     private static let kMeshScore: Float = 0.25
+
+    /// 被判 .demote 的幀，其顏色貢獻的額外折扣。幾何照收（LiDAR 不受 RGB 模糊影響、
+    /// 而且丟了會開洞），但顏色讓位給看同一片表面的清晰幀。
+    /// 0.2 而非 0：那格若剛好只有這一幀看過，它仍是唯一的顏色來源，總比留黑好。
+    private static let kDemotedColorWeight: Float = 0.2
     private static func projectMesh(_ verts: [SIMD3<Float>], depth: Data, rgba: [UInt8],
                                     dw: Int, dh: Int, K: CameraIntrinsics,
                                     c2w: simd_float4x4, config: CaptureConfig,

@@ -35,12 +35,18 @@ nonisolated struct FrameRecord: Codable, Sendable {
     var intrinsics: CameraIntrinsics
     var exposureDuration: Double
     var exposureOffsetEV: Double
+    /// 拍攝當下的感光度。顆粒感的直接成因，也是判斷「要不要降噪」的依據 ——
+    /// 低 ISO 還有顆粒代表問題不在感光度，降噪只會白白吃掉細節。
+    var iso: Double = 0
     var ambientLux: Double?
     var estimatedBlurPx: Double
     /// 影像清晰度的直接量測（歸一化二階差分能量）與其相對基準線的比例。
     /// 離線挑幀用：同一區域拍到多張時，可據此選最鋭利的餵給訓練。
     var sharpness: Double = 0
     var sharpnessRatio: Double = 1
+    /// 掃描結束後的全域複核結果（見 BlurFilter）。刻意保留在紀錄裡而非直接刪除 ——
+    /// 被排除的幀仍留在 poses_refined.jsonl 與 images/ 內，可回頭檢查判定對不對。
+    var blurVerdict: BlurVerdict = .keep
     var imageFile: String
     var depthFile: String?
     var confidenceFile: String?

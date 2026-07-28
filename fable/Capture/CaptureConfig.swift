@@ -87,6 +87,21 @@ nonisolated struct CaptureConfig: Sendable {
     /// 且 3DGS 對同一表面吃 10~30 個視角、雜訊以 √N 收斂 —— 最終成品比任一單張都乾淨得多。
     var jpegQuality: Double = 0.95
     var saveDepth = true
+    /// 高 ISO 時對存檔影像做輕度降噪的門檻。低於此值不處理。
+    ///
+    /// **為什麼只在高 ISO 才做** —— 3DGS 對同一表面吃 10~30 個視角，感光雜訊是零均值的，
+    /// 光度損失收斂到的就是多視角平均，雜訊本來就會以 √N 消掉。
+    /// 也就是說：對訓練而言，逐幀降噪能拿掉的東西「平均」本來就會拿掉，
+    /// 但降噪順手削掉的真實細節，平均**救不回來** —— 純以訓練論，降噪是負分。
+    /// 它真正值得做的地方有兩個：(a) 匯出的照片是給人看的；
+    /// (b) 雜訊會製造假梯度，讓 MRNF 的密集化把高斯浪費在雜訊上（floaters）。
+    /// 所以策略是「只在雜訊真的壓過細節時才動手，而且下手要輕」。
+    /// ISO 400 以下的 iPhone 主鏡雜訊遠低於 JPEG 量化誤差，動它沒有意義。
+    var denoiseISOThreshold: Double = 400
+    /// 降噪強度上限（CINoiseReduction 的 inputNoiseLevel；Apple 預設 0.02）。
+    /// 由 ISO 在 [threshold, 4×threshold] 之間以 log 內插到此值，超過就封頂。
+    /// 設 0 等於關閉降噪。
+    var denoiseMaxNoiseLevel: Double = 0.022
     // 相機參數鎖定（曝光/白平衡；對焦維持連續自動）為使用者可切換選項，
     // 見 CaptureController.lockCameraParams（預設開啟）
 

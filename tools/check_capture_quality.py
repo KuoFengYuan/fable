@@ -63,6 +63,25 @@ def main():
     else:
         print(f"    {OK} 全部 ≤ 1/60s")
 
+    # --- 1b. 感光度（顆粒感的直接成因）-----------------------------------
+    print("\n[1b] 感光度 ISO（顆粒感的直接成因）")
+    isos = sorted(r.get("iso", 0) for r in recs)
+    if isos[-1] <= 0:
+        print(f"    {WARN} 此掃描沒有 iso 欄位（舊版 App），跳過")
+    else:
+        med, hi = isos[n // 2], isos[-1]
+        over = sum(1 for i in isos if i > 400)
+        print(f"    中位數 {med:.0f}、最高 {hi:.0f}、超過 400 的有 {pct(over, n)}")
+        if med <= 200:
+            print(f"    {OK} ISO 很低 —— 顆粒感**不是**感光度造成的，降噪不會生效也不該生效。")
+            print("        剩下的顆粒是 ARKit video 幀本身的特性（無多幀降噪），")
+            print("        唯一的解法是改走照片管線 captureHighResolutionFrame()。")
+        elif med <= 800:
+            print(f"    {OK} ISO 中等 —— 自適應降噪會在超過 400 的那 {pct(over, n)} 幀上輕度介入")
+        else:
+            print(f"    {WARN} ISO 偏高 —— 現場光線不足。補光的效果會遠大於任何後處理；")
+            print("        或考慮放寬 CameraControls.kMaxShutter（代價是動態模糊變多）")
+
     # --- 2. 清晰度閘門 ---------------------------------------------------
     print("\n[2] 清晰度（sharpnessRatio：本幀 ÷ 同場景近期最佳）")
     if "sharpnessRatio" not in recs[0]:
@@ -82,10 +101,36 @@ def main():
             print(f"      {r['imageFile']}  ratio {r['sharpnessRatio']:.2f}"
                   f"  絕對值 {r['sharpness']:.3f}  估計劣化 {r['estimatedBlurPx']:.1f}px")
 
+    # --- 2b. 掃描後的全域模糊複核（BlurFilter）---------------------------
+    print("\n[2b] 掃描後全域複核 blurVerdict")
+    verdicts = [r.get("blurVerdict", "keep") for r in recs]
+    if "blurVerdict" not in recs[0]:
+        print(f"    {WARN} 此掃描沒有 blurVerdict 欄位（舊版 App），跳過")
+    else:
+        drop = [r for r in recs if r.get("blurVerdict") == "drop"]
+        demo = [r for r in recs if r.get("blurVerdict") == "demote"]
+        keep = n - len(drop) - len(demo)
+        print(f"    keep {keep} / demote {len(demo)} / drop {len(drop)}")
+        print("      demote = 顏色糊，不進訓練，但深度仍以降權併入點雲（幾何來自 LiDAR，丟了只會開洞）")
+        print("      drop   = 幾何不可信（轉太快 → 姿態錯位＋捲簾剪切），點雲也不用（殘影比破洞更糟）")
+        if (len(drop) + len(demo)) / n > 0.28:
+            print(f"    {WARN} 排除比例 {(len(drop)+len(demo))/n*100:.0f}% 已接近 30% 上限 ——")
+            print("        代表整段掃描普遍偏糊，補拍會比調參有效")
+        for r in (drop + demo)[:5]:
+            print(f"      {r['imageFile']}  {r['blurVerdict']:<6}"
+                  f"  sharpness {r.get('sharpness', 0):.3f}"
+                  f"  劣化 {r['estimatedBlurPx']:.1f}px")
+
     # --- 3. 幾何劣化估計（含捲簾快門）-----------------------------------
-    print("\n[3] 幾何劣化估計 estimatedBlurPx（運動模糊 ＋ 捲簾剪切）")
-    bl = sorted(r["estimatedBlurPx"] for r in recs)
-    print(f"    中位數 {bl[n//2]:.1f}px、最差 {bl[-1]:.1f}px")
+    # 只看實際會進訓練的幀 —— 被 BlurFilter 排除的本來就是要丟的，拿它們來判失敗是錯的
+    print("\n[3] 幾何劣化估計 estimatedBlurPx（運動模糊 ＋ 捲簾剪切，僅計 keep 的幀）")
+    kept = [r for r in recs if r.get("blurVerdict", "keep") == "keep"]
+    if not kept:
+        print(f"    {FAIL} 沒有任何幀通過複核")
+        return 1
+    bl = sorted(r["estimatedBlurPx"] for r in kept)
+    n = len(kept)
+    print(f"    {n} 幀，中位數 {bl[n//2]:.1f}px、最差 {bl[-1]:.1f}px")
     if bl[-1] > 16:
         problems += 1
         print(f"    {FAIL} 最差 {bl[-1]:.1f}px 超過 blockBlurPixels(16) 卻仍被存檔")
