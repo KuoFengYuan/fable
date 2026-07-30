@@ -37,6 +37,14 @@ struct CaptureView: View {
                     onZoom: { s in controller.zoomTrainedView(scale: Float(s)) })
                     .ignoresSafeArea()
             }
+            // 平面圖預覽：疊在點雲檢視之上，匯出前先確認形狀與尺寸對不對。
+            // 必須綁 phase —— 否則切去訓練後這層會蓋在 msplat 預覽上面。
+            if controller.showFloorPlan, controller.phase == .review,
+               let fp = controller.floorPlanData {
+                FloorPlanView(data: fp)
+                    .ignoresSafeArea()
+                    .transition(.opacity)
+            }
             HUDOverlay(controller: controller)
         }
         .statusBarHidden()

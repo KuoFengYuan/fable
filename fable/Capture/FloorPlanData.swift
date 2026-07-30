@@ -172,6 +172,39 @@ extension FloorPlanData {
     }
 }
 
+// MARK: - 驗收用的摘要數字（畫面預覽、log、離線檢查三處共用，不各算一遍）
+
+extension FloorPlanData {
+
+    /// 外接尺寸（公尺）。使用者拿捲尺對照時最先看的就是這兩個數
+    var sizeM: SIMD2<Float> {
+        guard boundsM.count == 4 else { return .zero }
+        return SIMD2(boundsM[2] - boundsM[0], boundsM[3] - boundsM[1])
+    }
+
+    var medianWallLengthM: Float { median(walls.map(\.lengthM)) }
+
+    /// 樓高中位數。這是「軸序有沒有搞錯」的判斷依據（見 axisOrderLooksWrong）
+    var medianWallHeightM: Float {
+        median(walls.compactMap { $0.dimensions.count > 1 ? $0.dimensions[1] : nil })
+    }
+
+    var longestWallM: Float { walls.map(\.lengthM).max() ?? 0 }
+
+    /// 程式假設 Surface.dimensions = (寬, 高, 厚)。若 RoomPlan 實際是相反的，
+    /// 每面「牆長」會全部變成樓高（~2.4m）→ 平面圖整張報廢，
+    /// 但畫面上仍然有線條、不會有任何錯誤訊息。用樓高是否落在合理區間反推。
+    var axisOrderLooksWrong: Bool {
+        guard !walls.isEmpty else { return false }
+        return !(2.0...3.6).contains(medianWallHeightM)
+    }
+
+    private func median(_ v: [Float]) -> Float {
+        guard !v.isEmpty else { return 0 }
+        return v.sorted()[v.count / 2]
+    }
+}
+
 // MARK: - SVG（直接可看的平面圖）
 
 extension FloorPlanData {

@@ -82,6 +82,8 @@ final class CaptureController: NSObject, ObservableObject {
     let floorPlan = FloorPlanCapture()
     /// 建好的平面圖，於 processing 階段產生 → review 可顯示、匯出時寫檔
     @Published private(set) var floorPlanData: FloorPlanData?
+    /// review 期間是否疊出平面圖預覽（匯出前先驗證，不要盲匯）
+    @Published var showFloorPlan = false
     let config = CaptureConfig()
     let hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
@@ -681,17 +683,13 @@ final class CaptureController: NSObject, ObservableObject {
     /// 每面「牆長」會全部變成樓高（約 2.4m）、平面圖整張報廢 —— 但看起來還是有線條，
     /// 不會有任何錯誤訊息。所以直接檢查樓高是否落在合理區間，錯了就明講。
     private func logFloorPlan(_ fp: FloorPlanData) {
-        let w = fp.boundsM.count == 4 ? fp.boundsM[2] - fp.boundsM[0] : 0
-        let d = fp.boundsM.count == 4 ? fp.boundsM[3] - fp.boundsM[1] : 0
         print(String(format: "平面圖: %d 房、%d 牆、%d 門、%d 窗、%d 家具，外接 %.2f×%.2fm",
                      fp.roomCount, fp.walls.count, fp.doors.count,
-                     fp.windows.count, fp.objects.count, w, d))
-        let heights = fp.walls.compactMap { $0.dimensions.count > 1 ? $0.dimensions[1] : nil }.sorted()
-        let lengths = fp.walls.map(\.lengthM).sorted()
-        guard !heights.isEmpty else { return }
-        let mh = heights[heights.count / 2], ml = lengths[lengths.count / 2]
-        print(String(format: "  牆長中位數 %.2fm、樓高中位數 %.2fm", ml, mh))
-        if !(2.0...3.6).contains(mh) {
+                     fp.windows.count, fp.objects.count, fp.sizeM.x, fp.sizeM.y))
+        guard !fp.walls.isEmpty else { return }
+        print(String(format: "  牆長中位數 %.2fm、最長牆 %.2fm、樓高中位數 %.2fm",
+                     fp.medianWallLengthM, fp.longestWallM, fp.medianWallHeightM))
+        if fp.axisOrderLooksWrong {
             print("  ⚠️ 樓高中位數不在 2.0~3.6m —— RoomPlan 的 dimensions 軸序可能與假設相反，"
                   + "平面圖的牆長會是錯的。請改用 dimensions[0] 當高、[1] 當寬（見 FloorPlanData.segment）")
         }

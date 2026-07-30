@@ -304,6 +304,24 @@ struct HUDOverlay: View {
 
     private var reviewControls: some View {
         VStack(spacing: 12) {
+            // 平面圖預覽（只有 RoomPlan 真的產出東西時才出現）
+            if let fp = controller.floorPlanData, !fp.walls.isEmpty {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        controller.showFloorPlan.toggle()
+                    }
+                } label: {
+                    Label(controller.showFloorPlan
+                          ? "回到點雲"
+                          : String(format: "平面圖（%d 牆 · %.1f×%.1fm）",
+                                   fp.walls.count, fp.sizeM.x, fp.sizeM.y),
+                          systemImage: controller.showFloorPlan ? "cube" : "map")
+                        .font(.caption.weight(.medium))
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .foregroundStyle(.white)
+                }
+            }
             // 訓練時是否即時顯示過程（關＝背景訓練略快，完成後仍可檢視）
             Toggle(isOn: $controller.showTrainingProcess) {
                 Label("邊訓練邊看過程", systemImage: "eye")
