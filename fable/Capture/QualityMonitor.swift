@@ -145,11 +145,20 @@ final class QualityMonitor {
         }
         smoothedAngular = smoothedAngular * 0.7 + angular * 0.3
         smoothedLinear = smoothedLinear * 0.7 + linear * 0.3
-        // 回報 max(瞬時, 平滑)。純 EMA 會把單幀尖峰壓到 30%：甩一下 2.0 rad/s 只讀到 0.6，
-        // 剛好從 1.0 的閘門底下溜過去 —— 而那一幀確實是糊的。取 max 讓尖峰不被平滑掉，
-        // 同時保留 EMA 對「持續快速移動」的記憶（穩定移動時兩者本來就相等，門檻不會變嚴）。
+        // 角速度回報 max(瞬時, 平滑)：純 EMA 會把單幀尖峰壓到 30%，
+        // 甩一下 2.0 rad/s 只讀到 0.6、剛好從 1.0 的閘門底下溜過去 —— 而那一幀確實是糊的。
+        // 這對角速度成立是因為它來自陀螺儀：硬體訊號，雜訊約 0.01 rad/s，遠低於門檻。
         a.angularSpeedRadS = max(angular, smoothedAngular)
-        a.linearSpeedMS = max(linear, smoothedLinear)
+
+        // 線速度**只能**用 EMA，不可取 max(瞬時, 平滑)。
+        //
+        // 它是由 ARKit 姿態差分算出來的：60fps 下 dt 只有 16.7ms，位置抖動 2mm
+        // 就等於 0.12 m/s 的純雜訊。單看速度門檻（0.5~0.8 m/s）這個量可以忽略，
+        // 我原本就是這樣判斷的 —— 但那是錯的，因為它還要**除以景深**才進模糊估計：
+        // 近距離掃桌面（景深 0.4m）時 0.12/0.4 = 0.3 rad/s 等效角速度，
+        // 憑空多出 8px 模糊，再加上偶發尖峰就足以持續觸發紅色遮斷警告。
+        // 而且平移不像旋轉，物理上做不出單幀尖峰（手臂有慣性），本來就不需要抓尖峰。
+        a.linearSpeedMS = smoothedLinear
 
         // 3. 目標距離（LiDAR 中心區域中位數）
         if let depthMap = frame.sceneDepth?.depthMap {

@@ -82,9 +82,11 @@ struct FloorPlanView: View {
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.white)
             // 拿雷射測距儀對照時看的就是這三個數
-            Text(String(format: "外接 %.2f × %.2f m　·　最長牆 %.2f m　·　樓高 %.2f m",
-                        data.sizeM.x, data.sizeM.y,
-                        data.longestWallM, data.medianWallHeightM))
+            Text(data.floorAreaM2 > 0.5
+                 ? String(format: "地板 %.1f m²　·　外接 %.2f × %.2f m　·　樓高 %.2f m",
+                          data.floorAreaM2, data.sizeM.x, data.sizeM.y, data.medianWallHeightM)
+                 : String(format: "外接 %.2f × %.2f m　·　最長牆 %.2f m　·　樓高 %.2f m",
+                          data.sizeM.x, data.sizeM.y, data.longestWallM, data.medianWallHeightM))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.white.opacity(0.6))
             if data.axisOrderLooksWrong {
@@ -130,85 +132,82 @@ struct FloorPlanView: View {
             }
     }
 
+    /// 語意色 → SwiftUI Color。與 SVG 後端的十六進位一一對應（見 FloorPlanData.hex），
+    /// 兩邊都是紙白底、墨黑線的製圖配色 —— 螢幕上看到的就是匯出檔的樣子。
+    private static func color(_ c: PlanColor) -> Color {
+        switch c {
+        case .ink:      Color(red: 0.10, green: 0.10, blue: 0.10)
+        case .paper:    Color(red: 1.00, green: 1.00, blue: 1.00)
+        case .wall:     Color(red: 0.17, green: 0.17, blue: 0.17)
+        case .door:     Color(red: 0.76, green: 0.25, blue: 0.05)
+        case .window:   Color(red: 0.11, green: 0.31, blue: 0.85)
+        case .opening:  Color(red: 0.47, green: 0.44, blue: 0.42)
+        case .roomFill: Color(red: 0.96, green: 0.95, blue: 0.93)
+        case .roomText: Color(red: 0.27, green: 0.25, blue: 0.24)
+        case .dim:      Color(red: 0.47, green: 0.44, blue: 0.42)
+        case .object:   Color(red: 0.86, green: 0.84, blue: 0.81)
+        }
+    }
+
+    /// 只做座標轉換與上色 —— 畫什麼完全由 FloorPlanData.drawing() 決定，
+    /// 與 SVG 後端共用同一份圖元清單。
     private func draw(_ ctx: GraphicsContext, _ size: CGSize) {
-        let b = data.boundsM
-        guard b.count == 4, data.sizeM.x > 0.01, data.sizeM.y > 0.01 else { return }
-        let pad: CGFloat = 24
-        let fit = min((size.width - pad * 2) / CGFloat(data.sizeM.x),
-                      (size.height - pad * 2) / CGFloat(data.sizeM.y))
+        let b = data.drawingBoundsM
+        guard b.count == 4, b[2] > b[0], b[3] > b[1] else { return }
+        let wm = CGFloat(b[2] - b[0]), hm = CGFloat(b[3] - b[1])
+        let pad: CGFloat = 12
+        let fit = min((size.width - pad * 2) / wm, (size.height - pad * 2) / hm)
         let s = fit * scaleNow
         let midX = CGFloat(b[0] + b[2]) / 2, midZ = CGFloat(b[1] + b[3]) / 2
         // world (x, z) → view：y 不翻轉 ⇒ 非鏡像俯視
-        func P(_ x: Float, _ z: Float) -> CGPoint {
-            CGPoint(x: (CGFloat(x) - midX) * s + size.width / 2 + panNow.width,
-                    y: (CGFloat(z) - midZ) * s + size.height / 2 + panNow.height)
-        }
-        func segments(_ items: [FloorPlanSurface]) -> Path {
-            var p = Path()
-            for i in items where i.segment2D.count == 4 {
-                p.move(to: P(i.segment2D[0], i.segment2D[1]))
-                p.addLine(to: P(i.segment2D[2], i.segment2D[3]))
-            }
-            return p
+        func P(_ p: SIMD2<Float>) -> CGPoint {
+            CGPoint(x: (CGFloat(p.x) - midX) * s + size.width / 2 + panNow.width,
+                    y: (CGFloat(p.y) - midZ) * s + size.height / 2 + panNow.height)
         }
 
-        // 1m 網格
-        var grid = Path()
-        var gx = b[0].rounded(.up)
-        while gx <= b[2] { grid.move(to: P(gx, b[1])); grid.addLine(to: P(gx, b[3])); gx += 1 }
-        var gz = b[1].rounded(.up)
-        while gz <= b[3] { grid.move(to: P(b[0], gz)); grid.addLine(to: P(b[2], gz)); gz += 1 }
-        ctx.stroke(grid, with: .color(.white.opacity(0.10)), lineWidth: 1)
+        // 紙張：只鋪在圖面範圍內，四周留深色，看起來像一張圖而不是換了底色的畫面
+        let paper = CGRect(x: P(SIMD2(b[0], b[1])).x, y: P(SIMD2(b[0], b[1])).y,
+                           width: wm * s, height: hm * s)
+        ctx.fill(Path(roundedRect: paper, cornerRadius: 4),
+                 with: .color(Self.color(.paper)))
 
-        // 家具佔地（壓在最底）
-        var foot = Path()
-        for o in data.objects where o.footprint2D.count == 8 {
-            foot.move(to: P(o.footprint2D[0], o.footprint2D[1]))
-            for k in stride(from: 2, to: 8, by: 2) {
-                foot.addLine(to: P(o.footprint2D[k], o.footprint2D[k + 1]))
-            }
-            foot.closeSubpath()
-        }
-        ctx.fill(foot, with: .color(.white.opacity(0.07)))
-        ctx.stroke(foot, with: .color(.white.opacity(0.18)), lineWidth: 1)
+        for prim in data.drawing() {
+            switch prim {
+            case let .path(pts, closed, style):
+                guard pts.count >= 2 else { continue }
+                var path = Path()
+                path.move(to: P(pts[0]))
+                for p in pts.dropFirst() { path.addLine(to: P(p)) }
+                if closed { path.closeSubpath() }
+                if let fill = style.fill {
+                    ctx.fill(path, with: .color(Self.color(fill)))
+                }
+                if let stroke = style.stroke {
+                    ctx.stroke(path, with: .color(Self.color(stroke)),
+                               style: StrokeStyle(lineWidth: CGFloat(style.widthPx),
+                                                  lineCap: .round, lineJoin: .round,
+                                                  dash: style.dash?.map { CGFloat($0) } ?? []))
+                }
 
-        // 由淡到重
-        ctx.stroke(segments(data.openings), with: .color(.gray),
-                   style: StrokeStyle(lineWidth: 3, lineCap: .round, dash: [6, 4]))
-        ctx.stroke(segments(data.windows), with: .color(.blue),
-                   style: StrokeStyle(lineWidth: 5, lineCap: .round))
-        ctx.stroke(segments(data.doors), with: .color(.orange),
-                   style: StrokeStyle(lineWidth: 5, lineCap: .round))
-        ctx.stroke(segments(data.walls), with: .color(.white),
-                   style: StrokeStyle(lineWidth: 6, lineCap: .round))
-
-        // 牆長標註：只標 ≥1m 的，且縮太小就不標（會擠成一團看不清）
-        if s > 40 {
-            for w in data.walls where w.lengthM >= 1 && w.segment2D.count == 4 {
-                let mid = P((w.segment2D[0] + w.segment2D[2]) / 2,
-                            (w.segment2D[1] + w.segment2D[3]) / 2)
-                ctx.draw(Text(String(format: "%.2fm", w.lengthM))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.75)),
-                         at: CGPoint(x: mid.x, y: mid.y - 8))
+            case let .text(str, at, sizePx, color, align, bold):
+                // 縮太小就不畫字：擠成一團比沒有更難看
+                guard s > 45 else { continue }
+                var t = Text(str).font(.system(size: CGFloat(sizePx),
+                                               weight: bold ? .semibold : .regular))
+                t = t.foregroundStyle(Self.color(color))
+                let anchor: UnitPoint = align == .center ? .center
+                    : (align == .right ? .trailing : .leading)
+                ctx.draw(t, at: P(at), anchor: anchor)
             }
         }
-
-        // 比例尺
-        let barY = size.height - 16
-        var bar = Path()
-        bar.move(to: CGPoint(x: 20, y: barY))
-        bar.addLine(to: CGPoint(x: 20 + s, y: barY))
-        ctx.stroke(bar, with: .color(.white), lineWidth: 2)
-        ctx.draw(Text("1 m").font(.system(size: 9)).foregroundStyle(.white),
-                 at: CGPoint(x: 20 + s / 2, y: barY - 9))
     }
 
     // MARK: - 圖例
 
     private var legend: some View {
         HStack(spacing: 14) {
-            key(.white, "牆"); key(.orange, "門"); key(.blue, "窗"); key(.gray, "開口")
+            key(Self.color(.wall), "牆"); key(Self.color(.door), "門")
+            key(Self.color(.window), "窗"); key(Self.color(.opening), "開口")
             Spacer()
             Text("雙指縮放 · 雙擊置中").foregroundStyle(.white.opacity(0.45))
         }

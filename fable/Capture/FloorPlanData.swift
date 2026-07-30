@@ -12,12 +12,16 @@
 //  （因為 (+X) × (-Z) = +Y，才是朝向觀察者的右手系）。SVG 的 y 軸向下增長，
 //  故 svg_y = world_z 正好給出**不鏡像**的俯視圖 —— 這件事搞錯會讓整張平面圖左右翻轉。
 //
+//  本檔**刻意不 import RoomPlan**：資料模型與製圖層與平台無關，
+//  RoomPlan → FloorPlanData 的轉換放在 FloorPlanData+RoomPlan.swift。
+//  好處是製圖層可以在 macOS 上獨立編譯執行（見 tools/render_floorplan.swift），
+//  匯出的 SVG 在交給實機之前就能先看過。
+//
 //  座標保持 ARKit 原生（+Y up、公尺），與 points.ply / poses.jsonl 一致；
 //  匯出 COLMAP 用的世界翻轉不套用在這裡（那是為了 3DGS 生態的慣例，平面圖不需要）。
 //
 
 import Foundation
-import RoomPlan
 import simd
 
 // MARK: - 資料模型
@@ -43,6 +47,21 @@ nonisolated struct FloorPlanObject: Codable, Sendable {
     var footprint2D: [Float]
 }
 
+/// 一個房間：地板多邊形 ＋ 名稱 ＋ 面積。
+/// 這是「像平面圖」與「像線框圖」的分界 —— 有封閉多邊形才畫得出填色、標得出名稱與面積。
+/// 資料來自 RoomPlan 的 floors（polygonCorners）與 sections（label），
+/// 兩者本來就在 CapturedRoom 裡，先前完全沒用到。
+nonisolated struct FloorPlanRoom: Codable, Sendable {
+    /// 房間名稱（RoomPlan section label，如 kitchen / bedroom；無法判定時為 nil）
+    var label: String?
+    /// 地板多邊形，投影到水平面的頂點序列 [x0,z0, x1,z1, ...]，公尺
+    var polygon2D: [Float]
+    /// 多邊形面積（m²），以 shoelace 公式計算 —— 這才是實際地板面積，非外接矩形
+    var areaM2: Float
+    /// 標註文字要放的位置（多邊形形心）
+    var labelAt: [Float]
+}
+
 nonisolated struct FloorPlanData: Codable, Sendable {
     var generator = "fable-roomplan"
     var version = 1
@@ -54,122 +73,15 @@ nonisolated struct FloorPlanData: Codable, Sendable {
     var windows: [FloorPlanSurface] = []
     var openings: [FloorPlanSurface] = []
     var objects: [FloorPlanObject] = []
+    /// 房間（地板多邊形 ＋ 名稱 ＋ 面積）
+    var rooms: [FloorPlanRoom] = []
+    /// 所有房間地板多邊形的面積合計（m²）＝ 實際可用面積
+    var floorAreaM2: Float = 0
     /// 牆體外接矩形（公尺）[minX, minZ, maxX, maxZ]，粗估整體尺寸用
     var boundsM: [Float] = []
     /// 牆體外接矩形面積（m²）。**不是**實際地板面積 ——
     /// 非矩形格局會高估，僅供快速對照，正式面積請用 USDZ 的地板幾何。
     var boundingAreaM2: Float = 0
-}
-
-// MARK: - 從 RoomPlan 轉換
-
-extension FloorPlanData {
-
-    init(room: CapturedRoom) {
-        self.init()
-        roomCount = 1
-        walls = room.walls.map(Self.surface)
-        doors = room.doors.map(Self.surface)
-        windows = room.windows.map(Self.surface)
-        openings = room.openings.map(Self.surface)
-        objects = room.objects.map(Self.object)
-        computeBounds()
-    }
-
-    init(structure: CapturedStructure) {
-        self.init()
-        roomCount = structure.rooms.count
-        walls = structure.walls.map(Self.surface)
-        doors = structure.doors.map(Self.surface)
-        windows = structure.windows.map(Self.surface)
-        openings = structure.openings.map(Self.surface)
-        objects = structure.objects.map(Self.object)
-        computeBounds()
-    }
-
-    private mutating func computeBounds() {
-        var lo = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
-        var hi = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
-        for w in walls {
-            for k in stride(from: 0, to: 4, by: 2) {
-                let p = SIMD2<Float>(w.segment2D[k], w.segment2D[k + 1])
-                lo = simd_min(lo, p); hi = simd_max(hi, p)
-            }
-        }
-        guard hi.x > lo.x else { return }
-        boundsM = [lo.x, lo.y, hi.x, hi.y]
-        boundingAreaM2 = (hi.x - lo.x) * (hi.y - lo.y)
-    }
-
-    private static func surface(_ s: CapturedRoom.Surface) -> FloorPlanSurface {
-        let (seg, len) = segment(transform: s.transform, width: s.dimensions.x)
-        return FloorPlanSurface(category: name(s.category), confidence: name(s.confidence),
-                                transform: rowMajor(s.transform),
-                                dimensions: [s.dimensions.x, s.dimensions.y, s.dimensions.z],
-                                segment2D: seg, lengthM: len)
-    }
-
-    private static func object(_ o: CapturedRoom.Object) -> FloorPlanObject {
-        FloorPlanObject(category: name(o.category), transform: rowMajor(o.transform),
-                        dimensions: [o.dimensions.x, o.dimensions.y, o.dimensions.z],
-                        footprint2D: footprint(transform: o.transform,
-                                               width: o.dimensions.x, depth: o.dimensions.z))
-    }
-
-    /// 中心 ± (局部 X 軸 × 半寬)，投影到 XZ 平面
-    private static func segment(transform t: simd_float4x4, width: Float) -> ([Float], Float) {
-        let c = t.columns.3
-        let ax = SIMD2<Float>(t.columns.0.x, t.columns.0.z)
-        let n = simd_length(ax)
-        let dir = n > 1e-6 ? ax / n : SIMD2<Float>(1, 0)
-        let h = width * 0.5
-        let p0 = SIMD2<Float>(c.x, c.z) - dir * h
-        let p1 = SIMD2<Float>(c.x, c.z) + dir * h
-        return ([p0.x, p0.y, p1.x, p1.y], width)
-    }
-
-    /// 家具佔地：中心 ± 局部 X/Z 兩軸的半長，四個角
-    private static func footprint(transform t: simd_float4x4,
-                                  width: Float, depth: Float) -> [Float] {
-        let c = SIMD2<Float>(t.columns.3.x, t.columns.3.z)
-        let ex = SIMD2<Float>(t.columns.0.x, t.columns.0.z) * (width * 0.5)
-        let ez = SIMD2<Float>(t.columns.2.x, t.columns.2.z) * (depth * 0.5)
-        // 逐個具名，不要寫成一行陣列字面值 —— SIMD2 的運算子重載組合起來
-        // 會讓 Swift 型別檢查器爆掉（"unable to type-check in reasonable time"）
-        let a: SIMD2<Float> = c - ex - ez
-        let b: SIMD2<Float> = c + ex - ez
-        let d: SIMD2<Float> = c + ex + ez
-        let e: SIMD2<Float> = c - ex + ez
-        return [a.x, a.y, b.x, b.y, d.x, d.y, e.x, e.y]
-    }
-
-    private static func rowMajor(_ m: simd_float4x4) -> [Float] {
-        (0..<4).flatMap { r in (0..<4).map { c in m[c][r] } }
-    }
-
-    private static func name(_ c: CapturedRoom.Surface.Category) -> String {
-        switch c {
-        case .wall:            "wall"
-        case .door:            "door"
-        case .window:          "window"
-        case .opening:         "opening"
-        case .floor:           "floor"
-        @unknown default:      "unknown"
-        }
-    }
-
-    private static func name(_ c: CapturedRoom.Object.Category) -> String {
-        String(describing: c)
-    }
-
-    private static func name(_ c: CapturedRoom.Confidence) -> String {
-        switch c {
-        case .high:   "high"
-        case .medium: "medium"
-        case .low:    "low"
-        @unknown default: "unknown"
-        }
-    }
 }
 
 // MARK: - 驗收用的摘要數字（畫面預覽、log、離線檢查三處共用，不各算一遍）
@@ -183,6 +95,13 @@ extension FloorPlanData {
     }
 
     var medianWallLengthM: Float { median(walls.map(\.lengthM)) }
+
+    /// 牆厚中位數。門窗開孔與符號都用它，而不是門窗自身的 thickness
+    /// （後者常較小，會在牆面留下白邊）
+    var medianWallThicknessM: Float {
+        median(walls.compactMap { $0.dimensions.count > 2 ? $0.dimensions[2] : nil }
+                    .filter { $0 > 0.02 })
+    }
 
     /// 樓高中位數。這是「軸序有沒有搞錯」的判斷依據（見 axisOrderLooksWrong）
     var medianWallHeightM: Float {
@@ -205,108 +124,85 @@ extension FloorPlanData {
     }
 }
 
-// MARK: - SVG（直接可看的平面圖）
+// MARK: - SVG 後端（把 drawing() 的圖元寫成 SVG）
 
 extension FloorPlanData {
 
-    // 色碼一律走常數再插值。直接把 "#111111" 寫進 #"..."# 原始字串會壞掉 ——
-    // 色碼前面那個引號加上 # 剛好構成 "# ，會提前終止原始字串的結束分隔符。
-    private enum Ink {
-        static let wall = "#111111", door = "#f59e0b", window = "#3b82f6"
-        static let opening = "#888888", grid = "#e8e8e8", paper = "#ffffff"
-        static let objFill = "#f2f2f2", objLine = "#cccccc"
-        static let label = "#444444", muted = "#666666"
-        static let font = "-apple-system,Helvetica,sans-serif"
+    /// 語意色 → 十六進位。紙白底、墨黑線，牆用深灰實體 —— 印出來也對。
+    private static func hex(_ c: PlanColor) -> String {
+        switch c {
+        case .ink:      "#1a1a1a"
+        case .paper:    "#ffffff"
+        case .wall:     "#2b2b2b"
+        case .door:     "#c2410c"
+        case .window:   "#1d4ed8"
+        case .opening:  "#78716c"
+        case .roomFill: "#f4f1ec"
+        case .roomText: "#44403c"
+        case .dim:      "#78716c"
+        case .object:   "#dcd7cf"
+        }
     }
 
-    /// 產生俯視平面圖 SVG。1 公尺 = pxPerMeter 像素，含公尺網格與比例尺。
-    /// 牆粗實線、門橘、窗藍、開口虛線、家具淡灰框 —— 一般平面圖的畫法。
-    func svg(pxPerMeter: Float = 100, margin: Float = 40) -> String {
-        guard boundsM.count == 4 else {
-            return #"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60"><text x="8" y="34">無牆面資料</text></svg>"#
+    /// 產生平面圖 SVG。1 公尺 = pxPerMeter 像素。
+    func svg(pxPerMeter: Float = 110) -> String {
+        let b = drawingBoundsM
+        guard b.count == 4, b[2] > b[0], b[3] > b[1] else {
+            return #"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="60"><text x="8" y="34" font-size="13">無牆面資料</text></svg>"#
         }
-        let lo = SIMD2<Float>(boundsM[0], boundsM[1])
-        let hi = SIMD2<Float>(boundsM[2], boundsM[3])
-        let w = (hi.x - lo.x) * pxPerMeter + margin * 2
-        let h = (hi.y - lo.y) * pxPerMeter + margin * 2
-        // world (x,z) → svg (x,y)：y 不翻轉，故為非鏡像俯視（見檔頭說明）
-        func X(_ v: Float) -> Float { (v - lo.x) * pxPerMeter + margin }
-        func Y(_ v: Float) -> Float { (v - lo.y) * pxPerMeter + margin }
+        let w = (b[2] - b[0]) * pxPerMeter
+        let h = (b[3] - b[1]) * pxPerMeter
         func f(_ v: Float) -> String { String(format: "%.1f", v) }
+        // world (x, z) → svg (x, y)：y 不翻轉 ⇒ 非鏡像俯視（推導見檔頭）
+        func X(_ v: Float) -> Float { (v - b[0]) * pxPerMeter }
+        func Y(_ v: Float) -> Float { (v - b[1]) * pxPerMeter }
 
         var s = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"\(f(w))\" height=\"\(f(h))\""
         s += " viewBox=\"0 0 \(f(w)) \(f(h))\">\n"
-        s += "<rect width=\"100%\" height=\"100%\" fill=\"\(Ink.paper)\"/>\n"
+        s += "<rect width=\"100%\" height=\"100%\" fill=\"\(Self.hex(.paper))\"/>\n"
 
-        // 1m 網格
-        s += "<g stroke=\"\(Ink.grid)\" stroke-width=\"1\">"
-        var gx = lo.x.rounded(.up)
-        while gx <= hi.x {
-            s += line(X(gx), margin, X(gx), h - margin, f)
-            gx += 1
-        }
-        var gz = lo.y.rounded(.up)
-        while gz <= hi.y {
-            s += line(margin, Y(gz), w - margin, Y(gz), f)
-            gz += 1
-        }
-        s += "</g>\n"
+        for prim in drawing() {
+            switch prim {
+            case let .path(pts, closed, style):
+                guard pts.count >= 2 else { continue }
+                let d = pts.enumerated()
+                    .map { "\($0.offset == 0 ? "M" : "L")\(f(X($0.element.x))) \(f(Y($0.element.y)))" }
+                    .joined(separator: " ") + (closed ? " Z" : "")
+                var attrs = "fill=\"\(style.fill.map(Self.hex) ?? "none")\""
+                if let st = style.stroke {
+                    attrs += " stroke=\"\(Self.hex(st))\" stroke-width=\"\(f(style.widthPx))\""
+                    attrs += " stroke-linejoin=\"round\" stroke-linecap=\"round\""
+                    if let dash = style.dash {
+                        attrs += " stroke-dasharray=\"\(dash.map { f($0) }.joined(separator: ","))\""
+                    }
+                } else {
+                    attrs += " stroke=\"none\""
+                }
+                s += "<path d=\"\(d)\" \(attrs)/>\n"
 
-        // 家具佔地（先畫，壓在牆下面）
-        if !objects.isEmpty {
-            s += "<g fill=\"\(Ink.objFill)\" stroke=\"\(Ink.objLine)\" stroke-width=\"1\">"
-            for o in objects where o.footprint2D.count == 8 {
-                let pts = stride(from: 0, to: 8, by: 2)
-                    .map { "\(f(X(o.footprint2D[$0]))),\(f(Y(o.footprint2D[$0 + 1])))" }
-                    .joined(separator: " ")
-                s += "<polygon points=\"\(pts)\"/>"
+            case let .text(str, at, size, color, align, bold):
+                let anchor = align == .center ? "middle" : (align == .right ? "end" : "start")
+                s += "<text x=\"\(f(X(at.x)))\" y=\"\(f(Y(at.y)))\" font-size=\"\(f(size))\""
+                s += " text-anchor=\"\(anchor)\" fill=\"\(Self.hex(color))\""
+                s += " font-family=\"-apple-system,Helvetica,sans-serif\""
+                s += bold ? " font-weight=\"600\"" : ""
+                s += ">\(Self.escape(str))</text>\n"
             }
-            s += "</g>\n"
         }
 
-        // 由淡到重疊上去：開口（虛線）→ 窗 → 門 → 牆
-        s += group(openings, stroke: Ink.opening, width: 3, dash: "6,4", X: X, Y: Y, f: f)
-        s += group(windows, stroke: Ink.window, width: 5, dash: nil, X: X, Y: Y, f: f)
-        s += group(doors, stroke: Ink.door, width: 5, dash: nil, X: X, Y: Y, f: f)
-        s += group(walls, stroke: Ink.wall, width: 7, dash: nil, X: X, Y: Y, f: f)
-
-        // 牆長標註（只標 ≥1m 的，避免小段擠成一團）
-        s += "<g font-family=\"\(Ink.font)\" font-size=\"11\" fill=\"\(Ink.label)\">"
-        for wl in walls where wl.lengthM >= 1.0 && wl.segment2D.count == 4 {
-            let mx = X((wl.segment2D[0] + wl.segment2D[2]) / 2)
-            let my = Y((wl.segment2D[1] + wl.segment2D[3]) / 2)
-            s += "<text x=\"\(f(mx))\" y=\"\(f(my - 4))\" text-anchor=\"middle\">\(f(wl.lengthM))m</text>"
-        }
-        s += "</g>\n"
-
-        // 比例尺 + 摘要
-        let by = h - margin * 0.45
-        s += "<g stroke=\"\(Ink.wall)\" stroke-width=\"2\">"
-        s += line(margin, by, margin + pxPerMeter, by, f) + "</g>"
-        s += "<text x=\"\(f(margin))\" y=\"\(f(by - 6))\" font-size=\"11\""
-        s += " font-family=\"\(Ink.font)\" fill=\"\(Ink.wall)\">1 m</text>"
-        let summary = "\(roomCount) 房 · \(walls.count) 牆 · \(doors.count) 門 · \(windows.count) 窗"
-        s += "<text x=\"\(f(w - margin))\" y=\"\(f(by - 6))\" font-size=\"11\" text-anchor=\"end\""
-        s += " font-family=\"\(Ink.font)\" fill=\"\(Ink.muted)\">\(summary)</text>"
-        s += "\n</svg>\n"
+        // 比例尺（畫在圖外側左下，用像素座標即可）
+        let by = h - 10
+        s += "<path d=\"M10 \(f(by)) L\(f(10 + pxPerMeter)) \(f(by))\" stroke=\"\(Self.hex(.ink))\""
+        s += " stroke-width=\"2\" fill=\"none\"/>\n"
+        s += "<text x=\"10\" y=\"\(f(by - 5))\" font-size=\"10\" fill=\"\(Self.hex(.ink))\""
+        s += " font-family=\"-apple-system,Helvetica,sans-serif\">1 m</text>\n"
+        s += "</svg>\n"
         return s
     }
 
-    private func line(_ x1: Float, _ y1: Float, _ x2: Float, _ y2: Float,
-                      _ f: (Float) -> String) -> String {
-        "<line x1=\"\(f(x1))\" y1=\"\(f(y1))\" x2=\"\(f(x2))\" y2=\"\(f(y2))\"/>"
-    }
-
-    private func group(_ items: [FloorPlanSurface], stroke: String, width: Float,
-                       dash: String?, X: (Float) -> Float, Y: (Float) -> Float,
-                       f: (Float) -> String) -> String {
-        guard !items.isEmpty else { return "" }
-        let d = dash.map { " stroke-dasharray=\"\($0)\"" } ?? ""
-        var s = "<g stroke=\"\(stroke)\" stroke-width=\"\(f(width))\" stroke-linecap=\"round\"\(d)>"
-        for i in items where i.segment2D.count == 4 {
-            s += line(X(i.segment2D[0]), Y(i.segment2D[1]),
-                      X(i.segment2D[2]), Y(i.segment2D[3]), f)
-        }
-        return s + "</g>\n"
+    private static func escape(_ s: String) -> String {
+        s.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
     }
 }
