@@ -14,6 +14,7 @@ import SwiftUI
 struct FloorPlanView: View {
 
     let data: FloorPlanData
+    let onClose: () -> Void
 
     @State private var zoom: CGFloat = 1
     @State private var pinch: CGFloat = 1
@@ -27,13 +28,21 @@ struct FloorPlanView: View {
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.92).ignoresSafeArea()
+            Color.black.ignoresSafeArea()
             VStack(spacing: 0) {
-                header
+                topBar
+                summary
                 if data.walls.isEmpty {
                     Spacer()
-                    Label("沒有偵測到牆面", systemImage: "square.dashed")
-                        .foregroundStyle(.secondary)
+                    VStack(spacing: 8) {
+                        Image(systemName: "square.dashed").font(.largeTitle)
+                        Text("沒有偵測到牆面").font(.subheadline)
+                        Text("RoomPlan 需要沿著牆面掃過去；\n只繞著物件拍不會產生牆")
+                            .font(.caption)
+                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.white.opacity(0.5))
+                    }
+                    .foregroundStyle(.white.opacity(0.7))
                     Spacer()
                 } else {
                     plan
@@ -43,41 +52,61 @@ struct FloorPlanView: View {
         }
     }
 
-    // MARK: - 標頭：驗收用的數字放最上面
+    // MARK: - 自己的頂部列（獨立頁面，不再借用 HUD 的空間）
 
-    private var header: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 14) {
-                stat("\(data.roomCount)", "房")
-                stat("\(data.walls.count)", "牆")
-                stat("\(data.doors.count)", "門")
-                stat("\(data.windows.count)", "窗")
+    private var topBar: some View {
+        HStack {
+            Button(action: onClose) {
+                Image(systemName: "chevron.left")
+                    .font(.headline)
+                    .padding(10)
+                    .background(.ultraThinMaterial, in: Circle())
             }
-            // 拿捲尺／雷射測距儀對照時，先看的就是這兩個數
-            Text(String(format: "外接 %.2f × %.2f m　最長牆 %.2f m　樓高 %.2f m",
+            .foregroundStyle(.white)
+            Spacer()
+            Text("平面圖").font(.headline).foregroundStyle(.white)
+            Spacer()
+            // 與左側等寬的佔位，讓標題真的居中
+            Image(systemName: "chevron.left").font(.headline).padding(10).opacity(0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+    }
+
+    // MARK: - 驗收數字：一行講完，不要排成大字
+
+    private var summary: some View {
+        VStack(spacing: 6) {
+            Text("\(data.roomCount) 房 · \(data.walls.count) 牆 · "
+                 + "\(data.doors.count) 門 · \(data.windows.count) 窗")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.white)
+            // 拿雷射測距儀對照時看的就是這三個數
+            Text(String(format: "外接 %.2f × %.2f m　·　最長牆 %.2f m　·　樓高 %.2f m",
                         data.sizeM.x, data.sizeM.y,
                         data.longestWallM, data.medianWallHeightM))
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.white.opacity(0.85))
+                .foregroundStyle(.white.opacity(0.6))
             if data.axisOrderLooksWrong {
-                Label("樓高不合理 → RoomPlan 的 dimensions 軸序與程式假設相反，牆長是錯的",
-                      systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
+                warn("樓高不合理 → RoomPlan 的 dimensions 軸序與程式假設相反，牆長是錯的")
+            } else if data.longestWallM < data.sizeM.max() * 0.5 {
+                // 最長牆遠短於整體尺寸 ⇒ 牆被切成碎片、房間沒閉合。
+                // 這不是 UI 問題也不是 bug，是掃描路徑沒有沿牆走 —— 講清楚比畫得漂亮有用。
+                warn("牆面破碎、房間未閉合：請沿著牆面走一圈並回到起點，"
+                     + "3DGS 那種繞著物件拍的路徑產生不出完整的牆")
             }
         }
-        .padding(.top, 52)
-        .padding(.bottom, 10)
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
     }
 
-    private func stat(_ value: String, _ label: String) -> some View {
-        VStack(spacing: 1) {
-            Text(value).font(.title3.weight(.semibold).monospacedDigit())
-            Text(label).font(.caption2)
-        }
-        .foregroundStyle(.white)
+    private func warn(_ text: String) -> some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption2)
+            .foregroundStyle(.orange)
+            .multilineTextAlignment(.leading)
+            .padding(.top, 2)
     }
 
     // MARK: - 平面圖本體
@@ -180,11 +209,13 @@ struct FloorPlanView: View {
     private var legend: some View {
         HStack(spacing: 14) {
             key(.white, "牆"); key(.orange, "門"); key(.blue, "窗"); key(.gray, "開口")
+            Spacer()
+            Text("雙指縮放 · 雙擊置中").foregroundStyle(.white.opacity(0.45))
         }
         .font(.caption2)
         .foregroundStyle(.white.opacity(0.8))
-        .padding(.vertical, 10)
-        .padding(.bottom, 92)      // 讓出下方 review 控制列的空間
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 
     private func key(_ c: Color, _ label: String) -> some View {
