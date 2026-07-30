@@ -84,6 +84,10 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var floorPlanData: FloorPlanData?
     /// review 期間是否疊出平面圖預覽（匯出前先驗證，不要盲匯）
     @Published var showFloorPlan = false
+    /// 平面圖是否連活動家具（椅子/沙發/桌子/電視）一起畫。
+    /// 預設關：建築製圖只畫固定設備，活動家具會蓋住圖面。
+    /// 畫面與匯出共用這個旗標 —— 看到的就是匯出的。
+    @Published var showPlanFurniture = false
     let config = CaptureConfig()
     let hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
@@ -718,8 +722,9 @@ final class CaptureController: NSObject, ObservableObject {
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
             try enc.encode(fp).write(to: dir.appendingPathComponent("floorplan.json"),
                                      options: [.atomic])
-            try Data(fp.svg().utf8).write(to: dir.appendingPathComponent("floorplan.svg"),
-                                          options: [.atomic])
+            let svg = fp.svg(showAllFurniture: showPlanFurniture)
+            try Data(svg.utf8).write(to: dir.appendingPathComponent("floorplan.svg"),
+                                     options: [.atomic])
         } catch {
             print("[FloorPlan] 寫檔失敗: \(error)")
         }

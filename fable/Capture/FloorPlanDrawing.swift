@@ -47,14 +47,24 @@ extension FloorPlanData {
     /// 牆厚缺值時的替代值（公尺）。RoomPlan 偶爾給 0，畫成 0 厚會整面牆消失
     private static let kFallbackWallThickness: Float = 0.10
 
+    /// 會畫進平面圖的「固定設備」。建築製圖的慣例是只畫**附屬於建築**的東西 ——
+    /// 衛浴設備、廚具、櫥櫃、樓梯、壁爐，因為它們決定空間怎麼用、拆掉要動工程。
+    /// 椅子、沙發、桌子、電視是**活動家具**：換位置不影響格局，畫上去只會蓋住圖面
+    /// （實機回報過：一堆歪斜的椅子把房間塞滿）。
+    /// 想看全部家具可切換 showAllFurniture。
+    private static let kFixtureCategories: Set<String> = [
+        "storage", "refrigerator", "stove", "sink", "washerDryer",
+        "toilet", "bathtub", "oven", "dishwasher", "fireplace", "stairs",
+    ]
+
     /// 產生整張平面圖的圖元清單，順序即繪製順序（後畫的蓋前面的）。
     ///
     /// 內容先在 ARKit 世界座標建好，再**整批**旋轉到水平（見 planRotationRad）——
     /// 旋轉放在最後一步而不是散在各個 builder 裡，是為了不可能漏掉某一種圖元。
     /// 尺寸標註鏈在旋轉之後才依「旋轉後的範圍」產生，否則標的會是歪的外接框。
-    func drawing() -> [PlanPrimitive] {
+    func drawing(showAllFurniture: Bool = false) -> [PlanPrimitive] {
         let a = planRotationRad
-        var content = content()
+        var content = content(showAllFurniture: showAllFurniture)
         if abs(a) > 0.005 {
             let c = cos(a), s = sin(a)
             content = content.map { Self.rotate($0, cos: c, sin: s) }
@@ -62,14 +72,30 @@ extension FloorPlanData {
         return content + dimensionChain(bounds: Self.bounds(of: content))
     }
 
+    /// 圖面上實際畫出來的外緣尺寸（公尺）。
+    ///
+    /// 與 sizeM 不同：sizeM 由牆**中心線**端點算出，而圖面畫的是帶厚度的牆實體，
+    /// 且房間地板多邊形可能超出牆的範圍。兩者差一個牆厚，於是會出現
+    /// 「標頭寫外接 4.48、圖上標 4.71」這種前後不一致（實機回報過）。
+    /// 建築圖的外部尺寸慣例是外緣到外緣 ——
+    /// 尺寸標註鏈標的就是這個值，顯示也一律用它，兩邊才會對得上。
+    var drawnSizeM: SIMD2<Float> {
+        let b = rotatedContentBounds
+        guard b.count == 4 else { return sizeM }
+        return SIMD2(b[2] - b[0], b[3] - b[1])
+    }
+
+    /// 旋轉後的內容範圍（不含標註留白）—— 尺寸標註與 drawnSizeM 共用
+    private var rotatedContentBounds: [Float] {
+        guard !walls.isEmpty else { return [] }
+        let a = planRotationRad
+        let c = cos(a), s = sin(a)
+        return Self.bounds(of: content().map { Self.rotate($0, cos: c, sin: s) })
+    }
+
     /// 旋轉後的圖面範圍（含尺寸標註留白）。兩個後端都靠它算縮放。
     var drawingBoundsM: [Float] {
-        guard !walls.isEmpty else { return [] }
-        let b = Self.bounds(of: {
-            let a = planRotationRad
-            let c = cos(a), s = sin(a)
-            return content().map { Self.rotate($0, cos: c, sin: s) }
-        }())
+        let b = rotatedContentBounds
         guard b.count == 4 else { return [] }
         // 左側留白較大：垂直尺寸的文字是靠右對齊、往左延伸，留太少會被裁掉（實機出現過）
         return [b[0] - 1.7, b[1] - 1.0, b[2] + 1.0, b[3] + 1.0]
@@ -102,7 +128,7 @@ extension FloorPlanData {
     }
 
     /// 圖面內容（未旋轉）
-    private func content() -> [PlanPrimitive] {
+    private func content(showAllFurniture: Bool = false) -> [PlanPrimitive] {
         var out: [PlanPrimitive] = []
 
         // 1. 房間地板：淡色填充 ＋ 細邊界
@@ -113,8 +139,8 @@ extension FloorPlanData {
                              style: PlanStyle(stroke: nil, fill: .roomFill)))
         }
 
-        // 2. 家具佔地：只描邊，淡 —— 家具不該搶走格局的視覺重量
-        for o in objects {
+        // 2. 固定設備佔地：只描邊，淡 —— 連設備都不該搶走格局的視覺重量
+        for o in objects where showAllFurniture || Self.kFixtureCategories.contains(o.category) {
             let poly = points(o.footprint2D)
             guard poly.count >= 3 else { continue }
             out.append(.path(points: poly, closed: true,

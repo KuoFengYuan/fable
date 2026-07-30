@@ -113,7 +113,8 @@ extension FloorPlanData {
                     .filter { $0 > 0.02 })
     }
 
-    /// 樓高中位數。這是「軸序有沒有搞錯」的判斷依據（見 axisOrderLooksWrong）
+    /// 樓高中位數。RoomPlan 只報告實際觀測到的牆高，故偏低代表沒掃到牆頂
+    /// （見 incompleteReason），不代表資料有錯
     var medianWallHeightM: Float {
         median(walls.compactMap { $0.dimensions.count > 1 ? $0.dimensions[1] : nil })
     }
@@ -237,7 +238,7 @@ extension FloorPlanData {
     }
 
     /// 產生平面圖 SVG。1 公尺 = pxPerMeter 像素。
-    func svg(pxPerMeter: Float = 110) -> String {
+    func svg(pxPerMeter: Float = 110, showAllFurniture: Bool = false) -> String {
         let b = drawingBoundsM
         guard b.count == 4, b[2] > b[0], b[3] > b[1] else {
             return #"<svg xmlns="http://www.w3.org/2000/svg" width="240" height="60"><text x="8" y="34" font-size="13">無牆面資料</text></svg>"#
@@ -253,7 +254,7 @@ extension FloorPlanData {
         s += " viewBox=\"0 0 \(f(w)) \(f(h))\">\n"
         s += "<rect width=\"100%\" height=\"100%\" fill=\"\(Self.hex(.paper))\"/>\n"
 
-        for prim in drawing() {
+        for prim in drawing(showAllFurniture: showAllFurniture) {
             switch prim {
             case let .path(pts, closed, style):
                 guard pts.count >= 2 else { continue }

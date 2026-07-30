@@ -17,6 +17,8 @@ struct FloorPlanView: View {
     let onClose: () -> Void
     /// (房間索引, 新名稱)。RoomPlan 常判不出用途，讓使用者自己命名比顯示 unidentified 有用
     var onRename: (Int, String) -> Void = { _, _ in }
+    /// 是否連活動家具一起畫（預設關；建築製圖只畫固定設備）
+    @Binding var showFurniture: Bool
 
     @State private var renamingIndex: Int?
     @State private var draftName = ""
@@ -87,8 +89,13 @@ struct FloorPlanView: View {
             Spacer()
             Text("平面圖").font(.headline).foregroundStyle(.white)
             Spacer()
-            // 與左側等寬的佔位，讓標題真的居中
-            Image(systemName: "chevron.left").font(.headline).padding(10).opacity(0)
+            Button { showFurniture.toggle() } label: {
+                Image(systemName: showFurniture ? "chair.lounge.fill" : "chair.lounge")
+                    .font(.headline)
+                    .padding(10)
+                    .background(.ultraThinMaterial, in: Circle())
+            }
+            .foregroundStyle(showFurniture ? .orange : .white)
         }
         .padding(.horizontal, 12)
         .padding(.top, 6)
@@ -103,11 +110,15 @@ struct FloorPlanView: View {
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.white)
             // 拿雷射測距儀對照時看的就是這三個數
+            // 外接尺寸用 drawnSizeM（外緣到外緣）而非 sizeM（牆中心線）——
+            // 圖上的尺寸標註標的就是前者，用後者會出現「標頭 4.48 / 圖上 4.71」的矛盾
             Text(data.floorAreaM2 > 0.5
                  ? String(format: "地板 %.1f m²　·　外接 %.2f × %.2f m　·　樓高 %.2f m",
-                          data.floorAreaM2, data.sizeM.x, data.sizeM.y, data.medianWallHeightM)
+                          data.floorAreaM2, data.drawnSizeM.x, data.drawnSizeM.y,
+                          data.medianWallHeightM)
                  : String(format: "外接 %.2f × %.2f m　·　最長牆 %.2f m　·　樓高 %.2f m",
-                          data.sizeM.x, data.sizeM.y, data.longestWallM, data.medianWallHeightM))
+                          data.drawnSizeM.x, data.drawnSizeM.y, data.longestWallM,
+                          data.medianWallHeightM))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.white.opacity(0.6))
             // 資料本身不完整時直接說明原因與該怎麼補救 ——
@@ -231,7 +242,7 @@ struct FloorPlanView: View {
         ctx.fill(Path(roundedRect: paper, cornerRadius: 4),
                  with: .color(Self.color(.paper)))
 
-        for prim in data.drawing() {
+        for prim in data.drawing(showAllFurniture: showFurniture) {
             switch prim {
             case let .path(pts, closed, style):
                 guard pts.count >= 2 else { continue }

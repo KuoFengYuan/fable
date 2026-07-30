@@ -47,7 +47,8 @@ struct CaptureView: View {
             if let fp = controller.floorPlanData {
                 FloorPlanView(data: fp,
                               onClose: { controller.showFloorPlan = false },
-                              onRename: { i, name in controller.renameRoom(at: i, to: name) })
+                              onRename: { i, name in controller.renameRoom(at: i, to: name) },
+                              showFurniture: $controller.showPlanFurniture)
             }
         }
         .onDisappear { controller.teardown() }

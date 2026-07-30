@@ -256,6 +256,37 @@ struct Render {
         e.rooms[0].customLabel = "   "
         check(e.rooms[0].displayName == "客廳", "只有空白時退回判定值")
 
+        // 5. 活動家具預設不畫；固定設備一律要畫
+        var f = synthetic()
+        f.objects = [
+            FloorPlanObject(category: "chair", transform: [], dimensions: [0.5, 0.9, 0.5],
+                            footprint2D: [1, 1, 1.5, 1, 1.5, 1.5, 1, 1.5]),
+            FloorPlanObject(category: "sofa", transform: [], dimensions: [1.9, 0.8, 0.8],
+                            footprint2D: [1, 2, 2.9, 2, 2.9, 2.8, 1, 2.8]),
+            FloorPlanObject(category: "toilet", transform: [], dimensions: [0.4, 0.8, 0.6],
+                            footprint2D: [4, 1, 4.4, 1, 4.4, 1.6, 4, 1.6]),
+        ]
+        func objectPaths(_ d: FloorPlanData, all: Bool) -> Int {
+            d.drawing(showAllFurniture: all).filter {
+                if case let .path(_, _, st) = $0 { return st.stroke == .object }
+                return false
+            }.count
+        }
+        check(objectPaths(f, all: false) == 1, "預設只畫固定設備（3 件中只有馬桶被畫）")
+        check(objectPaths(f, all: true) == 3, "開啟後椅子/沙發也畫出來")
+
+        // 6. 標頭顯示的外接尺寸要等於圖上尺寸標註的數字（外緣到外緣）
+        let g = synthetic()
+        let drawn = g.drawnSizeM
+        let dimTexts = g.drawing().compactMap { p -> String? in
+            if case let .text(t, _, _, c, _, _) = p, c == .dim { return t }
+            return nil
+        }
+        let wantW = String(format: "%.2f m", drawn.x)
+        let wantD = String(format: "%.2f m", drawn.y)
+        check(dimTexts.contains(wantW) && dimTexts.contains(wantD),
+              "標頭尺寸(\(wantW) × \(wantD)) 與圖上標註一致")
+
         print()
         print(fails == 0 ? "全部通過 — 製圖層不變量驗證完成" : "\(fails) 項失敗")
         if fails > 0 { exit(1) }
