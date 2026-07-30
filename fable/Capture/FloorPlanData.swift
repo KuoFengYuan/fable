@@ -60,6 +60,16 @@ nonisolated struct FloorPlanRoom: Codable, Sendable {
     var areaM2: Float
     /// 標註文字要放的位置（多邊形形心）
     var labelAt: [Float]
+    /// 使用者自己輸入的房間名稱。優先於 RoomPlan 的判定 ——
+    /// RoomPlan 判不出用途（回 unidentified）在單房間掃描時很常見，
+    /// 而使用者當然知道那是什麼房間。會一併寫進匯出的 json / svg。
+    var customLabel: String?
+
+    /// 圖面與 UI 一律用這個，不要各自決定要顯示哪個名稱
+    var displayName: String {
+        if let c = customLabel, !c.trimmingCharacters(in: .whitespaces).isEmpty { return c }
+        return label.map(FloorPlanData.roomName) ?? "房間"
+    }
 }
 
 nonisolated struct FloorPlanData: Codable, Sendable {
@@ -167,6 +177,37 @@ extension FloorPlanData {
         }
         guard sx * sx + sy * sy > 1e-9 else { return 0 }
         return -atan2(sy, sx) / 4
+    }
+
+    /// 哪個房間包含這個點（未旋轉的世界座標）。點擊命名用。
+    /// 多個房間重疊時取面積最小的 —— 小房間更可能是使用者想點的那個。
+    func roomIndex(containing pt: SIMD2<Float>) -> Int? {
+        var best: (Int, Float)?
+        for (i, r) in rooms.enumerated() {
+            guard Self.polygonContains(r.polygon2D, pt) else { continue }
+            if best == nil || r.areaM2 < best!.1 { best = (i, r.areaM2) }
+        }
+        return best?.0
+    }
+
+    /// ray casting point-in-polygon。多邊形以扁平化的 [x0,z0, x1,z1, ...] 表示。
+    /// 這段邏輯原本在 FloorPlanData+RoomPlan（配對房間名稱）與 FloorPlanDrawing
+    /// （判斷門的開向）各有一份，抽出來共用。
+    static func polygonContains(_ flat: [Float], _ pt: SIMD2<Float>) -> Bool {
+        let n = flat.count / 2
+        guard n >= 3 else { return false }
+        var inside = false
+        var j = n - 1
+        for i in 0..<n {
+            let ax = flat[i * 2], ay = flat[i * 2 + 1]
+            let bx = flat[j * 2], by = flat[j * 2 + 1]
+            if (ay > pt.y) != (by > pt.y),
+               pt.x < (bx - ax) * (pt.y - ay) / (by - ay) + ax {
+                inside.toggle()
+            }
+            j = i
+        }
+        return inside
     }
 
     private func median(_ v: [Float]) -> Float {

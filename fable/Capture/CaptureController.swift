@@ -694,6 +694,15 @@ final class CaptureController: NSObject, ObservableObject {
         }
     }
 
+    /// 使用者為房間命名。改動會一併進到匯出的 floorplan.json / .svg
+    /// （writeFloorPlan 讀的就是 floorPlanData）。
+    func renameRoom(at index: Int, to name: String) {
+        guard var fp = floorPlanData, fp.rooms.indices.contains(index) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        fp.rooms[index].customLabel = trimmed.isEmpty ? nil : trimmed
+        floorPlanData = fp
+    }
+
     /// 平面圖三種輸出，各有各的用途，所以都寫：
     ///   floorplan.usdz — RoomPlan 原生，帶完整 3D 幾何與門窗語意，可直接進 CAD / BIM
     ///   floorplan.json — 參數化資料 ＋ 已投影到水平面的 2D 線段，給程式化後處理用

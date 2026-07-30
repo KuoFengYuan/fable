@@ -145,12 +145,15 @@ func rotateAll(_ d: FloorPlanData, byDeg deg: Float) -> FloorPlanData {
 struct Render {
     static func main() throws {
         let args = CommandLine.arguments
-        let outPath = args.count > 1 ? args[1] : "floorplan.svg"
+        let outPath = args.dropFirst(1).first { $0.hasSuffix(".svg") } ?? "floorplan.svg"
         // args[2] 可以是 json 路徑，也可以是「先轉幾度」的數字（測試用）
         var jsonPath: String?
         var rotateDeg: Float?
-        for a in args.dropFirst(2) {
-            if let v = Float(a) { rotateDeg = v } else { jsonPath = a }
+        var selfTest = false
+        for a in args.dropFirst(1) {
+            if a == "--selftest" { selfTest = true }
+            else if let v = Float(a) { rotateDeg = v }
+            else if a.hasSuffix(".json") { jsonPath = a }
         }
         var data: FloorPlanData
         if let jsonPath {
@@ -165,6 +168,11 @@ struct Render {
             data = rotateAll(data, byDeg: deg)
             print(String(format: "先轉 %.0f° → planRotationRad 回報 %.2f°（應為 %.0f°）",
                          deg, data.planRotationRad * 180 / .pi, -deg))
+        }
+
+        if selfTest {
+            try runSelfTest()
+            return
         }
 
         let svg = data.svg()
@@ -192,5 +200,64 @@ struct Render {
         let ok = lo.x >= b[0] && hi.x <= b[2] && lo.y >= b[1] && hi.y <= b[3]
         print(ok ? "✅ 內容完全在圖面範圍內" : "❌ 內容超出圖面範圍 → 會被裁掉")
 
+    }
+
+    // MARK: - 回歸測試（swiftc 後執行 `render --selftest`）
+
+    /// 製圖層的關鍵不變量。改了旋轉、命中測試或命名邏輯就重跑。
+    static func runSelfTest() throws {
+        var fails = 0
+        func check(_ ok: Bool, _ what: String) {
+            print(ok ? "✅ \(what)" : "❌ \(what)")
+            if !ok { fails += 1 }
+        }
+
+        // 1. 轉正：任意角度的輸入都要被轉回水平
+        for deg in [Float(0), 12, 45, -17, 31, 88] {
+            let d = rotateAll(synthetic(), byDeg: deg)
+            let got = d.planRotationRad * 180 / .pi
+            // 牆向對 90° 取模，故 -deg 與 -deg±90 等價
+            let err = abs((got + deg).truncatingRemainder(dividingBy: 90))
+            check(min(err, 90 - err) < 0.5,
+                  String(format: "轉正 %.0f° → 回報 %.2f°（模 90° 誤差 %.2f°）",
+                         deg, got, min(err, 90 - err)))
+        }
+
+        // 2. 圖面範圍要包住所有內容（含尺寸標註），否則會被裁掉
+        for deg in [Float(0), 37] {
+            let d = rotateAll(synthetic(), byDeg: deg)
+            let b = d.drawingBoundsM
+            var lo = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
+            var hi = -lo
+            for p in d.drawing() {
+                if case let .path(pts, _, _) = p {
+                    for v in pts { lo = simd_min(lo, v); hi = simd_max(hi, v) }
+                }
+            }
+            check(lo.x >= b[0] && hi.x <= b[2] && lo.y >= b[1] && hi.y <= b[3],
+                  "內容完全在圖面範圍內（轉 \(Int(deg))°）")
+        }
+
+        // 3. 命中測試：形心命中該房間、屋外不命中
+        let d = synthetic()
+        let liv = SIMD2<Float>(d.rooms[0].labelAt[0], d.rooms[0].labelAt[1])
+        let bed = SIMD2<Float>(d.rooms[1].labelAt[0], d.rooms[1].labelAt[1])
+        check(d.roomIndex(containing: liv) == 0, "客廳形心命中 index 0")
+        check(d.roomIndex(containing: bed) == 1, "臥室形心命中 index 1")
+        check(d.roomIndex(containing: SIMD2(-3, -3)) == nil, "屋外不命中任何房間")
+
+        // 4. 自訂名稱：優先於 RoomPlan 判定，且會進到 SVG；全空白要退回判定值
+        var e = synthetic()
+        check(e.rooms[0].displayName == "客廳", "預設用 RoomPlan 判定的名稱")
+        e.rooms[0].customLabel = "主臥室"
+        check(e.rooms[0].displayName == "主臥室", "自訂名稱優先")
+        let svg = e.svg()
+        check(svg.contains("主臥室") && !svg.contains(">客廳<"), "自訂名稱寫進 SVG")
+        e.rooms[0].customLabel = "   "
+        check(e.rooms[0].displayName == "客廳", "只有空白時退回判定值")
+
+        print()
+        print(fails == 0 ? "全部通過 — 製圖層不變量驗證完成" : "\(fails) 項失敗")
+        if fails > 0 { exit(1) }
     }
 }

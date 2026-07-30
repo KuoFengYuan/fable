@@ -45,7 +45,9 @@ struct CaptureView: View {
         // fullScreenCover 也順便讓 HUD 整個退場，不必逐項判斷該不該隱藏。
         .fullScreenCover(isPresented: $controller.showFloorPlan) {
             if let fp = controller.floorPlanData {
-                FloorPlanView(data: fp) { controller.showFloorPlan = false }
+                FloorPlanView(data: fp,
+                              onClose: { controller.showFloorPlan = false },
+                              onRename: { i, name in controller.renameRoom(at: i, to: name) })
             }
         }
         .onDisappear { controller.teardown() }

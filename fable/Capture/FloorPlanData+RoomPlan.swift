@@ -63,7 +63,7 @@ extension FloorPlanData {
             let flat = pts.flatMap { [$0.x, $0.y] }
             let c = centroid(pts)
             let label = sections.first { s in
-                contains(pts, SIMD2(s.center.x, s.center.z))
+                FloorPlanData.polygonContains(flat, SIMD2(s.center.x, s.center.z))
             }.map { String(describing: $0.label) }
             return FloorPlanRoom(label: label, polygon2D: flat,
                                  areaM2: abs(shoelace(pts)), labelAt: [c.x, c.y])
@@ -101,21 +101,6 @@ extension FloorPlanData {
             c += (p[i] + q) * cross
         }
         return c / (6 * a)
-    }
-
-    /// ray casting point-in-polygon
-    private static func contains(_ poly: [SIMD2<Float>], _ pt: SIMD2<Float>) -> Bool {
-        var inside = false
-        var j = poly.count - 1
-        for i in poly.indices {
-            let a = poly[i], b = poly[j]
-            if (a.y > pt.y) != (b.y > pt.y),
-               pt.x < (b.x - a.x) * (pt.y - a.y) / (b.y - a.y) + a.x {
-                inside.toggle()
-            }
-            j = i
-        }
-        return inside
     }
 
     private static func surface(_ s: CapturedRoom.Surface) -> FloorPlanSurface {

@@ -154,8 +154,7 @@ extension FloorPlanData {
         // 6. 房間名稱與面積
         for r in rooms where r.areaM2 > 0.5 {
             let at = SIMD2<Float>(r.labelAt.first ?? 0, r.labelAt.count > 1 ? r.labelAt[1] : 0)
-            let name = r.label.map(Self.roomName) ?? "房間"
-            out.append(.text(name, at: at, sizePx: 13, color: .roomText,
+            out.append(.text(r.displayName, at: at, sizePx: 13, color: .roomText,
                              align: .center, bold: true))
             out.append(.text(String(format: "%.1f m²", r.areaM2),
                              at: at + SIMD2(0, 0.22), sizePx: 11, color: .roomText,
@@ -235,24 +234,9 @@ extension FloorPlanData {
         ]
     }
 
-    /// 該點是否落在任一房間多邊形內（ray casting）
+    /// 該點是否落在任一房間多邊形內
     private func roomsContain(_ pt: SIMD2<Float>) -> Bool {
-        for r in rooms {
-            let poly = points(r.polygon2D)
-            guard poly.count >= 3 else { continue }
-            var inside = false
-            var j = poly.count - 1
-            for i in poly.indices {
-                let a = poly[i], b = poly[j]
-                if (a.y > pt.y) != (b.y > pt.y),
-                   pt.x < (b.x - a.x) * (pt.y - a.y) / (b.y - a.y) + a.x {
-                    inside.toggle()
-                }
-                j = i
-            }
-            if inside { return true }
-        }
-        return false
+        rooms.contains { FloorPlanData.polygonContains($0.polygon2D, pt) }
     }
 
     /// 窗：沿窗寬三道平行線（外框兩條 ＋ 中線一條），建築圖慣例畫法。

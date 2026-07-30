@@ -15,6 +15,11 @@ struct FloorPlanView: View {
 
     let data: FloorPlanData
     let onClose: () -> Void
+    /// (房間索引, 新名稱)。RoomPlan 常判不出用途，讓使用者自己命名比顯示 unidentified 有用
+    var onRename: (Int, String) -> Void = { _, _ in }
+
+    @State private var renamingIndex: Int?
+    @State private var draftName = ""
 
     @State private var zoom: CGFloat = 1
     @State private var pinch: CGFloat = 1
@@ -49,6 +54,22 @@ struct FloorPlanView: View {
                 }
                 legend
             }
+        }
+        .alert("房間名稱", isPresented: Binding(
+            get: { renamingIndex != nil },
+            set: { if !$0 { renamingIndex = nil } })) {
+            TextField("例如：客廳、主臥、書房", text: $draftName)
+            Button("清除") {
+                if let i = renamingIndex { onRename(i, "") }
+                renamingIndex = nil
+            }
+            Button("取消", role: .cancel) { renamingIndex = nil }
+            Button("儲存") {
+                if let i = renamingIndex { onRename(i, draftName) }
+                renamingIndex = nil
+            }
+        } message: {
+            Text("會一併寫進匯出的 floorplan.json 與 .svg")
         }
     }
 
@@ -112,23 +133,69 @@ struct FloorPlanView: View {
 
     // MARK: - 平面圖本體
 
+    /// 世界(公尺, XZ) ↔ 畫面座標。繪製與命中測試**共用同一個**轉換 ——
+    /// 各寫一份是這個檔案已經踩過兩次的錯誤（SVG 與畫面漂走、標註被裁），不再重犯。
+    private struct PlanTransform {
+        let scale: CGFloat
+        let mid: CGPoint          // 圖面中心（世界座標）
+        let center: CGPoint       // 畫面中心 ＋ 平移
+        /// drawing() 對內容整批套用的旋轉角；命中測試要反轉它才能對上原始多邊形
+        let rotation: Float
+
+        func view(_ p: SIMD2<Float>) -> CGPoint {
+            CGPoint(x: (CGFloat(p.x) - mid.x) * scale + center.x,
+                    y: (CGFloat(p.y) - mid.y) * scale + center.y)
+        }
+
+        /// 畫面點 → **未旋轉**的世界座標（即 FloorPlanData.rooms 裡多邊形所在的座標系）
+        func world(_ p: CGPoint) -> SIMD2<Float> {
+            let rx = Float((p.x - center.x) / scale + mid.x)
+            let ry = Float((p.y - center.y) / scale + mid.y)
+            let c = cos(-rotation), s = sin(-rotation)
+            return SIMD2(rx * c - ry * s, rx * s + ry * c)
+        }
+    }
+
+    private func transform(for size: CGSize) -> PlanTransform? {
+        let b = data.drawingBoundsM
+        guard b.count == 4, b[2] > b[0], b[3] > b[1] else { return nil }
+        let wm = CGFloat(b[2] - b[0]), hm = CGFloat(b[3] - b[1])
+        let pad: CGFloat = 12
+        let fit = min((size.width - pad * 2) / wm, (size.height - pad * 2) / hm)
+        return PlanTransform(
+            scale: fit * scaleNow,
+            mid: CGPoint(x: CGFloat(b[0] + b[2]) / 2, y: CGFloat(b[1] + b[3]) / 2),
+            center: CGPoint(x: size.width / 2 + panNow.width,
+                            y: size.height / 2 + panNow.height),
+            rotation: data.planRotationRad)
+    }
+
     private var plan: some View {
-        Canvas { ctx, size in draw(ctx, size) }
-            .gesture(
-                SimultaneousGesture(
-                    MagnifyGesture()
-                        .onChanged { pinch = $0.magnification }
-                        .onEnded { _ in zoom = scaleNow; pinch = 1 },
-                    DragGesture()
-                        .onChanged { drag = $0.translation }
-                        .onEnded { _ in offset = panNow; drag = .zero }
+        GeometryReader { geo in
+            Canvas { ctx, size in draw(ctx, size) }
+                .gesture(
+                    SimultaneousGesture(
+                        MagnifyGesture()
+                            .onChanged { pinch = $0.magnification }
+                            .onEnded { _ in zoom = scaleNow; pinch = 1 },
+                        DragGesture()
+                            .onChanged { drag = $0.translation }
+                            .onEnded { _ in offset = panNow; drag = .zero }
+                    )
                 )
-            )
-            .onTapGesture(count: 2) {          // 雙擊回到自動置中
-                withAnimation(.easeOut(duration: 0.2)) {
-                    zoom = 1; pinch = 1; offset = .zero; drag = .zero
+                // count:2 必須宣告在 count:1 之前，否則單擊會先吃掉雙擊
+                .onTapGesture(count: 2) {          // 雙擊回到自動置中
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        zoom = 1; pinch = 1; offset = .zero; drag = .zero
+                    }
                 }
-            }
+                .onTapGesture { pt in              // 單擊房間 → 命名
+                    guard let t = transform(for: geo.size),
+                          let i = data.roomIndex(containing: t.world(pt)) else { return }
+                    renamingIndex = i
+                    draftName = data.rooms[i].customLabel ?? ""
+                }
+        }
     }
 
     /// 語意色 → SwiftUI Color。與 SVG 後端的十六進位一一對應（見 FloorPlanData.hex），
@@ -152,21 +219,15 @@ struct FloorPlanView: View {
     /// 與 SVG 後端共用同一份圖元清單。
     private func draw(_ ctx: GraphicsContext, _ size: CGSize) {
         let b = data.drawingBoundsM
-        guard b.count == 4, b[2] > b[0], b[3] > b[1] else { return }
-        let wm = CGFloat(b[2] - b[0]), hm = CGFloat(b[3] - b[1])
-        let pad: CGFloat = 12
-        let fit = min((size.width - pad * 2) / wm, (size.height - pad * 2) / hm)
-        let s = fit * scaleNow
-        let midX = CGFloat(b[0] + b[2]) / 2, midZ = CGFloat(b[1] + b[3]) / 2
+        guard b.count == 4, let t = transform(for: size) else { return }
+        let s = t.scale
         // world (x, z) → view：y 不翻轉 ⇒ 非鏡像俯視
-        func P(_ p: SIMD2<Float>) -> CGPoint {
-            CGPoint(x: (CGFloat(p.x) - midX) * s + size.width / 2 + panNow.width,
-                    y: (CGFloat(p.y) - midZ) * s + size.height / 2 + panNow.height)
-        }
+        func P(_ p: SIMD2<Float>) -> CGPoint { t.view(p) }
 
         // 紙張：只鋪在圖面範圍內，四周留深色，看起來像一張圖而不是換了底色的畫面
-        let paper = CGRect(x: P(SIMD2(b[0], b[1])).x, y: P(SIMD2(b[0], b[1])).y,
-                           width: wm * s, height: hm * s)
+        let origin = P(SIMD2(b[0], b[1]))
+        let paper = CGRect(x: origin.x, y: origin.y,
+                           width: CGFloat(b[2] - b[0]) * s, height: CGFloat(b[3] - b[1]) * s)
         ctx.fill(Path(roundedRect: paper, cornerRadius: 4),
                  with: .color(Self.color(.paper)))
 
@@ -208,7 +269,7 @@ struct FloorPlanView: View {
             key(Self.color(.wall), "牆"); key(Self.color(.door), "門")
             key(Self.color(.window), "窗"); key(Self.color(.opening), "開口")
             Spacer()
-            Text("雙指縮放 · 雙擊置中").foregroundStyle(.white.opacity(0.45))
+            Text("點房間可命名 · 雙擊置中").foregroundStyle(.white.opacity(0.45))
         }
         .font(.caption2)
         .foregroundStyle(.white.opacity(0.8))
