@@ -47,8 +47,62 @@ extension FloorPlanData {
     /// 牆厚缺值時的替代值（公尺）。RoomPlan 偶爾給 0，畫成 0 厚會整面牆消失
     private static let kFallbackWallThickness: Float = 0.10
 
-    /// 產生整張平面圖的圖元清單，順序即繪製順序（後畫的蓋前面的）
+    /// 產生整張平面圖的圖元清單，順序即繪製順序（後畫的蓋前面的）。
+    ///
+    /// 內容先在 ARKit 世界座標建好，再**整批**旋轉到水平（見 planRotationRad）——
+    /// 旋轉放在最後一步而不是散在各個 builder 裡，是為了不可能漏掉某一種圖元。
+    /// 尺寸標註鏈在旋轉之後才依「旋轉後的範圍」產生，否則標的會是歪的外接框。
     func drawing() -> [PlanPrimitive] {
+        let a = planRotationRad
+        var content = content()
+        if abs(a) > 0.005 {
+            let c = cos(a), s = sin(a)
+            content = content.map { Self.rotate($0, cos: c, sin: s) }
+        }
+        return content + dimensionChain(bounds: Self.bounds(of: content))
+    }
+
+    /// 旋轉後的圖面範圍（含尺寸標註留白）。兩個後端都靠它算縮放。
+    var drawingBoundsM: [Float] {
+        guard !walls.isEmpty else { return [] }
+        let b = Self.bounds(of: {
+            let a = planRotationRad
+            let c = cos(a), s = sin(a)
+            return content().map { Self.rotate($0, cos: c, sin: s) }
+        }())
+        guard b.count == 4 else { return [] }
+        // 左側留白較大：垂直尺寸的文字是靠右對齊、往左延伸，留太少會被裁掉（實機出現過）
+        return [b[0] - 1.7, b[1] - 1.0, b[2] + 1.0, b[3] + 1.0]
+    }
+
+    private static func rotate(_ p: PlanPrimitive, cos c: Float, sin s: Float) -> PlanPrimitive {
+        func R(_ v: SIMD2<Float>) -> SIMD2<Float> {
+            SIMD2(v.x * c - v.y * s, v.x * s + v.y * c)
+        }
+        switch p {
+        case let .path(pts, closed, style):
+            return .path(points: pts.map(R), closed: closed, style: style)
+        case let .text(t, at, size, color, align, bold):
+            return .text(t, at: R(at), sizePx: size, color: color, align: align, bold: bold)
+        }
+    }
+
+    private static func bounds(of prims: [PlanPrimitive]) -> [Float] {
+        var lo = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
+        var hi = SIMD2<Float>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
+        for p in prims {
+            // 只用實體幾何定範圍：文字位置不算（它不是圖面內容），
+            // 也避免門的開啟弧線把範圍撐大
+            guard case let .path(pts, _, style) = p, style.fill != nil || style.stroke == .wall
+            else { continue }
+            for v in pts { lo = simd_min(lo, v); hi = simd_max(hi, v) }
+        }
+        guard hi.x > lo.x else { return [] }
+        return [lo.x, lo.y, hi.x, hi.y]
+    }
+
+    /// 圖面內容（未旋轉）
+    private func content() -> [PlanPrimitive] {
         var out: [PlanPrimitive] = []
 
         // 1. 房間地板：淡色填充 ＋ 細邊界
@@ -108,8 +162,6 @@ extension FloorPlanData {
                              align: .center, bold: false))
         }
 
-        // 7. 外圍尺寸標註
-        out += dimensionChain()
         return out
     }
 
@@ -218,11 +270,12 @@ extension FloorPlanData {
         ]
     }
 
-    /// 外圍總尺寸：下緣標寬、左緣標深，各含端點短刻度線
-    private func dimensionChain() -> [PlanPrimitive] {
-        guard boundsM.count == 4 else { return [] }
-        let lo = SIMD2<Float>(boundsM[0], boundsM[1])
-        let hi = SIMD2<Float>(boundsM[2], boundsM[3])
+    /// 外圍總尺寸：下緣標寬、左緣標深，各含端點短刻度線。
+    /// bounds 必須是**旋轉後**的範圍，否則標到的是歪掉的外接框、數字沒有意義。
+    private func dimensionChain(bounds: [Float]) -> [PlanPrimitive] {
+        guard bounds.count == 4 else { return [] }
+        let lo = SIMD2<Float>(bounds[0], bounds[1])
+        let hi = SIMD2<Float>(bounds[2], bounds[3])
         let gap: Float = 0.45           // 標註線離牆的距離（公尺）
         let tick: Float = 0.10
         let style = PlanStyle(stroke: .dim, widthPx: 1)
@@ -252,13 +305,6 @@ extension FloorPlanData {
         return out
     }
 
-    /// 標註區域（含尺寸線）的世界座標範圍 —— 兩個後端都要靠它算縮放，避免標註被裁掉
-    var drawingBoundsM: [Float] {
-        guard boundsM.count == 4 else { return [] }
-        let pad: Float = 0.95    // 尺寸線 0.45 ＋ 文字空間
-        return [boundsM[0] - pad, boundsM[1] - pad, boundsM[2] + pad, boundsM[3] + pad]
-    }
-
     /// RoomPlan 的 section label（camelCase 英文）→ 中文
     static func roomName(_ raw: String) -> String {
         switch raw {
@@ -272,6 +318,9 @@ extension FloorPlanData {
         case "laundryRoom": "洗衣間"
         case "hallway":     "走廊"
         case "closet":      "衣櫃間"
+        // RoomPlan 判不出用途時會回 unidentified；顯示原字串只會讓人困惑，
+        // 而「這是哪種房間」對平面圖來說不是必要資訊，退回通稱即可
+        case "unidentified": "房間"
         default:            raw.isEmpty ? "房間" : raw
         }
     }

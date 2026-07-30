@@ -187,14 +187,25 @@ def main():
             if b and len(b) == 4:
                 print(f"    外接尺寸 {b[2]-b[0]:.2f} × {b[3]-b[1]:.2f} m"
                       f"（外接面積 {fp.get('boundingAreaM2', 0):.1f} m²，非實際地板面積）")
-            if hts:
-                mh = hts[len(hts)//2]
-                if 2.0 <= mh <= 3.6:
-                    print(f"    {OK} 樓高中位數 {mh:.2f}m 合理 → dimensions 軸序正確")
-                else:
-                    problems += 1
-                    print(f"    {FAIL} 樓高中位數 {mh:.2f}m 不合理 —— dimensions 軸序與假設相反，")
-                    print("        平面圖的牆長是錯的（見 FloorPlanData.segment 的註解）")
+            # 掃描完整度。這裡原本判定的是「dimensions 軸序相反」，那是錯的 ——
+            # Apple 文件定義 Surface.dimensions 為 (width, height, depth)，假設本來就對；
+            # 樓高偏低的真正成因是牆沒被掃到頂。舊判斷只會對不完整的掃描說謊。
+            incomplete = []
+            if hts and hts[len(hts) // 2] < 2.0:
+                incomplete.append(f"牆只掃到 {hts[len(hts)//2]:.2f}m 高（鏡頭要帶到牆與天花板的交界）")
+            if b and len(b) == 4 and lens[-1] < max(b[2] - b[0], b[3] - b[1]) * 0.5:
+                incomplete.append("牆面破碎、房間未閉合（沿牆走一圈並回到起點）")
+            if not fp.get("doors") and not fp.get("windows"):
+                incomplete.append("沒有偵測到任何門窗（沿牆掃時讓門窗完整入鏡）")
+            if incomplete:
+                print(f"    {WARN} 掃描不完整：")
+                for r in incomplete:
+                    print(f"        · {r}")
+                print("        RoomPlan 要沿牆掃一圈，3DGS 要繞著物件多視角拍 ——")
+                print("        共用 session 是免費的，共用掃描路徑不是")
+            else:
+                hm = hts[len(hts) // 2] if hts else 0
+                print(f"    {OK} 樓高 {hm:.2f}m、牆完整、有門窗 → 掃描涵蓋看起來足夠")
             print("    ↓ 拿雷射測距儀量最長那道牆與最長對角線，跟上面對一次 ——")
             print("      這是唯一能確認平面圖精度的方法（VIO 漂移不會自己報錯）")
 

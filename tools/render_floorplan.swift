@@ -110,6 +110,35 @@ extension FloorPlanData {
     }
 }
 
+/// 把整個格局繞原點轉一個角度 —— 用來驗證 planRotationRad 會不會把它轉回正。
+/// 實機上這個角度就是使用者按下開始掃描時手機的朝向（ARKit 只固定重力軸）。
+func rotateAll(_ d: FloorPlanData, byDeg deg: Float) -> FloorPlanData {
+    var d = d
+    let a = deg * .pi / 180, c = cos(a), s = sin(a)
+    func R(_ x: Float, _ z: Float) -> (Float, Float) { (x * c - z * s, x * s + z * c) }
+    func rf(_ flat: [Float]) -> [Float] {
+        var out: [Float] = []
+        for i in stride(from: 0, to: flat.count - 1, by: 2) {
+            let (x, z) = R(flat[i], flat[i + 1]); out += [x, z]
+        }
+        return out
+    }
+    func rs(_ v: [FloorPlanSurface]) -> [FloorPlanSurface] {
+        v.map { var w = $0; w.segment2D = rf($0.segment2D); return w }
+    }
+    d.walls = rs(d.walls); d.doors = rs(d.doors)
+    d.windows = rs(d.windows); d.openings = rs(d.openings)
+    d.objects = d.objects.map { var o = $0; o.footprint2D = rf($0.footprint2D); return o }
+    d.rooms = d.rooms.map {
+        var r = $0
+        r.polygon2D = rf($0.polygon2D)
+        let (x, z) = R($0.labelAt[0], $0.labelAt[1]); r.labelAt = [x, z]
+        return r
+    }
+    d.finalize()
+    return d
+}
+
 // MARK: - main
 
 @main
@@ -117,14 +146,25 @@ struct Render {
     static func main() throws {
         let args = CommandLine.arguments
         let outPath = args.count > 1 ? args[1] : "floorplan.svg"
+        // args[2] 可以是 json 路徑，也可以是「先轉幾度」的數字（測試用）
+        var jsonPath: String?
+        var rotateDeg: Float?
+        for a in args.dropFirst(2) {
+            if let v = Float(a) { rotateDeg = v } else { jsonPath = a }
+        }
         var data: FloorPlanData
-        if args.count > 2 {
-            let raw = try Data(contentsOf: URL(fileURLWithPath: args[2]))
+        if let jsonPath {
+            let raw = try Data(contentsOf: URL(fileURLWithPath: jsonPath))
             data = try JSONDecoder().decode(FloorPlanData.self, from: raw)
-            print("讀入 \(args[2])")
+            print("讀入 \(jsonPath)")
         } else {
             data = synthetic()
             print("使用合成的兩房格局")
+        }
+        if let deg = rotateDeg {
+            data = rotateAll(data, byDeg: deg)
+            print(String(format: "先轉 %.0f° → planRotationRad 回報 %.2f°（應為 %.0f°）",
+                         deg, data.planRotationRad * 180 / .pi, -deg))
         }
 
         let svg = data.svg()
@@ -136,6 +176,21 @@ struct Render {
         print(String(format: "地板面積 %.2f m²（外接 %.2f × %.2f m）",
                      data.floorAreaM2, data.sizeM.x, data.sizeM.y))
         print("圖元 \(data.drawing().count) 個 → \(outPath)（\(svg.count) bytes）")
+        // 驗證圖面範圍真的把所有內容包住（含尺寸標註），不會被裁掉
+        let b = data.drawingBoundsM
+        var lo = SIMD2<Float>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
+        var hi = -lo
+        for prim in data.drawing() {
+            if case let .path(pts, _, _) = prim {
+                for v in pts { lo = simd_min(lo, v); hi = simd_max(hi, v) }
+            }
+        }
+        print(String(format: "圖面範圍 x[%.2f, %.2f] y[%.2f, %.2f]",
+                     b[0], b[2], b[1], b[3]))
+        print(String(format: "內容範圍 x[%.2f, %.2f] y[%.2f, %.2f]",
+                     lo.x, hi.x, lo.y, hi.y))
+        let ok = lo.x >= b[0] && hi.x <= b[2] && lo.y >= b[1] && hi.y <= b[3]
+        print(ok ? "✅ 內容完全在圖面範圍內" : "❌ 內容超出圖面範圍 → 會被裁掉")
 
     }
 }

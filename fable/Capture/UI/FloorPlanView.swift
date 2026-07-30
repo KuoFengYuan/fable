@@ -89,13 +89,12 @@ struct FloorPlanView: View {
                           data.sizeM.x, data.sizeM.y, data.longestWallM, data.medianWallHeightM))
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.white.opacity(0.6))
-            if data.axisOrderLooksWrong {
-                warn("樓高不合理 → RoomPlan 的 dimensions 軸序與程式假設相反，牆長是錯的")
-            } else if data.longestWallM < data.sizeM.max() * 0.5 {
-                // 最長牆遠短於整體尺寸 ⇒ 牆被切成碎片、房間沒閉合。
-                // 這不是 UI 問題也不是 bug，是掃描路徑沒有沿牆走 —— 講清楚比畫得漂亮有用。
-                warn("牆面破碎、房間未閉合：請沿著牆面走一圈並回到起點，"
-                     + "3DGS 那種繞著物件拍的路徑產生不出完整的牆")
+            // 資料本身不完整時直接說明原因與該怎麼補救 ——
+            // 這不是 UI 問題也不是 bug，是掃描路徑沒有沿牆走：
+            // RoomPlan 要沿牆掃一圈，3DGS 要繞著物件多視角拍，兩者不是同一條路徑。
+            if let reason = data.incompleteReason {
+                warn(reason + "（RoomPlan 需要沿牆掃一圈，"
+                     + "3DGS 那種繞著物件拍的路徑產生不出完整的牆）")
             }
         }
         .padding(.horizontal, 16)

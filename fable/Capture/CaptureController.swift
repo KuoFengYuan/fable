@@ -676,12 +676,12 @@ final class CaptureController: NSObject, ObservableObject {
     /// 開始掃描時鎖定相機參數。委派給 CameraControls —— 它只凍結「還在自動」的項目，
     /// 使用者手動指定過的（快門/ISO/白平衡/對焦）維持自訂值。
     /// 「預設鎖定」與「調整完再鎖」因此是同一條路徑，不會互相覆蓋。
-    /// 平面圖摘要 ＋ 一道軸序自我檢查。
+    /// 平面圖摘要 ＋ 掃描完整度判斷。
     ///
-    /// 為什麼需要這道檢查：我們假設 Surface.dimensions = (寬, 高, 厚)、且 transform 的
-    /// 局部 X 軸沿牆面寬度方向。這個假設在桌機上無法驗證，而一旦相反，
-    /// 每面「牆長」會全部變成樓高（約 2.4m）、平面圖整張報廢 —— 但看起來還是有線條，
-    /// 不會有任何錯誤訊息。所以直接檢查樓高是否落在合理區間，錯了就明講。
+    /// 這裡原本放的是「dimensions 軸序自我檢查」，已移除 —— 那個判斷是錯的：
+    /// Apple 文件明確定義 Surface.dimensions 為 (width, height, depth)，假設本來就對。
+    /// 實機上樓高 1.83m 的成因是牆只被掃到 1.83m 高，不是軸序（同一份程式在另一次
+    /// 掃描樓高正常，軸序若相反不可能只錯一次）。那道檢查唯一的效果是對不完整的掃描說謊。
     private func logFloorPlan(_ fp: FloorPlanData) {
         print(String(format: "平面圖: %d 房、%d 牆、%d 門、%d 窗、%d 家具，外接 %.2f×%.2fm",
                      fp.roomCount, fp.walls.count, fp.doors.count,
@@ -689,9 +689,8 @@ final class CaptureController: NSObject, ObservableObject {
         guard !fp.walls.isEmpty else { return }
         print(String(format: "  牆長中位數 %.2fm、最長牆 %.2fm、樓高中位數 %.2fm",
                      fp.medianWallLengthM, fp.longestWallM, fp.medianWallHeightM))
-        if fp.axisOrderLooksWrong {
-            print("  ⚠️ 樓高中位數不在 2.0~3.6m —— RoomPlan 的 dimensions 軸序可能與假設相反，"
-                  + "平面圖的牆長會是錯的。請改用 dimensions[0] 當高、[1] 當寬（見 FloorPlanData.segment）")
+        if let reason = fp.incompleteReason {
+            print("  ⚠️ 掃描不完整：\(reason)")
         }
     }
 

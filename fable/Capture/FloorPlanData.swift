@@ -110,12 +110,63 @@ extension FloorPlanData {
 
     var longestWallM: Float { walls.map(\.lengthM).max() ?? 0 }
 
-    /// 程式假設 Surface.dimensions = (寬, 高, 厚)。若 RoomPlan 實際是相反的，
-    /// 每面「牆長」會全部變成樓高（~2.4m）→ 平面圖整張報廢，
-    /// 但畫面上仍然有線條、不會有任何錯誤訊息。用樓高是否落在合理區間反推。
-    var axisOrderLooksWrong: Bool {
+    /// 掃描是否明顯不完整。
+    ///
+    /// 這裡原本放的是「軸序檢查」（樓高不在 2.0~3.6m 就判定 dimensions 軸序相反），
+    /// 那個判斷是錯的，已移除：Apple 文件明確定義 Surface.dimensions 為
+    /// (width, height, depth)，假設本來就對。實機上樓高 1.83m 的成因是
+    /// **牆只被掃到 1.83m 高**，不是軸序 —— 而同一份程式在另一次掃描樓高正常，
+    /// 軸序若真的相反不可能只錯一次。那道檢查唯一的效果是對不完整的掃描說謊。
+    ///
+    /// 改判真正的成因。三個徵兆任一成立即視為不完整：
+    ///   樓高 < 2.0m       牆沒被掃到頂（RoomPlan 只報告實際觀測到的高度）
+    ///   最長牆 < 半個外接邊  牆被切成碎片、房間沒閉合
+    ///   完全沒有門窗       沿牆掃過的話至少會抓到門
+    var scanLooksIncomplete: Bool {
         guard !walls.isEmpty else { return false }
-        return !(2.0...3.6).contains(medianWallHeightM)
+        if medianWallHeightM < 2.0 { return true }
+        if longestWallM < sizeM.max() * 0.5 { return true }
+        if doors.isEmpty && windows.isEmpty { return true }
+        return false
+    }
+
+    /// 不完整的具體原因，用來給使用者可行動的說明（無問題時回 nil）
+    var incompleteReason: String? {
+        guard !walls.isEmpty else { return nil }
+        if medianWallHeightM < 2.0 {
+            return String(format: "牆只掃到 %.2fm 高：請把鏡頭往上帶到牆與天花板的交界",
+                          medianWallHeightM)
+        }
+        if longestWallM < sizeM.max() * 0.5 {
+            return "牆面破碎、房間未閉合：請沿著牆面走一圈並回到起點"
+        }
+        if doors.isEmpty && windows.isEmpty {
+            return "沒有偵測到任何門窗：沿牆掃過時請讓門窗完整入鏡"
+        }
+        return nil
+    }
+
+    /// 讓主要牆向對齊水平所需的旋轉角（弧度，逆時針為正）。
+    ///
+    /// ARKit 的世界 +X/+Z 是**任意**水平軸 —— gravity 對齊只固定 Y 軸，
+    /// 水平朝向取決於使用者按下開始掃描時手機指向哪裡。於是房間會歪著畫，
+    /// 實機實測歪了約 45°。建築平面圖一律是正的，所以要把主要牆向轉回水平。
+    ///
+    /// 做法：牆向對 90° 取模（牆只有兩個正交方向，差 90° 視為同一組），
+    /// 再以牆長為權重取圓形平均。角度先 ×4 映射到整個圓、平均完再 ÷4，
+    /// 這是在模數空間取平均的標準做法 —— 直接平均角度會在 0/90° 邊界爆掉
+    /// （例如 1° 與 89° 的算術平均是 45°，但正確答案是 0°）。
+    var planRotationRad: Float {
+        var sx: Float = 0, sy: Float = 0
+        for w in walls where w.segment2D.count == 4 && w.lengthM > 0.2 {
+            let dx = w.segment2D[2] - w.segment2D[0]
+            let dz = w.segment2D[3] - w.segment2D[1]
+            let a4 = atan2(dz, dx) * 4          // ×4 ⇒ 90° 的模數變成 360°
+            sx += cos(a4) * w.lengthM
+            sy += sin(a4) * w.lengthM
+        }
+        guard sx * sx + sy * sy > 1e-9 else { return 0 }
+        return -atan2(sy, sx) / 4
     }
 
     private func median(_ v: [Float]) -> Float {
