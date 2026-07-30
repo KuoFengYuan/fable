@@ -166,6 +166,38 @@ def main():
         print("        ← 這就是逐幀內參吸收掉的量。若 <0.1% 表示這台機器幾乎不呼吸，"
               "單一相機本來也夠；若 >1% 則逐幀內參是必要的。")
 
+    # --- 5. 平面圖（RoomPlan）--------------------------------------------
+    print("\n[5] 平面圖 floorplan.{usdz,json,svg}")
+    fp_path = args.scan_dir / "floorplan.json"
+    if not fp_path.exists():
+        print(f"    {WARN} 沒有 floorplan.json（未開啟 captureFloorPlan、機型不支援，或尚未匯出）")
+    else:
+        fp = json.loads(fp_path.read_text())
+        walls = fp.get("walls", [])
+        print(f"    {fp.get('roomCount', 1)} 房 · {len(walls)} 牆 · {len(fp.get('doors', []))} 門"
+              f" · {len(fp.get('windows', []))} 窗 · {len(fp.get('objects', []))} 家具")
+        for name in ("floorplan.usdz", "floorplan.svg"):
+            mark = OK if (args.scan_dir / name).exists() else WARN
+            print(f"    {mark} {name}")
+        if walls:
+            lens = sorted(w["lengthM"] for w in walls)
+            hts = sorted(w["dimensions"][1] for w in walls if len(w["dimensions"]) > 1)
+            b = fp.get("boundsM", [])
+            print(f"    牆長中位數 {lens[len(lens)//2]:.2f}m、最長 {lens[-1]:.2f}m")
+            if b and len(b) == 4:
+                print(f"    外接尺寸 {b[2]-b[0]:.2f} × {b[3]-b[1]:.2f} m"
+                      f"（外接面積 {fp.get('boundingAreaM2', 0):.1f} m²，非實際地板面積）")
+            if hts:
+                mh = hts[len(hts)//2]
+                if 2.0 <= mh <= 3.6:
+                    print(f"    {OK} 樓高中位數 {mh:.2f}m 合理 → dimensions 軸序正確")
+                else:
+                    problems += 1
+                    print(f"    {FAIL} 樓高中位數 {mh:.2f}m 不合理 —— dimensions 軸序與假設相反，")
+                    print("        平面圖的牆長是錯的（見 FloorPlanData.segment 的註解）")
+            print("    ↓ 拿雷射測距儀量最長那道牆與最長對角線，跟上面對一次 ——")
+            print("      這是唯一能確認平面圖精度的方法（VIO 漂移不會自己報錯）")
+
     print()
     print(f"{FAIL} {problems} 項未通過" if problems else f"{OK} 全部通過")
     return 1 if problems else 0

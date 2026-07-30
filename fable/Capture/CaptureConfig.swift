@@ -226,6 +226,16 @@ nonisolated struct CaptureConfig: Sendable {
     /// 熱狀態達 .serious 以上時暫停訓練（散熱保護，避免 thermal shutdown）
     var trainThermalThrottle = true
 
+    // MARK: - 平面圖（RoomPlan，與 3DGS 採集共用同一個 ARSession）
+    /// 掃描時同步擷取 RoomPlan 平面圖，匯出時一併輸出 usdz / json / svg。
+    ///
+    /// 共生的前提我們本來就滿足（gravity 對齊、sceneDepth、mesh），所以「多掃一趟」的成本是零。
+    /// 但**運算成本不是零** —— RoomPlan 會持續跑牆面偵測與物件分類。
+    /// 本專案已經對散熱敏感（thermalState 到 .critical 會自動停拍），
+    /// 長時間整屋掃描若發現提早過熱，這是第一個該關掉的開關。
+    /// 只在支援 RoomPlan 的機型生效（見 FloorPlanCapture.isSupported）。
+    var captureFloorPlan = true
+
     // MARK: - 涵蓋率圓頂（物件模式）
     var domeAzimuthBins = 24
     var domeElevationBins = 5

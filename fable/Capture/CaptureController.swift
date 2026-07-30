@@ -78,6 +78,10 @@ final class CaptureController: NSObject, ObservableObject {
     /// 使用者調整後，startScan 只鎖定「還在自動」的項目，手動值原樣帶進整段掃描 ——
     /// 也就是「預設鎖定，但可以調整完再鎖」。
     let cameraControls = CameraControls()
+    /// 平面圖擷取（RoomPlan，共用同一個 ARSession）。掃描時同步收集，匯出時轉成 usdz/json/svg
+    let floorPlan = FloorPlanCapture()
+    /// 建好的平面圖，於 processing 階段產生 → review 可顯示、匯出時寫檔
+    @Published private(set) var floorPlanData: FloorPlanData?
     let config = CaptureConfig()
     let hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
@@ -216,6 +220,7 @@ final class CaptureController: NSObject, ObservableObject {
             return
         }
         if lockCameraParams { applyCameraLocks() }
+        startFloorPlan(fresh: true)
         // 掃描中收合：中途改曝光會讓前後幀成像不一致（外觀校正要修的正是這個）
         cameraControls.expanded = nil
         cameraControls.railExpanded = false
@@ -239,9 +244,15 @@ final class CaptureController: NSObject, ObservableObject {
         UIApplication.shared.isIdleTimerDisabled = false
         let refined = snapshotRefinedTransforms()   // 必須在 pause 前讀 anchors
         let meshVerts = snapshotMeshVertices()      // 同上：pause 後 anchors 就讀不到了
-        arView?.session.pause()                     // review 期間停止追蹤，省電省熱
-        monitor.stop()
-        Task { await processScan(refinedTransforms: refined, meshVertices: meshVerts) }
+        floorPlan.stopCapture()                     // 只是 stop()，最終資料由 delegate 稍後送達
+        Task {
+            // pause 必須等 RoomPlan 交回 CapturedRoomData 之後 —— session 一 pause
+            // 它就收不完那一段了。waitForSegment 自帶逾時，不會卡住匯出流程。
+            await floorPlan.waitForSegment()
+            arView?.session.pause()                 // review 期間停止追蹤，省電省熱
+            monitor.stop()
+            await processScan(refinedTransforms: refined, meshVertices: meshVerts)
+        }
     }
 
     private func processScan(refinedTransforms: [Int: [Double]], meshVertices: [SIMD3<Float>]) async {
@@ -302,6 +313,12 @@ final class CaptureController: NSObject, ObservableObject {
             points = await accumulator.bestPoints(target: config.exportMaxPoints)
         }
 
+        // 平面圖建模（秒級）：放在 processing 階段，review 時就已經有結果可看/可匯出
+        if config.captureFloorPlan, FloorPlanCapture.isSupported {
+            floorPlanData = await floorPlan.build()
+            if let fp = floorPlanData { logFloorPlan(fp) }
+        }
+
         reviewPoints = points
         reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
         pointCount = points.count
@@ -332,6 +349,7 @@ final class CaptureController: NSObject, ObservableObject {
                 }
                 try ExportManager.writeRefinedPoses(records,
                                                     to: dir.appendingPathComponent("poses_refined.jsonl"))
+                await writeFloorPlan(to: dir)
             } catch {
                 statusText = "匯出 COLMAP 資料失敗：\(error.localizedDescription)"
             }
@@ -365,6 +383,9 @@ final class CaptureController: NSObject, ObservableObject {
         reviewTrajectory = []
         arView.session.run(makeARConfig(), options: [])
         if lockCameraParams { applyCameraLocks() }
+        // 刻意不 reset：續掃的這一段會成為「另一個房間」，最後由 StructureBuilder 合併成整層。
+        // 一間一間掃再合併的精度也優於一鏡到底（一鏡到底會在門口累積漂移）。
+        startFloorPlan(fresh: false)
         monitor.start()
         shutter.reset()
         phase = .scanning
@@ -653,6 +674,62 @@ final class CaptureController: NSObject, ObservableObject {
     /// 開始掃描時鎖定相機參數。委派給 CameraControls —— 它只凍結「還在自動」的項目，
     /// 使用者手動指定過的（快門/ISO/白平衡/對焦）維持自訂值。
     /// 「預設鎖定」與「調整完再鎖」因此是同一條路徑，不會互相覆蓋。
+    /// 平面圖摘要 ＋ 一道軸序自我檢查。
+    ///
+    /// 為什麼需要這道檢查：我們假設 Surface.dimensions = (寬, 高, 厚)、且 transform 的
+    /// 局部 X 軸沿牆面寬度方向。這個假設在桌機上無法驗證，而一旦相反，
+    /// 每面「牆長」會全部變成樓高（約 2.4m）、平面圖整張報廢 —— 但看起來還是有線條，
+    /// 不會有任何錯誤訊息。所以直接檢查樓高是否落在合理區間，錯了就明講。
+    private func logFloorPlan(_ fp: FloorPlanData) {
+        let w = fp.boundsM.count == 4 ? fp.boundsM[2] - fp.boundsM[0] : 0
+        let d = fp.boundsM.count == 4 ? fp.boundsM[3] - fp.boundsM[1] : 0
+        print(String(format: "平面圖: %d 房、%d 牆、%d 門、%d 窗、%d 家具，外接 %.2f×%.2fm",
+                     fp.roomCount, fp.walls.count, fp.doors.count,
+                     fp.windows.count, fp.objects.count, w, d))
+        let heights = fp.walls.compactMap { $0.dimensions.count > 1 ? $0.dimensions[1] : nil }.sorted()
+        let lengths = fp.walls.map(\.lengthM).sorted()
+        guard !heights.isEmpty else { return }
+        let mh = heights[heights.count / 2], ml = lengths[lengths.count / 2]
+        print(String(format: "  牆長中位數 %.2fm、樓高中位數 %.2fm", ml, mh))
+        if !(2.0...3.6).contains(mh) {
+            print("  ⚠️ 樓高中位數不在 2.0~3.6m —— RoomPlan 的 dimensions 軸序可能與假設相反，"
+                  + "平面圖的牆長會是錯的。請改用 dimensions[0] 當高、[1] 當寬（見 FloorPlanData.segment）")
+        }
+    }
+
+    /// 平面圖三種輸出，各有各的用途，所以都寫：
+    ///   floorplan.usdz — RoomPlan 原生，帶完整 3D 幾何與門窗語意，可直接進 CAD / BIM
+    ///   floorplan.json — 參數化資料 ＋ 已投影到水平面的 2D 線段，給程式化後處理用
+    ///   floorplan.svg  — 直接看得到的俯視平面圖（含 1m 網格、牆長標註、比例尺）
+    /// 座標維持 ARKit 原生（+Y up、公尺），與 points.ply / poses.jsonl 一致；
+    /// 匯出 COLMAP 用的世界翻轉**不**套用在這裡 —— 那是 3DGS 生態的慣例，平面圖不需要。
+    private func writeFloorPlan(to dir: URL) async {
+        guard config.captureFloorPlan, FloorPlanCapture.isSupported else { return }
+        await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
+        guard let fp = floorPlanData else { return }
+        do {
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try enc.encode(fp).write(to: dir.appendingPathComponent("floorplan.json"),
+                                     options: [.atomic])
+            try Data(fp.svg().utf8).write(to: dir.appendingPathComponent("floorplan.svg"),
+                                          options: [.atomic])
+        } catch {
+            print("[FloorPlan] 寫檔失敗: \(error)")
+        }
+    }
+
+    /// 開始一段平面圖擷取。fresh = 全新掃描（清空累積）；否則累積成另一個房間。
+    private func startFloorPlan(fresh: Bool) {
+        guard config.captureFloorPlan, FloorPlanCapture.isSupported,
+              let session = arView?.session else { return }
+        if fresh {
+            floorPlan.reset()
+            floorPlanData = nil
+        }
+        floorPlan.start(on: session)
+    }
+
     private func applyCameraLocks() { cameraControls.lockForScan() }
 
     private func releaseCameraLocks() { cameraControls.unlock() }
