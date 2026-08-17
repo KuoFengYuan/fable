@@ -221,8 +221,7 @@ nonisolated enum RefusionEngine {
             // 權重同時吃兩個來源：估計的幾何劣化（運動/捲簾）與實測的清晰度判定。
             // 原本只看 estimatedBlurPx，於是「相機拿得很穩但失焦」的幀拿到滿分權重，
             // 它糊掉的顏色會主導那格的加權平均 —— 這是實測清晰度才看得到的破口。
-            var sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
-            if r.blurVerdict == .demote { sharpness *= kDemotedColorWeight }
+            let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
             grid.insert(unprojectStored(depth: depth, conf: conf, rgba: rgba,
                                         dw: dw, dh: dh, K: K, c2w: c2w,
                                         config: config, sharpness: sharpness))
@@ -408,10 +407,11 @@ nonisolated enum RefusionEngine {
     /// mesh 只在「關鍵幀沒拍到」的空格補洞，不會稀釋既有的良好觀測。
     private static let kMeshScore: Float = 0.25
 
-    /// 被判 .demote 的幀，其顏色貢獻的額外折扣。幾何照收（LiDAR 不受 RGB 模糊影響、
-    /// 而且丟了會開洞），但顏色讓位給看同一片表面的清晰幀。
-    /// 0.2 而非 0：那格若剛好只有這一幀看過，它仍是唯一的顏色來源，總比留黑好。
-    private static let kDemotedColorWeight: Float = 0.2
+    // 註：先前這裡有一個 kDemotedColorWeight = 0.2，註解寫「只降顏色權重」——
+    // 但 score 是**單一權重**，同時決定位置與顏色的加權平均，所以它其實也把幾何
+    // 一起壓到 1/5。在覆蓋率吃緊（實機 26.4% 的格子沒有 LiDAR）的情況下這是反效果，
+    // 故移除。運動模糊本來就有物理權重 1/(1+blur/4) 壓著；
+    // 失焦則完全不影響幾何，本來就不該罰。
     private static func projectMesh(_ verts: [SIMD3<Float>], depth: Data, rgba: [UInt8],
                                     dw: Int, dh: Int, K: CameraIntrinsics,
                                     c2w: simd_float4x4, config: CaptureConfig,
@@ -470,8 +470,8 @@ nonisolated enum RefusionEngine {
                 while u < dw {
                     let i = v * dw + u
                     let z = d[i]
-                    if z.isFinite, z > minD, z < maxD,
-                       (conf?[i] ?? 2) >= minConf {
+                    let cv = conf?[i] ?? 2
+                    if z.isFinite, z > minD, z < maxD, cv >= minConf {
                         var ok = true
                         if u + 1 < dw {
                             let dr = d[i + 1]
@@ -490,9 +490,10 @@ nonisolated enum RefusionEngine {
                             let rv = (Float(v) - cy) / Float(dh)
                             let central = 1 - min(1, (ru * ru + rv * rv).squareRoot() * 1.4) * 0.5
                             let near = 1 / (0.2 + z * z)   // 反變異數：LiDAR 雜訊 ∝ z²，遠點大幅降權
+                            let confW: Float = cv >= 2 ? 1 : config.mediumConfidenceWeight
                             out.append(CloudPoint(x: w4.x, y: w4.y, z: w4.z,
                                                   r: rgba[px], g: rgba[px + 1], b: rgba[px + 2],
-                                                  score: central * near * sharpness))
+                                                  score: central * near * sharpness * confW))
                         }
                     }
                     u += stride

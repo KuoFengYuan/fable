@@ -18,12 +18,13 @@
 //
 //  ── 兩種模糊要分開處理，因為對下游的傷害方式不同 ──────────────────
 //
-//  1. 光度模糊（失焦、輕度運動模糊）：只影響「顏色」。
-//     幾何來自 LiDAR，跟 RGB 糊不糊無關。→ 不進訓練，但深度**留在點雲裡**（降權）。
-//     丟掉它的深度只會白白開洞，而 refusion 本來就是多視角加權平均，降權就夠了。
+//  1. 不適合當訓練影像（失焦、或運動模糊 >10px）：影響的是「影像鋭利度」。
+//     幾何來自 LiDAR，跟 RGB 糊不糊無關；而 10px 的運動換算成世界誤差是
+//     1.4cm @ 2m —— 小於一個 voxel。→ 不進訓練，深度**照樣收進點雲**。
+//     丟掉它的深度只會白白開洞。
 //
-//  2. 幾何劣化（快速轉動 → 姿態時間錯位 ＋ 捲簾剪切）：影響的是「位置」。
-//     這種幀的深度會被反投影到**錯的世界座標**，疊出殘影／雙層殼。
+//  2. 幾何真的不可信（運動 >25px ≈ 3.4cm @ 2m）：影響的是「位置」。
+//     深度會被反投影到**錯的世界座標**，疊出殘影／雙層殼。
 //     殘影比破洞更糟 —— 破洞看得出來，殘影會被當成真的幾何。→ 連點雲一起丟。
 //
 
@@ -33,9 +34,9 @@ import simd
 nonisolated enum BlurVerdict: String, Codable, Sendable {
     /// 正常採用
     case keep
-    /// 光度不佳：排除於訓練／匯出，但深度仍以降權併入點雲
+    /// 不當訓練影像（失焦、或運動模糊 10~25px），但**深度照常併入點雲**
     case demote
-    /// 幾何不可信：訓練與點雲都不用
+    /// 幾何也不可信（運動 >25px）：訓練與點雲都不用
     case drop
 }
 
@@ -51,9 +52,23 @@ nonisolated enum BlurFilter {
     /// 0.5 比即時閘門的 0.4 寬鬆一點：空間鄰居的畫面內容本來就不完全相同，
     /// 變異比「同一場景的前後幀」大，門檻收太緊會誤殺。
     static let kSharpRatio: Float = 0.5
-    /// 幾何劣化超過此值（px）判 drop。比即時的 blockBlurPixels(16) 嚴 ——
-    /// 事後我們已經知道覆蓋率達標了，可以挑剔一點。
-    static let kDropBlurPx: Double = 10
+    /// **訓練影像**的幾何劣化上限（px）。超過就不當訓練影像 —— 影像不鋭利是
+    /// 實打實的資訊損失，多視角平均救不回來。
+    static let kTrainBlurPx: Double = 10
+
+    /// **幾何（點雲）**的幾何劣化上限（px）。比訓練寬得多，因為換算成實際誤差後
+    /// 根本不到一個 voxel：
+    ///
+    ///     世界橫向誤差 = blur_px × z / fx
+    ///     10px @ 2m, fx=1450 → 1.4 cm   ← 小於 refuse voxel（2cm）
+    ///     25px @ 2m          → 3.4 cm   ← 約 1.7 voxel，加權平均吃得下
+    ///
+    /// 先前兩者共用 10px，等於「用小於一個體素的誤差」丟掉整幀的深度 ——
+    /// 實機 log 顯示這樣丟掉了 30% 的幀，而同一份 log 的覆蓋率是
+    /// 「26.4% 的格子沒有 LiDAR、只靠 mesh 撐著」。那些深度本來就該收。
+    /// 而且運動模糊的幀在 refusion 裡本來就有物理權重 1/(1+blur/4) 壓著
+    /// （15px → 0.21），不需要再用硬門檻砍一次。
+    static let kGeomBlurPx: Double = 25
     /// 丟棄（drop + demote）的總量上限。整段都拍糊時，全丟比留著更糟：
     /// 那代表使用者需要重拍，而不是我們該把資料集清空。
     static let kMaxRejectFraction: Double = 0.3
@@ -84,9 +99,15 @@ nonisolated enum BlurFilter {
             // 鄰居不夠 → 這是該視角唯一（或幾乎唯一）的觀測，再糊也得留
             guard peers.count >= kMinNeighbors else { continue }
 
-            // 幾何不可信優先判定：這種連深度都不能用，與清晰度無關
-            if records[i].estimatedBlurPx > kDropBlurPx {
-                candidates.append((records[i].id, .drop, Float(records[i].estimatedBlurPx)))
+            let blur = records[i].estimatedBlurPx
+            // 幾何都不能用：只有真的大到超過一個多 voxel 才算
+            if blur > kGeomBlurPx {
+                candidates.append((records[i].id, .drop, Float(blur)))
+                continue
+            }
+            // 影像不夠鋭利但深度仍可用 → demote（不進訓練，深度照收）
+            if blur > kTrainBlurPx {
+                candidates.append((records[i].id, .demote, Float(blur / kGeomBlurPx)))
                 continue
             }
             let ref = percentile(peers, 0.75)

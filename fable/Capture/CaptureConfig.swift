@@ -188,8 +188,19 @@ nonisolated struct CaptureConfig: Sendable {
     /// 孤立點移除：占據 voxel 的 26 鄰域中占據數少於此值 → 視為飄浮雜點剔除（0 = 關閉）。
     /// 專清空間中不貼表面的白霧；過大會咬掉細線/薄物，3 為保守值。
     var refuseMinNeighbors = 3
-    /// 只接受此信心等級以上的深度（2 = ARConfidenceLevel.high）
-    var minDepthConfidence: UInt8 = 2
+    /// 只接受此信心等級以上的深度（ARConfidenceLevel：0=low, 1=medium, 2=high）。
+    ///
+    /// 從 2（只收 high）放寬到 1（收 medium）。medium 大多出現在物體邊緣、
+    /// 深色表面與較遠處 —— 比較吵，但**不是錯的**，而且飛點過濾
+    /// （depthEdgeRejectRatio）與孤立點移除本來就會擋掉真正的壞值。
+    /// 實機 log 顯示 26.4% 的格子完全沒有 LiDAR 覆蓋、只靠 mesh 撐著；
+    /// 在覆蓋率這麼吃緊的情況下，把可用但較吵的觀測整片丟掉並不划算 ——
+    /// 收進來給低權重，讓多視角加權平均自己決定要不要相信它。
+    var minDepthConfidence: UInt8 = 1
+    /// medium 信心深度的分數倍率（high = 1.0）。
+    /// 0.4 使得「一次 high 觀測」勝過「兩次 medium」，high 存在時由它主導；
+    /// 只有在完全沒有 high 的格子，medium 才成為唯一來源 —— 那正是要補的洞。
+    var mediumConfidenceWeight: Float = 0.4
     /// 深度圖取樣步長（256×192 下 stride 2 → 每次融合約 1.2 萬個候選點）
     var depthSampleStride = 2
     /// 點雲融合的深度有效範圍（LiDAR 超過 5m 雜訊明顯）
