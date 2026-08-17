@@ -15,8 +15,7 @@ struct HUDOverlay: View {
             severeGlow
             VStack(spacing: 10) {
                 header
-                warningBanner
-                coverageHintBanner
+                guidanceBanner
                 fusionLegend
                 speedGauge
                 HStack {
@@ -33,6 +32,8 @@ struct HUDOverlay: View {
         .animation(.easeInOut(duration: 0.25), value: controller.assessment.worst)
         .animation(.easeInOut(duration: 0.25), value: controller.phase)
         .animation(.easeInOut(duration: 0.25), value: controller.coverageHint)
+        .animation(.easeInOut(duration: 0.25), value: controller.loopHint)
+        .animation(.easeInOut(duration: 0.25), value: controller.relocalizing)
     }
 
     // MARK: - 全螢幕紅框：遮斷級警告（暫停抓幀中）的強視覺提示
@@ -47,20 +48,65 @@ struct HUDOverlay: View {
         }
     }
 
-    // MARK: - 缺角提醒：往哪補掃（物件模式圓頂；擋掉遮斷級警告時不搶版面）
+    // MARK: - 單一提示插槽（依優先序只顯示最重要的一則）
+
+    /// 四種提示（重定位／品質警告／迴環／缺角）**共用一個位置**。
+    ///
+    /// 它們原本各佔一條橫幅，最壞情況同時出現四條把取景畫面塞滿 ——
+    /// 而使用者在任一時刻只能對一件事做出反應，多餘的那幾條只是雜訊。
+    /// 優先序即「現在最該做什麼」：
+    ///   1. 重定位中   姿態不可信、快門也被擋住，其他都不重要
+    ///   2. 遮斷級警告 正在暫停抓幀，不處理就一直沒有資料
+    ///   3. 迴環提示   影響全域精度，且錯過就補不回來
+    ///   4. 缺角提醒   局部覆蓋，之後還能補
+    ///   5. 提醒級警告 照拍，只是品質差一點
+    private struct Guidance {
+        let text: String
+        let symbol: String
+        let background: Color
+        let foreground: Color
+    }
+
+    private var guidance: Guidance? {
+        if controller.relocalizing {
+            return Guidance(text: "重新定位中：請把鏡頭對準上次掃描過的區域",
+                            symbol: "point.3.connected.trianglepath.dotted",
+                            background: .blue.opacity(0.9), foreground: .white)
+        }
+        guard controller.phase == .scanning else { return nil }
+        let a = controller.assessment
+        if a.captureBlocked, let w = a.worst {
+            return Guidance(text: w.message, symbol: w.symbol,
+                            background: .red.opacity(0.88), foreground: .white)
+        }
+        if let hint = controller.loopHint {
+            return Guidance(text: hint, symbol: "arrow.triangle.capsulepath",
+                            background: .yellow.opacity(0.92), foreground: .black)
+        }
+        if let hint = controller.coverageHint {
+            return Guidance(text: hint, symbol: "scope",
+                            background: .orange.opacity(0.85), foreground: .white)
+        }
+        if let w = a.worst {
+            return Guidance(text: w.message, symbol: w.symbol,
+                            background: .orange.opacity(0.88), foreground: .white)
+        }
+        return nil
+    }
 
     @ViewBuilder
-    private var coverageHintBanner: some View {
-        if controller.phase == .scanning, !controller.assessment.captureBlocked,
-           let hint = controller.coverageHint {
-            Label(hint, systemImage: "scope")
+    private var guidanceBanner: some View {
+        if let g = guidance {
+            Label(g.text, systemImage: g.symbol)
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white)
+                .foregroundStyle(g.foreground)
+                .multilineTextAlignment(.center)
                 .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(Color.orange.opacity(0.85), in: Capsule())
+                .background(g.background, in: Capsule())
                 .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
+
 
     /// 熱圖圖例。只在熱圖模式顯示 —— 顏色本身要能自我解釋。
     /// 量的是「從幾個不同方向看過」而非次數：站著不動連拍不會讓顏色前進，
@@ -166,27 +212,17 @@ struct HUDOverlay: View {
         }
     }
 
+    private static func ago(_ d: Date) -> String {
+        let s = Int(Date().timeIntervalSince(d))
+        if s < 90 { return "剛剛" }
+        if s < 3600 { return "\(s / 60) 分鐘前" }
+        if s < 86400 { return "\(s / 3600) 小時前" }
+        return "\(s / 86400) 天前"
+    }
+
     private var storageEstimate: String {
         let mb = Double(controller.keyframeCount) * 0.62
         return mb < 1000 ? String(format: "%.0f MB", mb) : String(format: "%.1f GB", mb / 1000)
-    }
-
-    // MARK: - 警告膠囊（只顯示最嚴重一項）
-
-    @ViewBuilder
-    private var warningBanner: some View {
-        if controller.phase == .scanning, let worst = controller.assessment.worst {
-            // 紅 = 遮斷級（暫停抓幀），橘 = 提醒級（照拍）
-            Label(worst.message, systemImage: worst.symbol)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 9)
-                .background(controller.assessment.captureBlocked
-                            ? Color.red.opacity(0.88) : Color.orange.opacity(0.88),
-                            in: Capsule())
-                .transition(.move(edge: .top).combined(with: .opacity))
-        }
     }
 
     // MARK: - 移動速度儀（綠＝安全、橘＝輕微模糊、紅＝暫停抓幀）
@@ -251,6 +287,25 @@ struct HUDOverlay: View {
     private var bottomControls: some View {
         VStack(spacing: 14) {
             if controller.phase == .idle {
+                // 延續上次座標系：跨 session 掃下一個房間時，兩份資料才拼得起來。
+                // 同一次 session 內的續掃 ARKit 會自動重定位，不需要這個。
+                if let info = WorldMapStore.latestInfo() {
+                    Toggle(isOn: Binding(
+                        get: { controller.continueFromLastMap },
+                        set: { controller.setContinueFromLastMap($0) })) {
+                        Label(String(format: "延續上次座標系（%.1f MB · %@）",
+                                     Double(info.bytes) / 1_048_576,
+                                     Self.ago(info.modified)),
+                              systemImage: "point.3.filled.connected.trianglepath.dotted")
+                            .font(.caption.weight(.medium))
+                    }
+                    .tint(.blue)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .foregroundStyle(.white)
+                }
+
                 // 相機參數鎖定開關（預設開啟）：按快門當下鎖定曝光/白平衡。
                 // 對焦刻意不在此列 —— 鎖對焦＝凍結景深，離開起始距離就糊。
                 Toggle(isOn: $controller.lockCameraParams) {
@@ -302,8 +357,53 @@ struct HUDOverlay: View {
         }
     }
 
+    /// 掃描品質摘要。這些數字原本只印在 log 裡，使用者看不到 ——
+    /// 而「漂移多少、迴環有沒有閉合」正是判斷這份資料能不能用的依據。
+    /// 只顯示需要注意的項目：一切正常時整張卡不出現，不佔版面。
+    @ViewBuilder
+    private var scanSummaryCard: some View {
+        if let s = controller.scanSummary, !summaryRows(s).isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(summaryRows(s), id: \.text) { row in
+                    Label(row.text, systemImage: row.symbol)
+                        .font(.caption)
+                        .foregroundStyle(row.tint)
+                }
+            }
+            .padding(.horizontal, 14).padding(.vertical, 9)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private func summaryRows(_ s: ScanSummary) -> [(text: String, symbol: String, tint: Color)] {
+        var rows: [(String, String, Color)] = []
+        // 迴環：未閉合代表 ARKit 沒機會做全域修正，遠端誤差留在資料裡
+        if s.traveledM >= 8 && !s.loopClosed {
+            rows.append((String(format: "走了 %.0fm 未回起點 —— 遠端可能有累積漂移", s.traveledM),
+                         "arrow.triangle.capsulepath", .orange))
+        }
+        // 漂移修正幅度：大代表這次追蹤本來就飄，全域幾何可信度低
+        if s.driftMaxCm >= 10 {
+            rows.append((String(format: "姿態修正 中位數 %.0fcm / 最大 %.0fcm",
+                                s.driftMedianCm, s.driftMaxCm),
+                         "scope", s.driftMaxCm >= 30 ? .red : .orange))
+        }
+        if s.blurDropped + s.blurDemoted > 0 {
+            rows.append((s.blurDropped > 0
+                         ? "排除 \(s.blurDropped) 幀（幾何不可信）、\(s.blurDemoted) 幀（顏色糊）"
+                         : "\(s.blurDemoted) 幀顏色糊，不進訓練但仍供點雲",
+                         "camera.metering.none", .secondary))
+        }
+        if let mb = s.worldMapMB {
+            rows.append((String(format: "世界地圖已存 %.1f MB —— 下次可延續同一座標系", mb),
+                         "point.3.filled.connected.trianglepath.dotted", .secondary))
+        }
+        return rows.map { (text: $0.0, symbol: $0.1, tint: $0.2) }
+    }
+
     private var reviewControls: some View {
         VStack(spacing: 12) {
+            scanSummaryCard
             // 平面圖預覽（只有 RoomPlan 真的產出東西時才出現）
             if let fp = controller.floorPlanData, !fp.walls.isEmpty {
                 Button {
@@ -457,8 +557,13 @@ struct HUDOverlay: View {
                 }
             }
         }
-        .disabled(controller.phase == .idle && !controller.trackingReady)
-        .opacity(controller.phase == .idle && !controller.trackingReady ? 0.4 : 1)
+        // 重定位未完成時姿態不可信，此時開拍等於把錯的外參寫進資料 —— 直接擋住
+        .disabled(shutterBlocked)
+        .opacity(shutterBlocked ? 0.4 : 1)
+    }
+
+    private var shutterBlocked: Bool {
+        controller.phase == .idle && (!controller.trackingReady || controller.relocalizing)
     }
 
     private var doneControls: some View {

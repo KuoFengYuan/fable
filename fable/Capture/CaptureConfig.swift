@@ -250,6 +250,18 @@ nonisolated struct CaptureConfig: Sendable {
     /// 只在支援 RoomPlan 的機型生效（見 FloorPlanCapture.isSupported）。
     var captureFloorPlan = true
 
+    // MARK: - 迴環閉合（降低累積漂移，投報率最高的一項）
+    /// 走多遠之後開始提示「回起點閉環」（公尺）。
+    ///
+    /// 為什麼需要提示：ARKit 只有在認出「我來過這裡」時才會做全域修正，
+    /// 把累積誤差攤回整條軌跡。走一條開放路徑不回頭的話，誤差一路累積、
+    /// 而且**不會有任何警告** —— 姿態看起來一樣正常，錯的是全域尺度與朝向。
+    /// 房間尺度的 VIO 漂移約軌跡長度的 0.5~2%，走 10m 就是 5~20cm。
+    var loopHintTravelM: Float = 8
+    /// 回到起點多近算閉合（公尺）。ARKit 的重定位需要看到相似的視野，
+    /// 1.5m 內大致就會觸發；太小會讓提示永遠不消失。
+    var loopClosedRadiusM: Float = 1.5
+
     // MARK: - 涵蓋率圓頂（物件模式）
     var domeAzimuthBins = 24
     var domeElevationBins = 5

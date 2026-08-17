@@ -69,6 +69,24 @@ nonisolated struct SessionMeta: Codable, Sendable {
     var lidarAvailable: Bool
 }
 
+/// 掃描結束後的品質摘要。
+/// 這些數字本來只走 print()，使用者完全看不到 —— 而它們正是判斷
+/// 「這次掃描能不能用、要不要重掃」的依據，應該當面講。
+nonisolated struct ScanSummary: Sendable {
+    var keyframes = 0
+    /// ARKit 回頭修正關鍵幀位置的幅度（公分）。大＝這次漂移嚴重、全域幾何可信度低
+    var driftMedianCm = 0.0
+    var driftMaxCm = 0.0
+    var traveledM = 0.0
+    /// 有沒有走回起點讓 ARKit 做全域修正。未閉合＝遠端的累積誤差留在資料裡了
+    var loopClosed = false
+    /// 掃描後複核排除的幀（幾何不可信 + 顏色糊）
+    var blurDropped = 0
+    var blurDemoted = 0
+    /// 世界地圖大小（MB）；nil = 沒存成（追蹤品質不足或超過上限）
+    var worldMapMB: Double?
+}
+
 /// 世界座標彩色點。score 為採集品質分數（距離近、靠畫面中心、低模糊 → 高分），
 /// 供 voxel 內擇優與匯出下採樣使用。
 nonisolated struct CloudPoint: Sendable {
