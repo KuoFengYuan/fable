@@ -33,6 +33,7 @@ struct HUDOverlay: View {
         .animation(.easeInOut(duration: 0.25), value: controller.phase)
         .animation(.easeInOut(duration: 0.25), value: controller.coverageHint)
         .animation(.easeInOut(duration: 0.25), value: controller.loopHint)
+        .animation(.easeInOut(duration: 0.25), value: controller.recentRejectCount >= 4)
         .animation(.easeInOut(duration: 0.25), value: controller.relocalizing)
     }
 
@@ -78,6 +79,12 @@ struct HUDOverlay: View {
         if a.captureBlocked, let w = a.worst {
             return Guidance(text: w.message, symbol: w.symbol,
                             background: .red.opacity(0.88), foreground: .white)
+        }
+        // 正在掉幀：這是實測結果不是推估，優先於所有「可能會怎樣」的提示
+        if controller.recentRejectCount >= 4 {
+            return Guidance(text: "畫面不夠清晰，已略過 \(controller.recentRejectCount) 次抓幀 —— 請放慢",
+                            symbol: "camera.metering.none",
+                            background: .red.opacity(0.85), foreground: .white)
         }
         if let hint = controller.loopHint {
             return Guidance(text: hint, symbol: "arrow.triangle.capsulepath",

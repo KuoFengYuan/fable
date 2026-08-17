@@ -90,6 +90,8 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var relocalizing = false
     /// 迴環閉合提示：走遠之後提醒回起點，讓 ARKit 修正整條軌跡的累積漂移
     @Published private(set) var loopHint: String?
+    /// 近 4 秒因清晰度不足而放棄的抓幀數（0 = 沒在掉幀）
+    @Published private(set) var recentRejectCount = 0
     /// 掃描品質摘要，review 階段顯示（原本只印在 log 裡，使用者看不到）
     @Published private(set) var scanSummary: ScanSummary?
 
@@ -119,6 +121,12 @@ final class CaptureController: NSObject, ObservableObject {
     private var lastWorldMapMB: Double?
     /// 因清晰度不足而放棄抓幀的次數（診斷用：拿來判斷門檻是否過嚴）
     private var sharpnessRejects = 0
+    /// 近幾秒被放棄的時間戳。用來即時告訴使用者「你正在掉幀」——
+    /// 這是**實測結果**，比 blurPixels 那個推估值可靠：實機 log 出現過
+    /// 「69% 的幀被清晰度閘門丟掉，但 HUD 全程沒有任何警告」，
+    /// 因為推估值(11.4px 中位數)沒到警告線(14px)，而清晰度閘門從 ~11px 就開始擋。
+    /// 與其去猜兩個門檻要怎麼對齊，不如直接把發生的事講出來。
+    private var recentRejects: [TimeInterval] = []
     private var frameCounter = 0
     private var pendingWrites = 0
     private var previewInFlight = false
@@ -271,6 +279,8 @@ final class CaptureController: NSObject, ObservableObject {
         keyframeCount = 0
         pointCount = 0
         sharpnessRejects = 0
+        recentRejects = []
+        recentRejectCount = 0
         scanStartPosition = nil
         lastTravelPosition = nil
         traveledM = 0
@@ -908,6 +918,9 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         }
 
         updateLoopClosure(frame)
+        // 掉幀率：只留近 4 秒。連續掉幀代表使用者正在流失資料而不自知
+        recentRejects.removeAll { frame.timestamp - $0 > 4 }
+        if recentRejectCount != recentRejects.count { recentRejectCount = recentRejects.count }
 
         // 過熱保護：critical 直接停拍並保住已拍資料
         if ProcessInfo.processInfo.thermalState == .critical {
@@ -953,6 +966,7 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         // 被擋下只是等幾幀：SmartShutter 的觸發條件在拍成之前一直成立。
         guard a.sharpnessRatio >= config.minSharpnessRatio else {
             sharpnessRejects += 1
+            recentRejects.append(frame.timestamp)
             return
         }
         guard pendingWrites < config.maxPendingWrites else { return }
