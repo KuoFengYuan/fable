@@ -42,18 +42,35 @@ nonisolated enum PointCloudMath {
 
     /// 分層擇優下採樣：逐級加粗格子、每格保留最高分，直到 ≤ target。
     /// 相比全域 top-K 不會把點擠在單一區域 —— 密度均勻且每處都是最佳樣本。
+    ///
+    /// 格距的成長率是**解析算出來的，不是固定 ×2**。點雲是嵌在 3D 裡的 2D 流形，
+    /// 占據格數 ∝ 1/格距²，所以格距加倍等於點數砍成 1/4 —— 固定 ×2 會嚴重過衝。
+    /// 實機出現過：332,251 格、上限 250,000，只需要砍 25%，結果一步跳到
+    /// 4.2cm 只剩 74,836 點（砍掉 77%）。
+    ///
+    /// 這不只是少了點：msplat 的初始高斯尺寸就等於 3-NN 點距，
+    /// 匯出端把點距放大 2 倍，初始高斯就跟著大 2 倍，密集化未必追得回來 ——
+    /// 與先前修過的「重融合靜默粗化」是同一種失效，只是發生在匯出端。
+    ///
+    /// 改為每輪由 √(count/target) 估出需要的格距，一兩步就收斂到接近上限。
     static func stratifiedBest(_ input: [CloudPoint], startCell: Float, target: Int) -> [CloudPoint] {
         var points = input
+        guard target > 0, points.count > target else { return points }
         var cellSize = startCell
-        while points.count > target {
-            var cells: [Int64: CloudPoint] = Dictionary(minimumCapacity: points.count / 4)
+        var rounds = 0
+        while points.count > target, rounds < 12 {   // rounds：防呆，正常 1~3 輪就結束
+            rounds += 1
+            // ×1.02 留一點餘裕（估計是統計性的，剛好壓線會多跑一輪）；
+            // 下限 1.03 保證一定有進展，不會卡死
+            let shrink = max(1.03, (Float(points.count) / Float(target)).squareRoot() * 1.02)
+            cellSize *= shrink
+            var cells: [Int64: CloudPoint] = Dictionary(minimumCapacity: points.count / 2)
             for pt in points {
                 guard let key = voxelKey(SIMD3<Float>(pt.x, pt.y, pt.z), size: cellSize) else { continue }
                 if let old = cells[key], old.score >= pt.score { continue }
                 cells[key] = pt
             }
             points = Array(cells.values)
-            cellSize *= 2
         }
         return points
     }
@@ -171,7 +188,9 @@ nonisolated struct FusedVoxelGrid {
                                      r: c8(cell.color.x), g: c8(cell.color.y), b: c8(cell.color.z),
                                      score: cell.bestScore * min(1, cell.weight / 1.5)))
         }
-        return PointCloudMath.stratifiedBest(points, startCell: voxelSize * 2, target: target)
+        // 起始格距用原生 voxelSize：加粗多少交給解析步長決定。
+        // 先前預設 ×2 等於還沒開始就先砍掉 4 倍的點。
+        return PointCloudMath.stratifiedBest(points, startCell: voxelSize, target: target)
     }
 }
 
