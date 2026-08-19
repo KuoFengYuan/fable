@@ -218,21 +218,34 @@ nonisolated enum FeatureExtractor {
                 let du = Int(uFull * sx), dv = Int(vFull * sy)
                 guard du >= 0, dv >= 0, du < dw, dv < dh else { continue }
                 let di = dv * dw + du
-                let z = dep[di]
+                let z0 = dep[di]
                 // BA 的 3D 只用 high confidence：這一步求位姿，寧可少也要準
-                guard z.isFinite, z > minDepth, z < maxDepth, (conf?[di] ?? 2) >= 2 else { continue }
+                guard z0.isFinite, z0 > minDepth, z0 < maxDepth,
+                      (conf?[di] ?? 2) >= 2 else { continue }
                 // 深度邊緣拒絕：3×3 鄰域必須一致，否則這個角點的 3D 不可信（見 depthEdgeReject）
                 guard du >= 1, dv >= 1, du < dw - 1, dv < dh - 1 else { continue }
                 var edgeOK = true
-                let tol = z * FeatureParams.depthEdgeReject
+                let tol = z0 * FeatureParams.depthEdgeReject
                 for ny in -1...1 {
                     for nx in -1...1 {
                         let nz = dep[(dv + ny) * dw + (du + nx)]
-                        if !nz.isFinite || abs(nz - z) > tol { edgeOK = false; break }
+                        if !nz.isFinite || abs(nz - z0) > tol { edgeOK = false; break }
                     }
                     if !edgeOK { break }
                 }
                 guard edgeOK else { continue }
+
+                // **雙線性內插深度**，不用最近鄰。
+                //
+                // 深度圖 256×192 對影像 1920×1440 是 7.5 倍落差 —— 一個深度像素橫跨
+                // 7.5 個影像像素。用最近鄰等於「拿一個 7.5px 方塊的深度代表一個
+                // 次像素定位的特徵」，在傾斜表面上誤差可達公分級。
+                // 實機量到深度殘差 2.0cm，遠大於 LiDAR 本身的 σ≈1cm，差額就是這個。
+                // 上面的邊緣拒絕已保證局部是平滑的（3% 內），所以線性項可靠、值得內插。
+                let fu = uFull * sx - Float(du), fv = vFull * sy - Float(dv)
+                let z = (1 - fv) * ((1 - fu) * dep[di] + fu * dep[di + 1])
+                      + fv * ((1 - fu) * dep[di + dw] + fu * dep[di + dw + 1])
+                guard z.isFinite, z > minDepth, z < maxDepth else { continue }
 
                 var patch = [UInt8](repeating: 0, count: side * side)
                 var sum: Float = 0
