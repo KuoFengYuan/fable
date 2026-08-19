@@ -70,11 +70,21 @@ nonisolated enum FeatureParams {
     static let gridRows = 18
     /// Shi-Tomasi 最小特徵值門檻（8-bit 影像的經驗值）。太低會收進平坦區的雜訊
     static let minCornerResponse: Float = 120
-    /// 引導搜尋半徑（全解析度像素）。ARKit 位姿的殘差量級是十幾 px，
-    /// 16 給了足夠餘裕又不至於讓誤匹配變多
-    static let searchRadius: Float = 16
-    /// ZNCC 接受門檻
-    static let minZNCC: Float = 0.80
+    /// 引導搜尋半徑（全解析度像素）。ARKit 位姿殘差約十幾 px，
+    /// 但深度取樣誤差也會讓引導位置偏掉，故留到 28（實測 16 太窄，匹配產出率只有 ~15/幀）
+    static let searchRadius: Float = 28
+    /// ZNCC 接受門檻。0.80 對「9×9 patch ＋ 6° 視角變化」偏嚴 ——
+    /// patch 沒有旋轉補償，6° 就足以讓相關性掉一截。0.70 仍遠高於雜訊水準。
+    static let minZNCC: Float = 0.70
+    /// 深度邊緣拒絕比例：特徵所在的 3×3 深度鄰域若彼此差異超過 depth×此值就不要。
+    ///
+    /// **這是匹配產出率的關鍵。** 角點天生偏好長在深度不連續處（物體輪廓），
+    /// 而深度圖只有 256×192 —— 一個深度像素橫跨 7.5 個影像像素。
+    /// 於是「我們最愛偵測的那些點」正好是深度最不可信的地方：
+    /// 取到前景或背景差之毫釐，3D 位置就差很多，引導投影跟著錯掉幾十個像素、
+    /// 落在搜尋半徑外 → 匹配失敗。實機實測：2224 個特徵只長出 68 條 track。
+    /// 只留深度局部平滑的角點，數量少一些但每一個都可靠。
+    static let depthEdgeReject: Float = 0.03
     /// 最佳/次佳比值檢定：次佳太接近就視為模糊匹配、丟棄
     static let maxSecondBestRatio: Float = 0.9
     /// 每幀往回匹配幾幀。3~5 幀給出足夠長的 track，又不會讓成本線性爆掉
@@ -167,6 +177,18 @@ nonisolated enum FeatureExtractor {
                 let z = dep[di]
                 // BA 的 3D 只用 high confidence：這一步求位姿，寧可少也要準
                 guard z.isFinite, z > minDepth, z < maxDepth, (conf?[di] ?? 2) >= 2 else { continue }
+                // 深度邊緣拒絕：3×3 鄰域必須一致，否則這個角點的 3D 不可信（見 depthEdgeReject）
+                guard du >= 1, dv >= 1, du < dw - 1, dv < dh - 1 else { continue }
+                var edgeOK = true
+                let tol = z * FeatureParams.depthEdgeReject
+                for ny in -1...1 {
+                    for nx in -1...1 {
+                        let nz = dep[(dv + ny) * dw + (du + nx)]
+                        if !nz.isFinite || abs(nz - z) > tol { edgeOK = false; break }
+                    }
+                    if !edgeOK { break }
+                }
+                guard edgeOK else { continue }
 
                 var patch = [UInt8](repeating: 0, count: side * side)
                 var sum: Float = 0
@@ -221,11 +243,19 @@ actor FeatureTracker {
     private var frames: [FrameFeatures] = []
     private var nextTrackID = 0
     private(set) var matchCount = 0
+    /// 匹配失敗的原因統計 —— 產出率不足時要能指出是哪一關卡住的，
+    /// 而不是只看到「BA 沒跑」
+    private var attempted = 0
+    private var outOfView = 0
+    private var noCandidate = 0
+    private var lowScore = 0
+    private var ambiguous = 0
 
     func reset() {
         frames.removeAll()
         nextTrackID = 0
         matchCount = 0
+        attempted = 0; outOfView = 0; noCandidate = 0; lowScore = 0; ambiguous = 0
     }
 
     /// 加入一幀：抽取 → 對最近數幀做引導式匹配 → 歸入既有 track 或開新 track
@@ -241,9 +271,12 @@ actor FeatureTracker {
         let r2 = FeatureParams.searchRadius * FeatureParams.searchRadius
 
         for prev in frames.suffix(FeatureParams.matchAgainstRecent) {
-            for pf in prev.features where pf.trackID >= 0 || true {
+            for pf in prev.features {
+                attempted += 1
                 // 用**已知位姿**把前一幀的 3D 特徵投影到本幀 → 預期位置
-                guard let (pu, pv) = Self.project(pf.world, w2c: w2c, K: K) else { continue }
+                guard let (pu, pv) = Self.project(pf.world, w2c: w2c, K: K) else {
+                    outOfView += 1; continue
+                }
                 var bestIdx = -1
                 var best: Float = -1, second: Float = -1
                 for (i, f) in feats.enumerated() where f.trackID < 0 {
@@ -253,9 +286,12 @@ actor FeatureTracker {
                     if s > best { second = best; best = s; bestIdx = i }
                     else if s > second { second = s }
                 }
-                guard bestIdx >= 0, best >= FeatureParams.minZNCC else { continue }
+                guard bestIdx >= 0 else { noCandidate += 1; continue }
+                guard best >= FeatureParams.minZNCC else { lowScore += 1; continue }
                 // 比值檢定：次佳太接近代表這區域自相似（磁磚、格紋），寧可不要
-                if second > 0, second / best > FeatureParams.maxSecondBestRatio { continue }
+                if second > 0, second / best > FeatureParams.maxSecondBestRatio {
+                    ambiguous += 1; continue
+                }
 
                 if pf.trackID >= 0 {
                     feats[bestIdx].trackID = pf.trackID
@@ -306,10 +342,21 @@ actor FeatureTracker {
         return out
     }
 
-    /// 診斷用摘要
-    func stats() -> (frames: Int, features: Int, tracks: Int, observations: Int) {
+    /// 診斷用摘要。含匹配失敗原因分解 —— 產出率不足時必須能指出卡在哪一關，
+    /// 否則只會看到「BA 沒跑」而不知道要改什麼。
+    func stats() -> String {
         let obs = observations()
-        return (frames.count, frames.reduce(0) { $0 + $1.features.count },
-                Set(obs.map(\.trackID)).count, obs.count)
+        let feats = frames.reduce(0) { $0 + $1.features.count }
+        let perFrame = frames.isEmpty ? 0 : obs.count / frames.count
+        var s = "特徵追蹤: \(frames.count) 幀 / \(feats) 特徵 / "
+        s += "\(Set(obs.map(\.trackID)).count) tracks / \(obs.count) 觀測"
+        s += "（每幀 \(perFrame)，BA 需要 ≥\(BundleAdjuster.kMinObsPerFrame)）"
+        if attempted > 0 {
+            s += String(format: "\n  匹配 %d/%d (%.0f%%)：出畫面 %d、半徑內無候選 %d、"
+                        + "ZNCC 不足 %d、模糊匹配 %d",
+                        matchCount, attempted, Double(matchCount) * 100 / Double(attempted),
+                        outOfView, noCandidate, lowScore, ambiguous)
+        }
+        return s
     }
 }

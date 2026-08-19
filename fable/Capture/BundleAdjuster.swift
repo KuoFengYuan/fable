@@ -86,8 +86,15 @@ nonisolated enum BundleAdjuster {
             obsByFrame[o.frameID, default: []].append(o)
         }
         // 只留觀測足夠的幀
+        let framesBefore = order.count
         order = order.filter { (obsByFrame[$0]?.count ?? 0) >= kMinObsPerFrame }
-        guard order.count >= 3 else { return result }
+        guard order.count >= 3 else {
+            // 不要靜默返回 —— 「完全沒有輸出」看起來像功能沒做，而不是條件不足
+            print("BA: 略過 —— \(framesBefore) 幀中只有 \(order.count) 幀的觀測數達 "
+                  + "\(kMinObsPerFrame)（共 \(observations.count) 個觀測）。"
+                  + "特徵匹配產出率不足，原因見上方「匹配」分解")
+            return result
+        }
 
         /// track 的 3D 位置＝所有觀測到它的幀給出的 LiDAR 世界座標平均。
         /// 每輪重算一次：位姿改了，同一個 track 的各幀反投影也跟著改。

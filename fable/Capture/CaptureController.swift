@@ -359,9 +359,7 @@ final class CaptureController: NSObject, ObservableObject {
         //   · 必須在 BlurFilter 與重融合**之前** —— 它們都吃姿態，晚了就白做
         if config.baRounds > 0 {
             let obs = await featureTracker.observations()
-            let st = await featureTracker.stats()
-            print("特徵追蹤: \(st.frames) 幀 / \(st.features) 特徵 / "
-                  + "\(st.tracks) tracks / \(st.observations) 觀測")
+            print(await featureTracker.stats())
             let ba = BundleAdjuster.refine(records: refinedRecords, observations: obs,
                                            rounds: config.baRounds)
             if ba.roundsApplied > 0 {
