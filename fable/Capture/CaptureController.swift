@@ -896,12 +896,28 @@ final class CaptureController: NSObject, ObservableObject {
         let med = deltas[deltas.count / 2], worst = deltas[deltas.count - 1]
         s.driftMedianCm = med * 100
         s.driftMaxCm = worst * 100
-        print(String(format: "漂移修正: 中位數 %.1f cm / 最大 %.1f cm；" +
-                     "行走 %.1f m，迴環%@",
-                     med * 100, worst * 100, traveledM, loopClosed ? "已閉合" : "**未閉合**"))
-        if !loopClosed && traveledM >= config.loopHintTravelM {
-            print("  ⚠️ 走了 \(Int(traveledM))m 但沒有回到起點 —— "
-                  + "ARKit 沒有機會做全域修正，遠端的累積誤差留在資料裡了")
+
+        // 兩種修正的形狀完全不同，混為一談會誤導：
+        //   累積漂移      中位數 ≪ 最大值（誤差沿軌跡累積，早期的幀幾乎沒動）
+        //   重定位跳變    中位數 ≈ 最大值（整組幀一起位移，把世界對齊到舊地圖）
+        // 實機出現過「中位數 34.3cm / 最大 34.4cm、只走了 0.9m」——
+        // 那不是 38% 的漂移率，是開了「延續上次座標系」後 ARKit 重定位的全域對齊量。
+        let uniform = worst > 0.02 && med / worst > 0.9
+        if uniform {
+            print(String(format: "全域重定位: 整組位姿一致位移 %.1f cm"
+                         + "（中位數≈最大值 ⇒ 世界座標系被對齊到舊地圖，不是累積漂移）",
+                         med * 100))
+        } else {
+            print(String(format: "漂移修正: 中位數 %.1f cm / 最大 %.1f cm（行走 %.1f m）",
+                         med * 100, worst * 100, traveledM))
+        }
+        // 迴環只在「走得夠遠、本來就該閉環」時才值得提。
+        // 走 0.9m 也印「未閉合」只是噪音 —— 那種距離根本無所謂閉不閉。
+        if traveledM >= config.loopHintTravelM {
+            print(loopClosed
+                  ? "  迴環已閉合 —— ARKit 有機會做全域修正"
+                  : "  ⚠️ 走了 \(Int(traveledM))m 但沒有回到起點，"
+                    + "ARKit 沒有機會做全域修正，遠端的累積誤差留在資料裡了")
         }
     }
 

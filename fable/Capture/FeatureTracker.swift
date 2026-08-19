@@ -359,13 +359,23 @@ actor FeatureTracker {
 
     /// 世界座標 → 影像座標。ARKit GL 慣例：相機看 -Z、Y 朝上，
     /// 與 RefusionEngine 的反投影 (xc, -yc, -z) 互為逆運算。
+    ///
+    /// **會檢查畫面邊界。** 先前只判「在相機後方」，於是投影到畫面外的特徵
+    /// 全被計入「半徑內無候選」—— 匹配率的分母因此嚴重高估，
+    /// 實機診斷出現過「出畫面 0、無候選 57%」這種不可能的分佈
+    /// （往回比對 4 幀＝最多相隔 0.4m/24°，大量特徵理應飛出視野）。
     static func project(_ world: SIMD3<Float>, w2c: simd_float4x4,
                        K: CameraIntrinsics) -> (Float, Float)? {
         let pc = w2c * SIMD4<Float>(world, 1)
         guard pc.z < -1e-4 else { return nil }        // 在相機後方
         let d = -pc.z
-        return (Float(K.cx) + pc.x * Float(K.fx) / d,
-                Float(K.cy) - pc.y * Float(K.fy) / d)
+        let u = Float(K.cx) + pc.x * Float(K.fx) / d
+        let v = Float(K.cy) - pc.y * Float(K.fy) / d
+        // 邊界留一點餘裕（搜尋半徑）：剛好在邊上的特徵仍可能匹配到畫面內的角點
+        let m = FeatureParams.searchRadius
+        guard u >= -m, v >= -m,
+              u < Float(K.width) + m, v < Float(K.height) + m else { return nil }
+        return (u, v)
     }
 
     /// 匯出給 BA 的觀測。只留長度足夠的 track —— 短 track 對位姿幾乎沒有約束力，

@@ -140,12 +140,19 @@ nonisolated enum BundleAdjuster {
         guard result.roundsApplied > 0 else { return result }
         result.poses = bestPoses
         if let a = result.residualsPx.first, let b = result.residualsPx.last {
-            print(String(format: "BA: %d 幀 / %d 觀測 / %d tracks × %d 輪 → 重投影 RMS "
-                         + "%.2f → %.2f px（改善 %.0f%%，等效位姿誤差 %.1f → %.1f cm @2m）",
+            // 位姿解讀只能用**重投影項**：深度項被 LiDAR 雜訊主導，
+            // 把它算進去會把量測雜訊當成位姿誤差
+            let rEnd = residuals(order: order, poses: poses, intr: intr,
+                                 obsByFrame: obsByFrame, points: trackPoints())
+            print(String(format: "BA: %d 幀 / %d 觀測 / %d tracks × %d 輪 → "
+                         + "總 RMS %.2f → %.2f px（改善 %.0f%%）",
                          order.count, observations.count,
                          Set(observations.map(\.trackID)).count, result.roundsApplied,
-                         a, b, (1 - b / a) * 100,
-                         Double(a) * 2 / 1450 * 100, Double(b) * 2 / 1450 * 100))
+                         a, b, (1 - b / a) * 100))
+            print(String(format: "  分項: 重投影 %.2f px（⇒ 位姿誤差 %.2f cm @2m）、"
+                         + "深度 %.2f px（≈ LiDAR 雜訊 %.1f cm，非位姿誤差）",
+                         rEnd.reproj, Double(rEnd.reproj) * 2 / 1450 * 100,
+                         rEnd.depth, Double(rEnd.depth) * 2 / 1450 * 100))
         }
         return result
     }
@@ -308,7 +315,23 @@ nonisolated enum BundleAdjuster {
                                 intr: [Int: CameraIntrinsics],
                                 obsByFrame: [Int: [FeatureObservation]],
                                 points: [Int: SIMD3<Float>]) -> Float {
-        var sum: Double = 0
+        let r = residuals(order: order, poses: poses, intr: intr,
+                          obsByFrame: obsByFrame, points: points)
+        return r.total
+    }
+
+    /// 分開回報重投影與深度殘差。
+    ///
+    /// **必須分開看。** 深度殘差的雜訊來源是 LiDAR（σ≈1cm @2m ⇒ 約 7px 等效），
+    /// 混進總 RMS 之後再換算成「等效位姿誤差」會把量測雜訊算成位姿誤差 ——
+    /// 實機出現過「總 RMS 14.8px ⇒ 聲稱位姿誤差 2.0cm」，但同一份 log 的
+    /// 漂移修正只有 0.4cm，兩者矛盾。只有重投影項才適合做位姿解讀。
+    static func residuals(order: [Int], poses: [Int: simd_float4x4],
+                          intr: [Int: CameraIntrinsics],
+                          obsByFrame: [Int: [FeatureObservation]],
+                          points: [Int: SIMD3<Float>])
+        -> (total: Float, reproj: Float, depth: Float) {
+        var sum: Double = 0, sumR: Double = 0, sumD: Double = 0
         var n = 0
         for id in order {
             guard let c2w = poses[id], let K = intr[id], let obs = obsByFrame[id] else { continue }
@@ -322,16 +345,23 @@ nonisolated enum BundleAdjuster {
                 let up = Float(K.cx) + pc.x * fx / d
                 let vp = Float(K.cy) - pc.y * Float(K.fy) / d
                 let du = Double(o.u - up), dv = Double(o.v - vp)
-                var m2 = du * du + dv * dv
-                if m2 > Double(kMaxResidualPx * kMaxResidualPx) { continue }
+                let r2 = du * du + dv * dv
+                if r2 > Double(kMaxResidualPx * kMaxResidualPx) { continue }
+                var m2 = r2
+                var d2: Double = 0
                 if kDepthWeight > 0 {
                     let rd = Double((d - o.depth) * (fx / d) * kDepthWeight)
-                    m2 += rd * rd
+                    d2 = rd * rd
+                    m2 += d2
                 }
-                sum += m2
+                sum += m2; sumR += r2; sumD += d2
                 n += 1
             }
         }
-        return n > 0 ? Float((sum / Double(n)).squareRoot()) : .infinity
+        guard n > 0 else { return (.infinity, .infinity, .infinity) }
+        let k = Double(n)
+        return (Float((sum / k).squareRoot()),
+                Float((sumR / k).squareRoot()),
+                Float((sumD / k).squareRoot()))
     }
 }
