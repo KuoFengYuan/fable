@@ -72,19 +72,22 @@ final class FloorPlanCapture: NSObject, ObservableObject {
     /// 等 didEndWith 把 CapturedRoomData 交回來。帶逾時，避免 delegate 不觸發時卡住整個流程
     /// （寧可少一張平面圖，不能讓掃描結果匯不出去）。
     func waitForSegment(timeout: TimeInterval = 8) async {
-        guard capturing else { return }
+        guard capturing else { return }      // idempotent：已收完就直接返回
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             endContinuation = c
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(timeout))
                 if self?.endContinuation != nil {
-                    print("[FloorPlan] 等待 RoomPlan 最終資料逾時（\(timeout)s），略過平面圖")
+                    // 這不是失敗：build() 會再等一次（見 build()），
+                    // 資料晚到仍然算得出平面圖。這裡放行只是為了不擋住 session.pause()。
+                    print("[FloorPlan] RoomPlan 最終資料尚未送達（等了 \(Int(timeout))s），"
+                          + "先繼續後續處理 —— 建模時會再等")
                 }
                 self?.releaseWait()
             }
         }
-        session = nil
         capturing = false
+        session = nil
     }
 
     private func releaseWait() {
@@ -114,6 +117,16 @@ final class FloorPlanCapture: NSObject, ObservableObject {
     /// 把累積的所有段落建成平面圖。單段直接用，多段用 StructureBuilder 合併成整層。
     /// 這一步是重運算（秒級），呼叫端應在 processing 階段做、別擋在 UI 上。
     func build() async -> FloorPlanData? {
+        // 先確保最後一段資料已到手。
+        //
+        // 為什麼這裡要再等一次：stopScan 已經 await 過 waitForSegment，但那一次是為了
+        // 「在 ARSession.pause() 之前把資料收完」，有較短的逾時。
+        // 而 build() 現在與重融合並行（重融合只花 ~0.6s），若 RoomPlan 的最終資料
+        // 稍晚才到，build() 會看到空的 segments 而回 nil ——
+        // 實機 log 出現過「逾時 8s、略過平面圖」但後來平面圖又出來了，
+        // 就是這個競態剛好賭贏。waitForSegment 是 idempotent 的（capturing 為 false 時直接返回），
+        // 所以在這裡再等一次是安全的，也讓結果不再靠運氣。
+        await waitForSegment(timeout: 20)
         guard !segments.isEmpty else { return nil }
         do {
             let rs = try await rooms()
@@ -153,6 +166,8 @@ final class FloorPlanCapture: NSObject, ObservableObject {
 
 extension FloorPlanCapture: @preconcurrency RoomCaptureSessionDelegate {
 
+    /// 注意：這個回呼**可能在 waitForSegment 逾時之後才到**。
+    /// 那不是錯誤 —— 資料照樣收下，build() 會拿到它（build 內也會再等一次）。
     func captureSession(_ session: RoomCaptureSession,
                         didEndWith data: CapturedRoomData, error: Error?) {
         if let error {
