@@ -37,6 +37,17 @@ nonisolated struct PoseRefineResult: Sendable {
     /// 它才是決定 3DGS 解析度天花板的量（1cm 位姿誤差 @2m ≈ 7px）
     var residualsPx: [Float] = []
     var roundsApplied = 0
+    /// 交叉驗證：保留集（未參與求解的 track）的重投影中位數，修正前 → 修正後（像素）。
+    /// **這是唯一一個不在目標函數裡的數字** —— 其餘都是 BA 自己在最小化的量，
+    /// 下降是必然的。只有這一對能分辨「位姿真的變好」與「把觀測雜訊吸進位姿」。
+    /// 見 BundleAdjuster.kHoldoutEvery。保留集太小時為 nil。
+    var holdoutMedianPx: (before: Float, after: Float)?
+
+    /// 保留集改善率（負值＝變好）。nil 代表沒量到。
+    var holdoutDelta: Double? {
+        guard let h = holdoutMedianPx, h.before > 1e-6 else { return nil }
+        return Double(h.after / h.before) - 1
+    }
 
     var improvedPercent: Double {
         guard let first = residualsM.first, let last = residualsM.last, first > 1e-9 else { return 0 }

@@ -275,6 +275,31 @@ import simd
         check(j1.cm < j0.cm * 1.3,
               String(format: "全垃圾觀測 → 位姿誤差 %.2f → %.2f cm（不得顯著惡化）", j0.cm, j1.cm))
 
+        // ── 6. 保留集要看得到真訊號（true positive）──
+        // 沿用第 2 案：含雜訊觀測 + 2cm/0.4° 擾動，確實有位姿誤差可修。
+        // 保留集的 track 完全沒進求解，它下降就代表位姿真的變好了。
+        check((rN.holdoutDelta ?? 0) < -0.05,
+              String(format: "保留集｜有真實位姿誤差 → 中位數 %.2f → %.2f px（%+.0f%%，應明顯下降）",
+                     rN.holdoutMedianPx?.before ?? 0, rN.holdoutMedianPx?.after ?? 0,
+                     (rN.holdoutDelta ?? 0) * 100))
+
+        // ── 7. 保留集不得謊報（false positive）──
+        //
+        // **這是整個交叉驗證機制存在的理由。** 位姿已經是真值，觀測雜訊很大，
+        // 所以 BA 做的任何事都只可能是在擬合雜訊。此時：
+        //   · 目標函數（BA 自己最小化的量）**必然**下降 —— 這正是我先前一直誤讀的數字
+        //   · 保留集不在目標函數裡，必須看得出來那個下降是假的
+        // 若這一項失敗，保留集就跟其他數字一樣沒有判別力，實機 log 會再次誤導我。
+        seed = 8888
+        let obsNoisy = observations(points: pts, poses: truth, noisePx: 3.0, noiseDepthM: 0.03)
+        let rF = BundleAdjuster.refine(records: records(truth), observations: obsNoisy, rounds: 10)
+        let objDrop = (rF.residualsPx.first ?? 1) > 1e-6
+            ? (1 - (rF.residualsPx.last ?? 0) / (rF.residualsPx.first ?? 1)) * 100 : 0
+        check((rF.holdoutDelta ?? 0) > -0.03,
+              String(format: "保留集｜無位姿誤差、只有雜訊(3px/3cm) → 目標函數假性改善 %.0f%%，"
+                     + "保留集 %+.0f%%（不得聲稱變好）",
+                     objDrop, (rF.holdoutDelta ?? 0) * 100))
+
         print()
         print(fails == 0 ? "全部通過 — 局部 BA 驗證完成" : "\(fails) 項失敗")
         exit(fails == 0 ? 0 : 1)

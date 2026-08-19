@@ -21,6 +21,7 @@
 //
 //  ── 自我驗證 ─────────────────────────────────────────────────
 //  每輪都量修正前後的重投影 RMS，沒下降就回退並停止。
+//  但那是 BA 自己最小化的量 —— 見下方 kHoldoutEvery，還需要一個目標函數外的證人。
 //
 
 import Foundation
@@ -63,6 +64,25 @@ nonisolated enum BundleAdjuster {
     /// 兩種殘差因此可以直接相加，不必另外調係數。
     static let kDepthWeight: Float = 1.0
 
+    /// 交叉驗證：每 N 條 track 抽 1 條**完全不參與求解**，只用來當目標函數外的證人。
+    ///
+    /// **為什麼非有不可。** 上面那些自我驗證量的都是 BA 自己在最小化的量 ——
+    /// 它下降是必然的，下降本身不代表位姿變好，也可能只是把觀測雜訊吸進位姿裡。
+    /// 實機的修正量（中位數 1.0cm）與觀測雜訊（重投影中位數 7.7px ≈ 1.1cm、
+    /// 深度殘差 3.1cm）同量級，這正是最該懷疑過擬合的情形，
+    /// 而我先前每一輪的判斷都只看了求解內的數字，等於一直在問被告他自己有沒有罪。
+    ///
+    /// 保留集的殘差不在目標函數裡：
+    ///   下降 ⇒ 位姿真的變好（雜訊不會跨 track 相關，只有真實位姿誤差會）
+    ///   持平/上升 ⇒ 在擬合雜訊，BA 沒有淨效益 → baRounds 設 0
+    ///
+    /// 以 **track**（不是單一觀測）為單位保留：track 的 3D 位置是各幀反投影的平均，
+    /// 只留一個觀測的話該點仍被求解用到，等於資訊洩漏、保留集會假性變好。
+    ///
+    /// 這是量測用的鷹架 —— 判定出來之後，要嘛整個 BA 拿掉、要嘛把保留集拿掉用回 100%
+    /// 觀測。留著 20% 不用是暫時的代價（每幀仍有 ~84 個觀測解 6 個未知數，遠超需求）。
+    static let kHoldoutEvery = 5
+
     /// 執行局部 BA。回傳修正後的位姿與每輪的重投影 RMS（像素）。
     ///
     /// - records: 關鍵幀（transform 為初值，來自 ARKit＋錨點修正）
@@ -82,10 +102,18 @@ nonisolated enum BundleAdjuster {
             intr[r.id] = r.intrinsics
             order.append(r.id)
         }
+        // 保留集：以 track 為單位切出來，完全不進求解（見 kHoldoutEvery）
+        var heldByFrame: [Int: [FeatureObservation]] = [:]
+        var heldTracks = Set<Int>()
         for o in observations where poses[o.frameID] != nil {
-            obsByFrame[o.frameID, default: []].append(o)
+            if o.trackID % kHoldoutEvery == kHoldoutEvery - 1 {
+                heldByFrame[o.frameID, default: []].append(o)
+                heldTracks.insert(o.trackID)
+            } else {
+                obsByFrame[o.frameID, default: []].append(o)
+            }
         }
-        // 只留觀測足夠的幀
+        // 只留觀測足夠的幀（用求解集判定 —— 解不動的幀不該進迴圈）
         let framesBefore = order.count
         order = order.filter { (obsByFrame[$0]?.count ?? 0) >= kMinObsPerFrame }
         guard order.count >= 3 else {
@@ -101,6 +129,17 @@ nonisolated enum BundleAdjuster {
         func trackPoints() -> [Int: SIMD3<Float>] {
             trackPointsFor(poses, order: order, intr: intr, obsByFrame: obsByFrame)
         }
+
+        /// 保留集的重投影殘差。只看重投影、不含深度項 —— 深度殘差被 LiDAR 雜訊主導，
+        /// 混進來會蓋掉我們要偵測的那個訊號（位姿有沒有真的變好）。
+        func heldOutReproj(_ p: [Int: simd_float4x4]) -> (rms: Float, median: Float)? {
+            guard heldTracks.count >= 20 else { return nil }   // 太少 → 中位數沒有意義
+            let pts = trackPointsFor(p, order: order, intr: intr, obsByFrame: heldByFrame)
+            let r = residuals(order: order, poses: p, intr: intr,
+                              obsByFrame: heldByFrame, points: pts)
+            return r.reproj.isFinite ? (r.reproj, r.medianReproj) : nil
+        }
+        let heldBefore = heldOutReproj(poses)      // 以 ARKit 原始位姿量
 
         var bestPoses = poses
         for round in 0..<rounds {
@@ -143,6 +182,9 @@ nonisolated enum BundleAdjuster {
 
         guard result.roundsApplied > 0 else { return result }
         result.poses = bestPoses
+        if let hb = heldBefore, let ha = heldOutReproj(bestPoses) {
+            result.holdoutMedianPx = (hb.median, ha.median)
+        }
         if let a = result.residualsPx.first, let b = result.residualsPx.last {
             // 位姿解讀只能用**重投影項**：深度項被 LiDAR 雜訊主導，
             // 把它算進去會把量測雜訊當成位姿誤差
@@ -159,8 +201,21 @@ nonisolated enum BundleAdjuster {
                          + "（⇒ 典型位姿誤差 %.2f cm @2m；RMS 高於中位數的部分是誤匹配）",
                          rEnd.reproj, rEnd.medianReproj,
                          Double(rEnd.medianReproj) * 2 / 1450 * 100))
-            print(String(format: "  深度殘差 %.2f px（≈ %.1f cm，屬 LiDAR 量測雜訊，非位姿誤差）",
-                         rEnd.depth, Double(rEnd.depth) * 2 / 1450 * 100))
+            print(String(format: "  深度殘差 %.2f px（≈ %.1f cm，屬 LiDAR 量測雜訊，非位姿誤差）"
+                         + "，佔目標函數平方成本 %.0f%%",
+                         rEnd.depth, Double(rEnd.depth) * 2 / 1450 * 100,
+                         Double(rEnd.depth * rEnd.depth)
+                             / Double(rEnd.total * rEnd.total) * 100))
+            // 目標函數外的證人。上面每一個數字都是 BA 自己在最小化的量，下降是必然的；
+            // 只有這一行能分辨「位姿真的變好」與「把雜訊吸進位姿」。
+            if let d = result.holdoutDelta, let h = result.holdoutMedianPx {
+                let verdict = d < -0.03 ? "位姿真的變好"
+                    : d > 0.03 ? "⚠️ 變差 —— BA 在擬合觀測雜訊，建議 baRounds 設 0"
+                    : "持平 —— 修正量已低於觀測雜訊，BA 無淨效益，建議 baRounds 設 0"
+                print(String(format: "  保留集（%d 條 track 未參與求解）重投影中位數 "
+                             + "%.2f → %.2f px（%+.0f%%）：%@",
+                             heldTracks.count, h.before, h.after, d * 100, verdict))
+            }
         }
         return result
     }

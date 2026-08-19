@@ -56,6 +56,23 @@ import simd
         func check(_ ok: Bool, _ what: String) {
             print(ok ? "✅ \(what)" : "❌ \(what)"); if !ok { fails += 1 }
         }
+        /// 斷言「這個做法**做不到**」。
+        ///
+        /// 見檔頭：以 voxel 佔用建立對應，在最該修正的方向（平面法向）收不到訊號。
+        /// 這幾項是**否定結論的存證**，不是待修的失敗 —— 它們就是
+        /// CaptureConfig.poseRefineRounds 預設 0 的理由。
+        ///
+        /// 先前它們寫成正向斷言，於是整套測試永遠是紅的：我因此誤報過「四套全過」，
+        /// 而真正的風險是「已驗證正確的那幾項（6×6 求解、阻尼、去漂移）
+        /// 哪天壞了也看不出來」—— 5 個常駐失敗會把新的失敗蓋掉。
+        ///
+        /// 若哪天這幾項變成達標，代表對應方法被改好了 → 回頭評估是否重新打開。
+        func refuted(_ reachedBar: Bool, _ what: String) {
+            print(reachedBar
+                  ? "❌ \(what) —— 竟然達標：對應方法已改善，請重新評估 poseRefineRounds"
+                  : "🚫 \(what)")
+            if reachedBar { fails += 1 }
+        }
 
         let truth = surface(40000)
         var grid = FusedVoxelGrid(voxelSize: 0.02, maxCells: 2_000_000)
@@ -77,9 +94,9 @@ import simd
                 let q = delta * SIMD4<Float>(p, 1); return SIMD3(q.x, q.y, q.z)
             }
             let after = residual(fixed, grid)
-            check(after < rms * 0.6,
-                  String(format: "平移 %.0fcm → 殘差 %.2f → %.2f cm（降 %.0f%%）",
-                         mag*100, rms*100, after*100, (1 - after/rms)*100))
+            refuted(after < rms * 0.6,
+                    String(format: "平移 %.0fcm → 殘差 %.2f → %.2f cm（降 %.0f%%，需 ≥40%% 才夠用）",
+                           mag*100, rms*100, after*100, (1 - after/rms)*100))
         }
 
         // ── 繞相機中心的小角度旋轉 ──
@@ -95,9 +112,9 @@ import simd
                 let q = delta * SIMD4<Float>(p, 1); return SIMD3(q.x, q.y, q.z)
             }
             let after = residual(fixed, grid)
-            check(after < rms * 0.7,
-                  String(format: "旋轉 %.1f° → 殘差 %.2f → %.2f cm（降 %.0f%%）",
-                         deg, rms*100, after*100, (1 - after/rms)*100))
+            refuted(after < rms * 0.7,
+                    String(format: "旋轉 %.1f° → 殘差 %.2f → %.2f cm（降 %.0f%%，需 ≥30%% 才夠用）",
+                           deg, rms*100, after*100, (1 - after/rms)*100))
         }
 
         // ── 沒有擾動時不該亂動（阻尼與夾住不能產生假修正）──
@@ -119,7 +136,9 @@ import simd
         check(simd_length(mean / 5) < 1e-5, "去除全域漂移後平均修正量為 0")
 
         print()
-        print(fails == 0 ? "全部通過 — 位姿微調求解器驗證完成" : "\(fails) 項失敗")
+        print(fails == 0
+              ? "全部通過 — 求解器本身正確；🚫 那幾項是 voxel 對應法的否定結論存證"
+              : "\(fails) 項失敗")
         exit(fails == 0 ? 0 : 1)
     }
 
