@@ -1,0 +1,315 @@
+//
+//  FeatureTracker.swift
+//  fable — 掃描時同步抽取特徵並建立跨幀對應（給 BundleAdjuster 用）
+//
+//  這一步是「跳過從零重建軌跡」的關鍵：ARKit 已經給了位姿、LiDAR 已經給了深度，
+//  所以我們不需要三角化、也不需要全域描述子搜尋。
+//
+//    · 每個特徵的 3D 位置直接由 LiDAR 讀出 → 不必三角化
+//    · 已知位姿 ⇒ 前一幀的特徵投影到本幀的**預期位置**可以算出來
+//      → 匹配退化成 ±R 像素的局部搜尋，而不是 N×M 的描述子比對
+//
+//  這兩件事合起來，把 SfM 最貴的兩步（搜尋 + 三角化）整個拿掉，
+//  剩下的只有「局部微調」——也就是把對應關係丟進 BA 解一次。
+//
+//  ── 為什麼在掃描時做而不是停止後 ────────────────────────────────
+//  停止後做要重新解碼 JPEG（120 張 × ~20ms = 2.4s，比 BA 本身還貴），
+//  而掃描時影像已經在記憶體裡（captureKeyframe 已經 clone 了一份 pixel buffer）。
+//  抽取＋匹配約 5ms / 關鍵幀，而關鍵幀速率只有 ~2Hz —— 成本攤掉後看不見。
+//
+//  ── 精度考量 ──────────────────────────────────────────────────
+//  Harris 響應在 stride 2 的網格上算（1920×1440 → 960×720），特徵座標仍記全解析度，
+//  故量化誤差 2px。以 ~300 個特徵做最小平方，等效位姿誤差 ≈ 2/√300 ≈ 0.12px，
+//  遠低於我們要打的目標（把重投影殘差壓到 <2px），所以不值得為此付全解析度的代價。
+//
+
+import Foundation
+import CoreVideo
+import simd
+
+/// 一幀裡的一個特徵。patch 用來做 ZNCC 匹配 —— 引導式局部搜尋不需要旋轉不變性，
+/// 而 ZNCC 對曝光變化免疫（掃描中 AE 會變），比 SSD 可靠。
+nonisolated struct TrackedFeature: Sendable {
+    /// 全解析度影像座標
+    var u: Float
+    var v: Float
+    /// 該像素的 LiDAR 深度（公尺）——位姿無關，BA 每輪重算世界座標用
+    var depth: Float
+    /// 以抽取當時的位姿反投影出的世界座標（匹配時的引導投影用）
+    var world: SIMD3<Float>
+    /// 9×9 patch（在 stride 網格上取樣）
+    var patch: [UInt8]
+    /// 預先算好的均值與 1/範數，讓 ZNCC 不必每次重算
+    var mean: Float
+    var invNorm: Float
+    /// 所屬 track（同一個 3D 點）。-1 = 尚未歸屬
+    var trackID: Int = -1
+}
+
+/// BA 要吃的扁平觀測：某一幀看到某個 track 的影像位置
+nonisolated struct FeatureObservation: Sendable {
+    var frameID: Int
+    var trackID: Int
+    var u: Float
+    var v: Float
+    /// 該像素的 LiDAR 深度（公尺）。**存深度而不是世界座標**是關鍵：
+    /// 世界座標是用「拍攝當時的位姿」算出來的，BA 一改位姿它就過期了；
+    /// 深度與位姿無關，所以每輪都能用最新位姿重算世界座標。
+    var depth: Float
+}
+
+nonisolated enum FeatureParams {
+    /// Harris/Shi-Tomasi 響應的取樣步長（全解析度像素）
+    static let stride = 2
+    /// patch 邊長（以 stride 網格計）。9 → 全解析度覆蓋 18px，
+    /// 對室內紋理是合適的尺度：小了容易誤匹配、大了對視角變化不耐
+    static let patchSide = 9
+    /// 網格化取點：把畫面切成 cols×rows 格，每格最多取一個最強角點。
+    /// 均勻分佈對位姿的條件數很重要 —— 特徵全擠在一角會讓旋轉/平移退化耦合。
+    static let gridCols = 24
+    static let gridRows = 18
+    /// Shi-Tomasi 最小特徵值門檻（8-bit 影像的經驗值）。太低會收進平坦區的雜訊
+    static let minCornerResponse: Float = 120
+    /// 引導搜尋半徑（全解析度像素）。ARKit 位姿的殘差量級是十幾 px，
+    /// 16 給了足夠餘裕又不至於讓誤匹配變多
+    static let searchRadius: Float = 16
+    /// ZNCC 接受門檻
+    static let minZNCC: Float = 0.80
+    /// 最佳/次佳比值檢定：次佳太接近就視為模糊匹配、丟棄
+    static let maxSecondBestRatio: Float = 0.9
+    /// 每幀往回匹配幾幀。3~5 幀給出足夠長的 track，又不會讓成本線性爆掉
+    static let matchAgainstRecent = 4
+    /// track 至少要被幾幀看到才進 BA。2 幀就能約束，但 3 幀起才穩
+    static let minTrackLength = 3
+}
+
+// MARK: - 抽取
+
+nonisolated enum FeatureExtractor {
+
+    /// 從 ARKit capturedImage 的 luma plane 抽網格化的 Shi-Tomasi 角點，
+    /// 並用深度圖給每個角點一個世界座標。
+    ///
+    /// - depth: 該幀的深度（float32, dw×dh），conf 為信心圖（可 nil）
+    /// - c2w: 該幀的 camera-to-world（ARKit GL 慣例）
+    static func extract(luma pb: CVPixelBuffer,
+                        depth: Data, conf: [UInt8]?, dw: Int, dh: Int,
+                        K: CameraIntrinsics, c2w: simd_float4x4,
+                        minDepth: Float, maxDepth: Float) -> [TrackedFeature] {
+        guard CVPixelBufferGetPlaneCount(pb) >= 1 else { return [] }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return [] }
+        let w = CVPixelBufferGetWidthOfPlane(pb, 0)
+        let h = CVPixelBufferGetHeightOfPlane(pb, 0)
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+
+        let s = FeatureParams.stride
+        let half = FeatureParams.patchSide / 2
+        // 網格座標範圍：留出 patch 與差分所需的邊界
+        let margin = half + 2
+        let gw = w / s, gh = h / s
+        guard gw > 2 * margin, gh > 2 * margin else { return [] }
+
+        @inline(__always) func lum(_ gx: Int, _ gy: Int) -> Int {
+            Int((p + gy * s * rowBytes)[gx * s])
+        }
+
+        // 每個網格單元保留最強的一個角點
+        var bestResp = [Float](repeating: 0, count: FeatureParams.gridCols * FeatureParams.gridRows)
+        var bestPos = [(Int, Int)](repeating: (-1, -1),
+                                   count: FeatureParams.gridCols * FeatureParams.gridRows)
+
+        var gy = margin
+        while gy < gh - margin {
+            var gx = margin
+            while gx < gw - margin {
+                // 3×3 網格窗上的結構張量（＝全解析度 6×6）
+                var a: Float = 0, b: Float = 0, c: Float = 0
+                for dy in -1...1 {
+                    for dx in -1...1 {
+                        let ix = Float(lum(gx + dx + 1, gy + dy) - lum(gx + dx - 1, gy + dy))
+                        let iy = Float(lum(gx + dx, gy + dy + 1) - lum(gx + dx, gy + dy - 1))
+                        a += ix * ix; b += ix * iy; c += iy * iy
+                    }
+                }
+                // Shi-Tomasi：最小特徵值（比 Harris 的 det-k·trace² 少一個要調的 k）
+                let t = (a + c) * 0.5
+                let d = (((a - c) * 0.5) * ((a - c) * 0.5) + b * b).squareRoot()
+                let minEig = t - d
+                if minEig >= FeatureParams.minCornerResponse {
+                    let cellX = gx * FeatureParams.gridCols / gw
+                    let cellY = gy * FeatureParams.gridRows / gh
+                    let ci = cellY * FeatureParams.gridCols + cellX
+                    if minEig > bestResp[ci] { bestResp[ci] = minEig; bestPos[ci] = (gx, gy) }
+                }
+                gx += 1
+            }
+            gy += 1
+        }
+
+        // 取 patch + 由深度賦予世界座標
+        let side = FeatureParams.patchSide
+        var out: [TrackedFeature] = []
+        out.reserveCapacity(bestPos.count)
+        let sx = Float(dw) / Float(w), sy = Float(dh) / Float(h)
+        let fx = Float(K.fx), fy = Float(K.fy), cx = Float(K.cx), cy = Float(K.cy)
+
+        depth.withUnsafeBytes { raw in
+            let dep = raw.bindMemory(to: Float32.self)
+            for (gx, gy) in bestPos where gx >= 0 {
+                let uFull = Float(gx * s), vFull = Float(gy * s)
+                // 深度圖座標（深度解析度遠低於影像，故最近取樣即可）
+                let du = Int(uFull * sx), dv = Int(vFull * sy)
+                guard du >= 0, dv >= 0, du < dw, dv < dh else { continue }
+                let di = dv * dw + du
+                let z = dep[di]
+                // BA 的 3D 只用 high confidence：這一步求位姿，寧可少也要準
+                guard z.isFinite, z > minDepth, z < maxDepth, (conf?[di] ?? 2) >= 2 else { continue }
+
+                var patch = [UInt8](repeating: 0, count: side * side)
+                var sum: Float = 0
+                for py in 0..<side {
+                    for px in 0..<side {
+                        let val = UInt8(lum(gx + px - half, gy + py - half))
+                        patch[py * side + px] = val
+                        sum += Float(val)
+                    }
+                }
+                let mean = sum / Float(side * side)
+                var sq: Float = 0
+                for val in patch { let d = Float(val) - mean; sq += d * d }
+                guard sq > 1 else { continue }          // 平坦 patch 無法匹配
+                let invNorm = 1 / sq.squareRoot()
+
+                let xc = (uFull - cx) / fx * z
+                let yc = (vFull - cy) / fy * z
+                let wp = c2w * SIMD4<Float>(xc, -yc, -z, 1)
+                out.append(TrackedFeature(u: uFull, v: vFull, depth: z,
+                                          world: SIMD3<Float>(wp.x, wp.y, wp.z),
+                                          patch: patch, mean: mean, invNorm: invNorm))
+            }
+        }
+        return out
+    }
+
+    /// ZNCC。兩個 patch 都已預先算好 mean 與 invNorm，故只剩一次點積。
+    /// 對曝光變化免疫 —— 掃描中 AE 會變，SSD 在這種情況下不可靠。
+    @inline(__always)
+    static func zncc(_ a: TrackedFeature, _ b: TrackedFeature) -> Float {
+        var acc: Float = 0
+        for i in 0..<a.patch.count {
+            acc += (Float(a.patch[i]) - a.mean) * (Float(b.patch[i]) - b.mean)
+        }
+        return acc * a.invNorm * b.invNorm
+    }
+}
+
+// MARK: - 追蹤（跨幀建立 track）
+
+/// 掃描期間逐幀累積。actor 讓它離開主執行緒 —— 不能餓死 ARKit 的 VIO。
+actor FeatureTracker {
+
+    private struct FrameFeatures {
+        let frameID: Int
+        let c2w: simd_float4x4
+        let K: CameraIntrinsics
+        var features: [TrackedFeature]
+    }
+
+    private var frames: [FrameFeatures] = []
+    private var nextTrackID = 0
+    private(set) var matchCount = 0
+
+    func reset() {
+        frames.removeAll()
+        nextTrackID = 0
+        matchCount = 0
+    }
+
+    /// 加入一幀：抽取 → 對最近數幀做引導式匹配 → 歸入既有 track 或開新 track
+    func add(frameID: Int, luma: CVPixelBuffer, depth: Data, conf: [UInt8]?,
+             dw: Int, dh: Int, K: CameraIntrinsics, c2w: simd_float4x4,
+             minDepth: Float, maxDepth: Float) {
+        var feats = FeatureExtractor.extract(luma: luma, depth: depth, conf: conf,
+                                            dw: dw, dh: dh, K: K, c2w: c2w,
+                                            minDepth: minDepth, maxDepth: maxDepth)
+        guard !feats.isEmpty else { return }
+
+        let w2c = c2w.inverse
+        let r2 = FeatureParams.searchRadius * FeatureParams.searchRadius
+
+        for prev in frames.suffix(FeatureParams.matchAgainstRecent) {
+            for pf in prev.features where pf.trackID >= 0 || true {
+                // 用**已知位姿**把前一幀的 3D 特徵投影到本幀 → 預期位置
+                guard let (pu, pv) = Self.project(pf.world, w2c: w2c, K: K) else { continue }
+                var bestIdx = -1
+                var best: Float = -1, second: Float = -1
+                for (i, f) in feats.enumerated() where f.trackID < 0 {
+                    let du = f.u - pu, dv = f.v - pv
+                    if du * du + dv * dv > r2 { continue }      // 只搜半徑內的角點
+                    let s = FeatureExtractor.zncc(pf, f)
+                    if s > best { second = best; best = s; bestIdx = i }
+                    else if s > second { second = s }
+                }
+                guard bestIdx >= 0, best >= FeatureParams.minZNCC else { continue }
+                // 比值檢定：次佳太接近代表這區域自相似（磁磚、格紋），寧可不要
+                if second > 0, second / best > FeatureParams.maxSecondBestRatio { continue }
+
+                if pf.trackID >= 0 {
+                    feats[bestIdx].trackID = pf.trackID
+                } else {
+                    // 前一幀那個特徵還沒歸屬 → 兩者一起開一個新 track
+                    let id = nextTrackID
+                    nextTrackID += 1
+                    feats[bestIdx].trackID = id
+                    if let pi = frames.indices.last(where: { frames[$0].frameID == prev.frameID }),
+                       let fi = frames[pi].features.firstIndex(where: {
+                           $0.u == pf.u && $0.v == pf.v && $0.trackID < 0
+                       }) {
+                        frames[pi].features[fi].trackID = id
+                    }
+                }
+                matchCount += 1
+            }
+        }
+        frames.append(FrameFeatures(frameID: frameID, c2w: c2w, K: K, features: feats))
+    }
+
+    /// 世界座標 → 影像座標。ARKit GL 慣例：相機看 -Z、Y 朝上，
+    /// 與 RefusionEngine 的反投影 (xc, -yc, -z) 互為逆運算。
+    static func project(_ world: SIMD3<Float>, w2c: simd_float4x4,
+                       K: CameraIntrinsics) -> (Float, Float)? {
+        let pc = w2c * SIMD4<Float>(world, 1)
+        guard pc.z < -1e-4 else { return nil }        // 在相機後方
+        let d = -pc.z
+        return (Float(K.cx) + pc.x * Float(K.fx) / d,
+                Float(K.cy) - pc.y * Float(K.fy) / d)
+    }
+
+    /// 匯出給 BA 的觀測。只留長度足夠的 track —— 短 track 對位姿幾乎沒有約束力，
+    /// 卻會把離群匹配帶進求解。
+    func observations() -> [FeatureObservation] {
+        var lengths: [Int: Int] = [:]
+        for f in frames { for t in f.features where t.trackID >= 0 {
+            lengths[t.trackID, default: 0] += 1
+        } }
+        var out: [FeatureObservation] = []
+        for f in frames {
+            for t in f.features where t.trackID >= 0 {
+                guard (lengths[t.trackID] ?? 0) >= FeatureParams.minTrackLength else { continue }
+                out.append(FeatureObservation(frameID: f.frameID, trackID: t.trackID,
+                                              u: t.u, v: t.v, depth: t.depth))
+            }
+        }
+        return out
+    }
+
+    /// 診斷用摘要
+    func stats() -> (frames: Int, features: Int, tracks: Int, observations: Int) {
+        let obs = observations()
+        return (frames.count, frames.reduce(0) { $0 + $1.features.count },
+                Set(obs.map(\.trackID)).count, obs.count)
+    }
+}

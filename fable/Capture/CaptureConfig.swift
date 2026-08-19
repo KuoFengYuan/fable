@@ -266,7 +266,13 @@ nonisolated struct CaptureConfig: Sendable {
     var captureFloorPlan = true
 
     // MARK: - 位姿微調（以 LiDAR 共識點雲為固定結構，非完整 BA）
-    /// 微調輪數。**目前為 0（關閉）** —— 求解器的對應方式被離線測試否決了。
+    /// 局部 BA 的輪數（0 = 關閉）。以 ARKit＋錨點修正為初值，用掃描時同步建立的
+    /// 跨幀特徵對應做微調。殘差 = 重投影 ＋ 深度（後者擋住沿光軸的退化）。
+    /// 每輪自我驗證：RMS 沒下降就回退並停止。
+    /// 3 輪足夠 —— coordinate descent 在有 LiDAR 錨定結構的情況下收斂很快。
+    var baRounds = 3
+
+    /// （已停用的舊路徑）幾何式位姿微調的輪數。**目前為 0（關閉）** —— 求解器的對應方式被離線測試否決了。
     ///
     /// 原設計用「點落在哪個 voxel」建立對應。離線測試（tools/test_pose_refine.swift）
     /// 拿單一平面做對照，結果決定性地否定了它：

@@ -31,8 +31,11 @@ import simd
 nonisolated struct PoseRefineResult: Sendable {
     /// 逐幀修正後的 c2w（未列出者維持原樣）
     var poses: [Int: simd_float4x4] = [:]
-    /// 每一輪的殘差（公尺，RMS）。第 0 個是修正前
+    /// 每一輪的殘差（公尺，RMS）。第 0 個是修正前。幾何式精修（PoseRefiner）填這個
     var residualsM: [Double] = []
+    /// 每一輪的重投影殘差（像素，RMS）。第 0 個是修正前。BundleAdjuster 填這個 ——
+    /// 它才是決定 3DGS 解析度天花板的量（1cm 位姿誤差 @2m ≈ 7px）
+    var residualsPx: [Float] = []
     var roundsApplied = 0
 
     var improvedPercent: Double {

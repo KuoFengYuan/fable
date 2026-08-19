@@ -80,6 +80,10 @@ final class CaptureController: NSObject, ObservableObject {
     let cameraControls = CameraControls()
     /// 平面圖擷取（RoomPlan，共用同一個 ARSession）。掃描時同步收集，匯出時轉成 usdz/json/svg
     let floorPlan = FloorPlanCapture()
+    /// 特徵追蹤：掃描時同步抽角點並建立跨幀對應，停止後餵給 BundleAdjuster。
+    /// 放在掃描期做而非停止後，是因為停止後要重新解碼 120 張 JPEG（~2.4s，比 BA 還貴），
+    /// 而此刻影像已經在記憶體裡。
+    private let featureTracker = FeatureTracker()
     /// 建好的平面圖，於 processing 階段產生 → review 可顯示、匯出時寫檔
     @Published private(set) var floorPlanData: FloorPlanData?
     /// 是否以上次的 ARWorldMap 開始 —— 讓這次掃描與上次落在**同一個座標系**。
@@ -119,6 +123,8 @@ final class CaptureController: NSObject, ObservableObject {
     private var lastTravelPosition: SIMD3<Float>?
     private var loopClosed = false
     private var lastWorldMapMB: Double?
+    /// BA 的每輪重投影 RMS（像素）。第 0 個是修正前 —— review 的摘要卡會顯示
+    private var baResidualsPx: [Float] = []
     /// 因清晰度不足而放棄抓幀的次數（診斷用：拿來判斷門檻是否過嚴）
     private var sharpnessRejects = 0
     /// 近幾秒被放棄的時間戳。用來即時告訴使用者「你正在掉幀」——
@@ -281,12 +287,14 @@ final class CaptureController: NSObject, ObservableObject {
         sharpnessRejects = 0
         recentRejects = []
         recentRejectCount = 0
+        Task { await featureTracker.reset() }
         scanStartPosition = nil
         lastTravelPosition = nil
         traveledM = 0
         loopClosed = false
         loopHint = nil
         lastWorldMapMB = nil
+        baResidualsPx = []
         scanSummary = nil
         phase = .scanning
         statusText = nil
@@ -345,6 +353,28 @@ final class CaptureController: NSObject, ObservableObject {
             }
             return r
         }
+        // 局部 BA：以「ARKit ＋ 錨點修正」為初值，用掃描時建好的跨幀對應做微調。
+        // 位置在這裡的理由：
+        //   · 必須在錨點修正**之後** —— 那是初值，BA 只做微調
+        //   · 必須在 BlurFilter 與重融合**之前** —— 它們都吃姿態，晚了就白做
+        if config.baRounds > 0 {
+            let obs = await featureTracker.observations()
+            let st = await featureTracker.stats()
+            print("特徵追蹤: \(st.frames) 幀 / \(st.features) 特徵 / "
+                  + "\(st.tracks) tracks / \(st.observations) 觀測")
+            let ba = BundleAdjuster.refine(records: refinedRecords, observations: obs,
+                                           rounds: config.baRounds)
+            if ba.roundsApplied > 0 {
+                refinedRecords = refinedRecords.map { r in
+                    guard let m = ba.poses[r.id] else { return r }
+                    var out = r
+                    out.transform = RefusionEngine.rowMajor(m)
+                    return out
+                }
+            }
+            baResidualsPx = ba.residualsPx
+        }
+
         // 模糊幀全域複核。必須在姿態修正**之後**：BlurFilter 靠位置/朝向找「看同一片表面」
         // 的鄰居，用未修正的姿態會找錯鄰居。判定寫回紀錄而非直接刪除，
         // poses_refined.jsonl 與 images/ 都保留完整，可回頭檢查判定對不對。
@@ -844,6 +874,8 @@ final class CaptureController: NSObject, ObservableObject {
         s.blurDropped = refined.filter { $0.blurVerdict == .drop }.count
         s.blurDemoted = refined.filter { $0.blurVerdict == .demote }.count
         s.worldMapMB = lastWorldMapMB
+        s.baBeforePx = baResidualsPx.first
+        s.baAfterPx = baResidualsPx.last
         defer { scanSummary = s }
         let byID = Dictionary(uniqueKeysWithValues: raw.map { ($0.id, $0.transform) })
         var deltas: [Double] = []
@@ -1124,9 +1156,20 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             pendingWrites -= 1
             return
         }
+        let cfg = config
+        let tracker = featureTracker
         Task {
             await writer.write(keyframe)
             self.pendingWrites -= 1
+            // 特徵抽取放在寫檔之後：兩者共用同一份 clone 的 pixel buffer
+            //（CVPixelBuffer 是 refcounted，兩個 actor 各自持有沒問題），
+            // 而寫檔先做可以早一點釋放背壓（pendingWrites）。
+            guard cfg.baRounds > 0, let dData = keyframe.depthData, dw > 0, dh > 0 else { return }
+            let confArr = keyframe.confidenceData.map { [UInt8]($0) }
+            await tracker.add(frameID: record.id, luma: keyframe.pixelBuffer,
+                              depth: dData, conf: confArr, dw: dw, dh: dh,
+                              K: record.intrinsics, c2w: keyframe.c2w,
+                              minDepth: cfg.pointMinDepthM, maxDepth: cfg.pointMaxDepthM)
         }
     }
 }

@@ -85,6 +85,10 @@ nonisolated struct ScanSummary: Sendable {
     var blurDemoted = 0
     /// 世界地圖大小（MB）；nil = 沒存成（追蹤品質不足或超過上限）
     var worldMapMB: Double?
+    /// BA 前後的重投影 RMS（像素）。這是 3DGS 解析度天花板的直接量測 ——
+    /// 1cm 位姿誤差 @2m ≈ 7px，所以這個數字就是「高斯最細能到多細」
+    var baBeforePx: Float?
+    var baAfterPx: Float?
 }
 
 /// 世界座標彩色點。score 為採集品質分數（距離近、靠畫面中心、低模糊 → 高分），
