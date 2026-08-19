@@ -384,8 +384,16 @@ final class CaptureController: NSObject, ObservableObject {
                   + "、\(demoted) 幀（顏色糊，不進訓練但深度仍以降權併入點雲）")
         }
 
-        // 重融合：用修正後姿態把所有關鍵幀原始深度重新反投影 + 加權平均
+        // 重融合與平面圖建模**並行**：兩者完全獨立（一個吃深度、一個吃 RoomPlan 的
+        // CapturedRoomData），序列跑等於白等較短的那一個。
+        // RoomBuilder / StructureBuilder 是 Apple 的程式、秒級且無法加速，
+        // 但它可以整段藏在重融合底下。
+        let t0 = Date()
+        let wantPlan = config.captureFloorPlan && FloorPlanCapture.isSupported
+        async let planTask: FloorPlanData? = wantPlan ? floorPlan.build() : nil
+
         var points: [CloudPoint] = []
+        var refuseSec: Double = 0
         if hasLiDAR && config.saveDepth && !refinedRecords.isEmpty {
             let records = refinedRecords
             let cfg = config
@@ -393,20 +401,21 @@ final class CaptureController: NSObject, ObservableObject {
                 Task { @MainActor [weak self] in self?.exportProgress = p }
             }
             let mesh = meshVertices
+            let tR = Date()
             points = await Task.detached(priority: .userInitiated) {
                 RefusionEngine.refuse(records: records, sessionDir: dir, config: cfg,
                                       meshVertices: mesh, progress: onProg)
             }.value
+            refuseSec = Date().timeIntervalSince(tR)
         }
         if points.isEmpty {                          // 無 LiDAR / 無深度時退回即時累積雲
             points = await accumulator.bestPoints(target: config.exportMaxPoints)
         }
 
-        // 平面圖建模（秒級）：放在 processing 階段，review 時就已經有結果可看/可匯出
-        if config.captureFloorPlan, FloorPlanCapture.isSupported {
-            floorPlanData = await floorPlan.build()
-            if let fp = floorPlanData { logFloorPlan(fp) }
-        }
+        floorPlanData = await planTask
+        if let fp = floorPlanData { logFloorPlan(fp) }
+        print(String(format: "處理耗時: 總計 %.2fs（其中重融合 %.2fs；平面圖建模與它並行）",
+                     Date().timeIntervalSince(t0), refuseSec))
 
         reviewPoints = points
         reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }

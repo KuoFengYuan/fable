@@ -64,10 +64,17 @@ nonisolated enum FeatureParams {
     /// patch 邊長（以 stride 網格計）。9 → 全解析度覆蓋 18px，
     /// 對室內紋理是合適的尺度：小了容易誤匹配、大了對視角變化不耐
     static let patchSide = 9
-    /// 網格化取點：把畫面切成 cols×rows 格，每格最多取一個最強角點。
-    /// 均勻分佈對位姿的條件數很重要 —— 特徵全擠在一角會讓旋轉/平移退化耦合。
-    static let gridCols = 24
-    static let gridRows = 18
+    /// 特徵數上限（依響應強度取前 N 個）。
+    ///
+    /// **不用「每格取最強」的網格法。** 網格取極值跨幀不穩定：同一個物理角點在下一幀
+    /// 若跨到隔壁格子、而那格另有更強的角點，它就完全不會被偵測到。
+    /// 實機實測其後果：匹配失敗有 72% 是「半徑內無候選」——
+    /// 不是投影不準，是對應的角點在新幀根本沒被抽出來。
+    /// 改用非極大值抑制：局部極大值在下一幀仍然是局部極大值，與網格對齊無關。
+    static let maxFeatures = 600
+    /// NMS 的最小間距（stride 網格單位）。8 → 全解析度 16px，
+    /// 約等於 patch 邊長，避免同一個角落被重複收好幾次
+    static let nmsRadius = 8
     /// Shi-Tomasi 最小特徵值門檻（8-bit 影像的經驗值）。太低會收進平坦區的雜訊
     static let minCornerResponse: Float = 120
     /// 引導搜尋半徑（全解析度像素）。ARKit 位姿殘差約十幾 px，
@@ -126,10 +133,11 @@ nonisolated enum FeatureExtractor {
             Int((p + gy * s * rowBytes)[gx * s])
         }
 
-        // 每個網格單元保留最強的一個角點
-        var bestResp = [Float](repeating: 0, count: FeatureParams.gridCols * FeatureParams.gridRows)
-        var bestPos = [(Int, Int)](repeating: (-1, -1),
-                                   count: FeatureParams.gridCols * FeatureParams.gridRows)
+        // 收集所有「3×3 局部極大值且超過門檻」的候選，稍後做 NMS
+        var cand: [(resp: Float, gx: Int, gy: Int)] = []
+        cand.reserveCapacity(4096)
+        // 響應先算成一整張圖，才能做局部極大值判定（逐點算無法比較鄰居）
+        var resp = [Float](repeating: 0, count: gw * gh)
 
         var gy = margin
         while gy < gh - margin {
@@ -147,16 +155,52 @@ nonisolated enum FeatureExtractor {
                 // Shi-Tomasi：最小特徵值（比 Harris 的 det-k·trace² 少一個要調的 k）
                 let t = (a + c) * 0.5
                 let d = (((a - c) * 0.5) * ((a - c) * 0.5) + b * b).squareRoot()
-                let minEig = t - d
-                if minEig >= FeatureParams.minCornerResponse {
-                    let cellX = gx * FeatureParams.gridCols / gw
-                    let cellY = gy * FeatureParams.gridRows / gh
-                    let ci = cellY * FeatureParams.gridCols + cellX
-                    if minEig > bestResp[ci] { bestResp[ci] = minEig; bestPos[ci] = (gx, gy) }
+                resp[gy * gw + gx] = t - d
+                gx += 1
+            }
+            gy += 1
+        }
+
+        // 3×3 局部極大值
+        gy = margin + 1
+        while gy < gh - margin - 1 {
+            var gx = margin + 1
+            while gx < gw - margin - 1 {
+                let r = resp[gy * gw + gx]
+                if r >= FeatureParams.minCornerResponse {
+                    var isMax = true
+                    for dy in -1...1 {
+                        for dx in -1...1 where !(dx == 0 && dy == 0) {
+                            if resp[(gy + dy) * gw + (gx + dx)] > r { isMax = false; break }
+                        }
+                        if !isMax { break }
+                    }
+                    if isMax { cand.append((r, gx, gy)) }
                 }
                 gx += 1
             }
             gy += 1
+        }
+
+        // 依響應由強到弱貪婪取點，彼此至少相隔 nmsRadius（空間 hash 做 O(1) 鄰域查詢）
+        cand.sort { $0.resp > $1.resp }
+        let nms = FeatureParams.nmsRadius
+        var occupied = Set<Int32>()
+        var bestPos: [(Int, Int)] = []
+        bestPos.reserveCapacity(FeatureParams.maxFeatures)
+        for c in cand {
+            if bestPos.count >= FeatureParams.maxFeatures { break }
+            let cx = c.gx / nms, cy = c.gy / nms
+            var clash = false
+            for dy in -1...1 {
+                for dx in -1...1 {
+                    if occupied.contains(Int32((cy + dy) << 16 | (cx + dx))) { clash = true; break }
+                }
+                if clash { break }
+            }
+            if clash { continue }
+            occupied.insert(Int32(cy << 16 | cx))
+            bestPos.append((c.gx, c.gy))
         }
 
         // 取 patch + 由深度賦予世界座標
@@ -168,7 +212,7 @@ nonisolated enum FeatureExtractor {
 
         depth.withUnsafeBytes { raw in
             let dep = raw.bindMemory(to: Float32.self)
-            for (gx, gy) in bestPos where gx >= 0 {
+            for (gx, gy) in bestPos {
                 let uFull = Float(gx * s), vFull = Float(gy * s)
                 // 深度圖座標（深度解析度遠低於影像，故最近取樣即可）
                 let du = Int(uFull * sx), dv = Int(vFull * sy)

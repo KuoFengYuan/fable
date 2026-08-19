@@ -9,6 +9,8 @@ struct HUDOverlay: View {
     @ObservedObject var controller: CaptureController
     @Environment(\.dismiss) private var dismiss
     @State private var showDiscardConfirm = false
+    /// 品質摘要是否展開（預設收合，見 scanSummaryCard）
+    @State private var summaryExpanded = false
 
     var body: some View {
         ZStack {
@@ -215,6 +217,8 @@ struct HUDOverlay: View {
             .foregroundStyle(.white)
             .padding(10)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            // 純資訊面板，不吃手勢 —— review 階段底下是可旋轉的點雲
+            .allowsHitTesting(false)
             }
         }
     }
@@ -266,6 +270,9 @@ struct HUDOverlay: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .background(.ultraThinMaterial, in: Capsule())
+                // 純提示，不該吃手勢。review 階段底下是可旋轉的 3D 點雲，
+                // 有背景的 View 會在自己的範圍內攔截觸控 —— 實機回報「不好轉動」就是這個。
+                .allowsHitTesting(false)
         }
     }
 
@@ -281,7 +288,7 @@ struct HUDOverlay: View {
         case .processing:
             return "點雲優化中：姿態修正 + 多視角加權融合…"
         case .review:
-            return "檢查點雲品質：單指旋轉、雙指縮放；可繼續掃描補拍，或直接訓練成 3DGS"
+            return nil    // 旋轉/縮放是直覺操作，不需要文字說明佔住畫面
         case .training:
             return nil
         case .exporting:
@@ -367,18 +374,38 @@ struct HUDOverlay: View {
     /// 掃描品質摘要。這些數字原本只印在 log 裡，使用者看不到 ——
     /// 而「漂移多少、迴環有沒有閉合」正是判斷這份資料能不能用的依據。
     /// 只顯示需要注意的項目：一切正常時整張卡不出現，不佔版面。
+    /// 品質摘要。**預設收成一行**，點一下才展開 ——
+    /// review 階段的主體是可旋轉的 3D 點雲，資訊不該佔住畫面也不該擋住手勢。
     @ViewBuilder
     private var scanSummaryCard: some View {
-        if let s = controller.scanSummary, !summaryRows(s).isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(summaryRows(s), id: \.text) { row in
-                    Label(row.text, systemImage: row.symbol)
-                        .font(.caption)
-                        .foregroundStyle(row.tint)
+        if let s = controller.scanSummary {
+            let rows = summaryRows(s)
+            if !rows.isEmpty {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { summaryExpanded.toggle() }
+                } label: {
+                    if summaryExpanded {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(rows, id: \.text) { row in
+                                Label(row.text, systemImage: row.symbol)
+                                    .font(.caption)
+                                    .foregroundStyle(row.tint)
+                                    .multilineTextAlignment(.leading)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    } else {
+                        // 收合態：只留「有 N 項要注意」＋最嚴重那項的顏色
+                        Label("\(rows.count) 項掃描提醒", systemImage: "exclamationmark.circle")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(rows.first?.tint ?? .secondary)
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.ultraThinMaterial, in: Capsule())
+                    }
                 }
             }
-            .padding(.horizontal, 14).padding(.vertical, 9)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
         }
     }
 

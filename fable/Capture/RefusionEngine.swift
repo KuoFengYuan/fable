@@ -227,6 +227,8 @@ nonisolated enum RefusionEngine {
         // 模型不在 bundle 裡就是 nil → 整條 MDE 路徑靜默略過，行為與改動前相同
         let mde: DepthDensifier? = config.useMDEHoleFill ? DepthDensifier() : nil
         var mdeAccepted = 0, mdePoints = 0
+        // 分段計時：先前只能靠估算猜哪一段慢，實際數字才有依據
+        var tUnproject: Double = 0, tMesh: Double = 0, tDecode: Double = 0
 
         for (i, r) in records.enumerated() {
             defer { progress(Double(i + 1) / Double(total)) }
@@ -241,8 +243,10 @@ nonisolated enum RefusionEngine {
                confData.count == dw * dh {
                 conf = [UInt8](confData)
             }
+            let tD = Date()
             guard let rgba = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
                                         width: dw, height: dh) else { continue }
+            tDecode += Date().timeIntervalSince(tD)
 
             // 幾何不可信的幀直接跳過：它的深度會被反投影到錯的世界座標，疊出殘影／雙層殼。
             // 殘影比破洞更糟 —— 破洞看得出來，殘影會被當成真的幾何。
@@ -256,14 +260,18 @@ nonisolated enum RefusionEngine {
             // 原本只看 estimatedBlurPx，於是「相機拿得很穩但失焦」的幀拿到滿分權重，
             // 它糊掉的顏色會主導那格的加權平均 —— 這是實測清晰度才看得到的破口。
             let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
+            let tU = Date()
             grid.insert(unprojectStored(depth: depth, conf: conf, rgba: rgba,
                                         dw: dw, dh: dh, K: K, c2w: c2w,
                                         config: config, sharpness: sharpness))
+            tUnproject += Date().timeIntervalSince(tU)
             // mesh 頂點：投影進本幀取色。同一頂點會被多幀命中 → 由 voxel 加權平均做多視角混色。
             if !meshVertices.isEmpty {
+                let tM = Date()
                 grid.insert(projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
                                         K: K, c2w: c2w, config: config, sharpness: sharpness),
                             measured: false)
+                tMesh += Date().timeIntervalSince(tM)
             }
             // MDE 補洞：只在 LiDAR 無回波處產生點
             if let mde, config.useMDEHoleFill,
@@ -282,6 +290,9 @@ nonisolated enum RefusionEngine {
         // 診斷：這條鏈上有三處會悄悄粗化解析度（融合格觸頂、匯出擇優下採樣、訓練高斯預算），
         // 而初始點距直接決定初始高斯大小（msplat 的初始 scale = 3-NN 距離）。
         // 過去完全沒有數字，訓練端看到 15cm 的初始高斯卻無從得知是哪一段造成的。
+        print(String(format: "  重融合分段: 反投影+插入 %.2fs、mesh 投影 %.2fs、"
+                     + "JPEG 解碼 %.2fs（%d 幀）",
+                     tUnproject, tMesh, tDecode, records.count))
         let rawCells = grid.count
         let inferredOnly = grid.inferredOnlyCount
         let gridVoxel = grid.voxelSize
