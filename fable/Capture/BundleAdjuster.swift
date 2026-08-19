@@ -105,9 +105,9 @@ nonisolated enum BundleAdjuster {
         var bestPoses = poses
         for round in 0..<rounds {
             let pts = trackPoints()
-            let before = reprojectionRMS(order: order, poses: poses, intr: intr,
-                                         obsByFrame: obsByFrame, points: pts)
-            if result.residualsPx.isEmpty { result.residualsPx.append(before) }
+            let rBefore = residuals(order: order, poses: poses, intr: intr,
+                                    obsByFrame: obsByFrame, points: pts)
+            if result.residualsPx.isEmpty { result.residualsPx.append(rBefore.total) }
 
             // 逐幀獨立求解（結構固定 ⇒ 相機之間解耦）
             var deltas: [Int: simd_float4x4] = [:]
@@ -126,14 +126,18 @@ nonisolated enum BundleAdjuster {
 
             var candidate = poses
             for (id, d) in deltas { if let c = candidate[id] { candidate[id] = d * c } }
-            let after = reprojectionRMS(order: order, poses: candidate, intr: intr,
-                                        obsByFrame: obsByFrame, points: trackPointsFor(candidate,
-                                            order: order, intr: intr, obsByFrame: obsByFrame))
-            guard after < before else { break }        // 自我驗證：沒變好就停
+            let rAfter = residuals(order: order, poses: candidate, intr: intr,
+                                   obsByFrame: obsByFrame,
+                                   points: trackPointsFor(candidate, order: order,
+                                                          intr: intr, obsByFrame: obsByFrame))
+            // 自我驗證用 **robust 成本**（＝求解實際最小化的量），不用原始 RMS。
+            // 原始 RMS 被少數誤匹配主導：一輪可能把 inlier 改善很多、RMS 卻沒降，
+            // 於是被誤判為「沒變好」而提早停止（實機 BA 卡在 8% 改善的成因）。
+            guard rAfter.robust < rBefore.robust else { break }
 
             poses = candidate
             bestPoses = candidate
-            result.residualsPx.append(after)
+            result.residualsPx.append(rAfter.total)
             result.roundsApplied = round + 1
         }
 
@@ -149,9 +153,13 @@ nonisolated enum BundleAdjuster {
                          order.count, observations.count,
                          Set(observations.map(\.trackID)).count, result.roundsApplied,
                          a, b, (1 - b / a) * 100))
-            print(String(format: "  分項: 重投影 %.2f px（⇒ 位姿誤差 %.2f cm @2m）、"
-                         + "深度 %.2f px（≈ LiDAR 雜訊 %.1f cm，非位姿誤差）",
-                         rEnd.reproj, Double(rEnd.reproj) * 2 / 1450 * 100,
+            // 中位數才是「典型」誤差：RMS 只擋 40px 硬上限，少數 30px 的誤匹配就能主導它。
+            // 位姿解讀要看中位數；RMS 與中位數的差距則代表誤匹配的比重。
+            print(String(format: "  重投影 RMS %.2f px / 中位數 %.2f px"
+                         + "（⇒ 典型位姿誤差 %.2f cm @2m；RMS 高於中位數的部分是誤匹配）",
+                         rEnd.reproj, rEnd.medianReproj,
+                         Double(rEnd.medianReproj) * 2 / 1450 * 100))
+            print(String(format: "  深度殘差 %.2f px（≈ %.1f cm，屬 LiDAR 量測雜訊，非位姿誤差）",
                          rEnd.depth, Double(rEnd.depth) * 2 / 1450 * 100))
         }
         return result
@@ -330,9 +338,14 @@ nonisolated enum BundleAdjuster {
                           intr: [Int: CameraIntrinsics],
                           obsByFrame: [Int: [FeatureObservation]],
                           points: [Int: SIMD3<Float>])
-        -> (total: Float, reproj: Float, depth: Float) {
+        -> (total: Float, reproj: Float, depth: Float, medianReproj: Float, robust: Double) {
         var sum: Double = 0, sumR: Double = 0, sumD: Double = 0
         var n = 0
+        var reprojMags: [Float] = []
+        // robust：與求解實際最小化的量一致（Huber 加權平方和）。
+        // 自我驗證必須用它，不能用原始 RMS —— 兩者不一致時，
+        // 一輪明明改善了 inlier 卻因為少數離群值讓 RMS 沒降而被判失敗、提早停止。
+        var robust: Double = 0
         for id in order {
             guard let c2w = poses[id], let K = intr[id], let obs = obsByFrame[id] else { continue }
             let w2c = c2w.inverse
@@ -355,13 +368,28 @@ nonisolated enum BundleAdjuster {
                     m2 += d2
                 }
                 sum += m2; sumR += r2; sumD += d2
+                let mag = Float(r2.squareRoot())
+                reprojMags.append(mag)
+                // Huber：|r| ≤ δ 用平方、超過改用線性（與 solveFrame 的加權一致）
+                robust += mag <= kHuberPx
+                    ? Double(mag * mag)
+                    : Double(kHuberPx * (2 * mag - kHuberPx))
+                if kDepthWeight > 0 {
+                    let dm = Float(d2.squareRoot())
+                    robust += dm <= kDepthHuberPx
+                        ? Double(dm * dm)
+                        : Double(kDepthHuberPx * (2 * dm - kDepthHuberPx))
+                }
                 n += 1
             }
         }
-        guard n > 0 else { return (.infinity, .infinity, .infinity) }
+        guard n > 0 else { return (.infinity, .infinity, .infinity, .infinity, .infinity) }
         let k = Double(n)
+        reprojMags.sort()
         return (Float((sum / k).squareRoot()),
                 Float((sumR / k).squareRoot()),
-                Float((sumD / k).squareRoot()))
+                Float((sumD / k).squareRoot()),
+                reprojMags[reprojMags.count / 2],
+                robust / k)
     }
 }

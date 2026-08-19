@@ -315,8 +315,11 @@ final class CaptureController: NSObject, ObservableObject {
         Task {
             // pause 必須等 RoomPlan 交回 CapturedRoomData 之後 —— session 一 pause
             // 它就收不完那一段了。waitForSegment 自帶逾時，不會卡住匯出流程。
-            await floorPlan.waitForSegment()
-            await saveWorldMap()                    // 同樣必須在 pause 之前：地圖要從活著的 session 取
+            // 不在這裡等 RoomPlan（它要 8 秒以上）—— 那 8 秒使用者是乾等的。
+            // build() 自己會等（逾時 20s），而它現在跑在背景、不擋 review。
+            // 唯一的取捨是 ARSession 會早一點 pause；實測 RoomPlan 的最終優化
+            // 不需要新的幀，資料照樣送達。
+            await saveWorldMap()                    // 必須在 pause 之前：地圖要從活著的 session 取
             arView?.session.pause()                 // review 期間停止追蹤，省電省熱
             monitor.stop()
             await processScan(refinedTransforms: refined, meshVertices: meshVerts)
@@ -384,13 +387,23 @@ final class CaptureController: NSObject, ObservableObject {
                   + "、\(demoted) 幀（顏色糊，不進訓練但深度仍以降權併入點雲）")
         }
 
-        // 重融合與平面圖建模**並行**：兩者完全獨立（一個吃深度、一個吃 RoomPlan 的
-        // CapturedRoomData），序列跑等於白等較短的那一個。
-        // RoomBuilder / StructureBuilder 是 Apple 的程式、秒級且無法加速，
-        // 但它可以整段藏在重融合底下。
+        // 平面圖**不擋 review**。
+        //
+        // 實測 RoomPlan 從 stop() 到 didEndWith 要 8 秒以上（它自己的最終優化），
+        // 而重融合只花 1 秒。先前把兩者並行仍然要等較慢的那個 ——
+        // 使用者按下停止後乾等 8 秒才看到點雲，而平面圖其實只有
+        // 「review 按平面圖」和「匯出」兩個時機才需要。
+        // 改成背景建，好了再更新 @Published；review 的平面圖按鈕本來就綁 floorPlanData != nil，
+        // 所以它會自己出現。
         let t0 = Date()
-        let wantPlan = config.captureFloorPlan && FloorPlanCapture.isSupported
-        async let planTask: FloorPlanData? = wantPlan ? floorPlan.build() : nil
+        if config.captureFloorPlan, FloorPlanCapture.isSupported {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let fp = await self.floorPlan.build()
+                self.floorPlanData = fp
+                if let fp { self.logFloorPlan(fp) }
+            }
+        }
 
         var points: [CloudPoint] = []
         var refuseSec: Double = 0
@@ -412,9 +425,7 @@ final class CaptureController: NSObject, ObservableObject {
             points = await accumulator.bestPoints(target: config.exportMaxPoints)
         }
 
-        floorPlanData = await planTask
-        if let fp = floorPlanData { logFloorPlan(fp) }
-        print(String(format: "處理耗時: 總計 %.2fs（其中重融合 %.2fs；平面圖建模與它並行）",
+        print(String(format: "處理耗時: 總計 %.2fs（其中重融合 %.2fs；平面圖在背景建，不擋 review）",
                      Date().timeIntervalSince(t0), refuseSec))
 
         reviewPoints = points
@@ -807,6 +818,9 @@ final class CaptureController: NSObject, ObservableObject {
     /// 匯出 COLMAP 用的世界翻轉**不**套用在這裡 —— 那是 3DGS 生態的慣例，平面圖不需要。
     private func writeFloorPlan(to dir: URL) async {
         guard config.captureFloorPlan, FloorPlanCapture.isSupported else { return }
+        // 平面圖是背景建的（見 processScan），匯出時若還沒好就在這裡等 ——
+        // 匯出是使用者明確要求的動作，少一個檔比多等幾秒糟。
+        if floorPlanData == nil { floorPlanData = await floorPlan.build() }
         await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
         guard let fp = floorPlanData else { return }
         do {
