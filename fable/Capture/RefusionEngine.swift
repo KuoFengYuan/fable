@@ -205,6 +205,21 @@ nonisolated enum RefusionEngine {
     static func refuse(records: [FrameRecord], sessionDir: URL, config: CaptureConfig,
                        meshVertices: [SIMD3<Float>] = [],
                        progress: @Sendable (Double) -> Void) -> [CloudPoint] {
+        // 先做位姿微調：位姿誤差是 3DGS 的解析度天花板（1cm @2m ≈ 7px 重投影），
+        // 修位姿之前先做高品質融合是本末倒置 —— 融出來的共識會帶著同樣的誤差。
+        var records = records
+        if config.poseRefineRounds > 0 {
+            let refined = refinePoses(records: records, sessionDir: sessionDir, config: config)
+            if refined.roundsApplied > 0 {
+                records = records.map { r in
+                    guard let m = refined.poses[r.id] else { return r }
+                    var out = r
+                    out.transform = rowMajor(m)
+                    return out
+                }
+            }
+        }
+
         var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM, maxCells: config.refuseMaxCells)
         let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
         let imagesDir = sessionDir.appendingPathComponent("images", isDirectory: true)
@@ -296,6 +311,148 @@ nonisolated enum RefusionEngine {
         }
         FileHandle.standardError.write(Data((msg + "\n").utf8))
         return out
+    }
+
+    /// simd_float4x4 → row-major 16（FrameRecord.transform 的格式）
+    static func rowMajor(_ m: simd_float4x4) -> [Double] {
+        (0..<4).flatMap { r in (0..<4).map { c in Double(m[c][r]) } }
+    }
+
+    /// 位姿微調：以「所有幀共同融出的點雲」為固定結構，逐幀求剛體修正量。
+    ///
+    /// 為什麼先做這一步：位姿誤差是 3DGS 的解析度天花板（1cm @2m ≈ 7px 重投影誤差，
+    /// 高斯縮得比它小就會被各視角的矛盾懲罰）。在修位姿之前先做高品質融合是本末倒置 ——
+    /// 融出來的共識會帶著同樣的誤差。
+    ///
+    /// 用粗取樣（poseRefineStride）跑，因為 6 個未知數不需要全像素：
+    /// 256×192 在 stride 3 下每幀約 5400 點，遠超所需，而每輪重建成本降到 1/9。
+    ///
+    /// **自我驗證**：每輪比對殘差，沒下降就回退並停止。所以預設開啟不會把資料改壞 ——
+    /// 最壞情況等於沒做。
+    static func refinePoses(records: [FrameRecord], sessionDir: URL,
+                            config: CaptureConfig) -> PoseRefineResult {
+        let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
+        let stride = max(1, config.poseRefineStride)
+
+        // 相機座標的點只讀一次；每輪用當下的位姿轉到世界，避免重複 IO 與反投影
+        struct Frame {
+            let id: Int
+            var c2w: simd_float4x4
+            let camLocal: [SIMD3<Float>]
+        }
+        var frames: [Frame] = []
+        for r in records where r.blurVerdict != .drop {
+            guard let depthFile = r.depthFile, let dw = r.depthWidth, let dh = r.depthHeight,
+                  dw > 0, dh > 0,
+                  let depth = try? Data(contentsOf: depthDir.appendingPathComponent(depthFile)),
+                  depth.count == dw * dh * 4 else { continue }
+            var conf: [UInt8]?
+            if let cf = r.confidenceFile,
+               let cd = try? Data(contentsOf: depthDir.appendingPathComponent(cf)),
+               cd.count == dw * dh { conf = [UInt8](cd) }
+
+            let K = r.intrinsics.scaled(toWidth: dw, height: dh)
+            let fx = Float(K.fx), fy = Float(K.fy), cx = Float(K.cx), cy = Float(K.cy)
+            let minD = config.pointMinDepthM, maxD = config.pointMaxDepthM
+            var local: [SIMD3<Float>] = []
+            local.reserveCapacity((dw / stride) * (dh / stride))
+            depth.withUnsafeBytes { raw in
+                let d = raw.bindMemory(to: Float32.self)
+                var v = 0
+                while v < dh {
+                    var u = 0
+                    while u < dw {
+                        let i = v * dw + u
+                        let z = d[i]
+                        // 微調只用 high confidence：這一步求的是位姿，寧可少也要準
+                        if z.isFinite, z > minD, z < maxD, (conf?[i] ?? 2) >= 2 {
+                            local.append(SIMD3<Float>((Float(u) - cx) / fx * z,
+                                                      -((Float(v) - cy) / fy * z), -z))
+                        }
+                        u += stride
+                    }
+                    v += stride
+                }
+            }
+            guard local.count >= PoseRefiner.kMinCorrespondences else { continue }
+            frames.append(Frame(id: r.id, c2w: float4x4(rowMajor: r.transform), camLocal: local))
+        }
+        var result = PoseRefineResult()
+        guard frames.count >= 3 else { return result }
+
+        @inline(__always) func world(_ f: Frame) -> [SIMD3<Float>] {
+            f.camLocal.map { p in
+                let w = f.c2w * SIMD4<Float>(p, 1)
+                return SIMD3<Float>(w.x, w.y, w.z)
+            }
+        }
+        func buildGrid() -> FusedVoxelGrid {
+            var g = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM,
+                                   maxCells: config.refuseMaxCells)
+            for f in frames {
+                g.insert(world(f).map { CloudPoint(x: $0.x, y: $0.y, z: $0.z,
+                                                   r: 0, g: 0, b: 0, score: 1) })
+            }
+            return g
+        }
+
+        var best = frames.map(\.c2w)
+        for round in 0..<config.poseRefineRounds {
+            let grid = buildGrid()
+            var deltas: [Int: simd_float4x4] = [:]
+            var sumSq: Double = 0
+            var counted = 0
+            for (idx, f) in frames.enumerated() {
+                let wp = world(f)
+                let camPos = SIMD3<Float>(f.c2w.columns.3.x, f.c2w.columns.3.y, f.c2w.columns.3.z)
+                guard let (delta, rms) = PoseRefiner.solveRigid(worldPoints: wp, camPos: camPos,
+                                                               grid: grid) else { continue }
+                deltas[idx] = delta
+                sumSq += rms * rms
+                counted += 1
+            }
+            guard counted > 0 else { break }
+            let residual = (sumSq / Double(counted)).squareRoot()
+
+            // 第一輪的殘差就是「修正前」的基準
+            if result.residualsM.isEmpty { result.residualsM.append(residual) }
+            else if residual >= result.residualsM.last! {
+                // 沒有變好 → 回退到上一輪並停止（自我驗證）
+                for (i, m) in best.enumerated() { frames[i].c2w = m }
+                break
+            } else {
+                result.residualsM.append(residual)
+            }
+
+            PoseRefiner.removeGlobalDrift(&deltas)
+            best = frames.map(\.c2w)
+            for (idx, d) in deltas { frames[idx].c2w = d * frames[idx].c2w }
+            result.roundsApplied = round + 1
+        }
+
+        // 最後一輪套用後還要再量一次，否則 residualsM 少了最終值
+        if result.roundsApplied > 0 {
+            let grid = buildGrid()
+            var sumSq: Double = 0, counted = 0
+            for f in frames {
+                let camPos = SIMD3<Float>(f.c2w.columns.3.x, f.c2w.columns.3.y, f.c2w.columns.3.z)
+                if let (_, rms) = PoseRefiner.solveRigid(worldPoints: world(f), camPos: camPos,
+                                                        grid: grid) {
+                    sumSq += rms * rms; counted += 1
+                }
+            }
+            if counted > 0 { result.residualsM.append((sumSq / Double(counted)).squareRoot()) }
+            for f in frames { result.poses[f.id] = f.c2w }
+        }
+
+        if let a = result.residualsM.first, let b = result.residualsM.last {
+            print(String(format: "位姿微調: %d 幀 × %d 輪 → 殘差 %.2f → %.2f cm"
+                         + "（等效 2m 處重投影 %.1f → %.1f px，改善 %.0f%%）",
+                         frames.count, result.roundsApplied, a * 100, b * 100,
+                         PoseRefineResult.pixelsAt2m(a), PoseRefineResult.pixelsAt2m(b),
+                         result.improvedPercent))
+        }
+        return result
     }
 
     static func float4x4(rowMajor m: [Double]) -> simd_float4x4 {
