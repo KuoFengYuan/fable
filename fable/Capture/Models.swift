@@ -35,12 +35,18 @@ nonisolated struct FrameRecord: Codable, Sendable {
     var intrinsics: CameraIntrinsics
     var exposureDuration: Double
     var exposureOffsetEV: Double
+    /// 拍攝當下的感光度。顆粒感的直接成因，也是判斷「要不要降噪」的依據 ——
+    /// 低 ISO 還有顆粒代表問題不在感光度，降噪只會白白吃掉細節。
+    var iso: Double = 0
     var ambientLux: Double?
     var estimatedBlurPx: Double
     /// 影像清晰度的直接量測（歸一化二階差分能量）與其相對基準線的比例。
     /// 離線挑幀用：同一區域拍到多張時，可據此選最鋭利的餵給訓練。
     var sharpness: Double = 0
     var sharpnessRatio: Double = 1
+    /// 掃描結束後的全域複核結果（見 BlurFilter）。刻意保留在紀錄裡而非直接刪除 ——
+    /// 被排除的幀仍留在 poses_refined.jsonl 與 images/ 內，可回頭檢查判定對不對。
+    var blurVerdict: BlurVerdict = .keep
     var imageFile: String
     var depthFile: String?
     var confidenceFile: String?
@@ -61,6 +67,28 @@ nonisolated struct SessionMeta: Codable, Sendable {
     var imageOrientation = "sensor_landscape_right"
     var depthFormat = "float32_raw_little_endian"
     var lidarAvailable: Bool
+}
+
+/// 掃描結束後的品質摘要。
+/// 這些數字本來只走 print()，使用者完全看不到 —— 而它們正是判斷
+/// 「這次掃描能不能用、要不要重掃」的依據，應該當面講。
+nonisolated struct ScanSummary: Sendable {
+    var keyframes = 0
+    /// ARKit 回頭修正關鍵幀位置的幅度（公分）。大＝這次漂移嚴重、全域幾何可信度低
+    var driftMedianCm = 0.0
+    var driftMaxCm = 0.0
+    var traveledM = 0.0
+    /// 有沒有走回起點讓 ARKit 做全域修正。未閉合＝遠端的累積誤差留在資料裡了
+    var loopClosed = false
+    /// 掃描後複核排除的幀（幾何不可信 + 顏色糊）
+    var blurDropped = 0
+    var blurDemoted = 0
+    /// 世界地圖大小（MB）；nil = 沒存成（追蹤品質不足或超過上限）
+    var worldMapMB: Double?
+    /// BA 前後的重投影 RMS（像素）。這是 3DGS 解析度天花板的直接量測 ——
+    /// 1cm 位姿誤差 @2m ≈ 7px，所以這個數字就是「高斯最細能到多細」
+    var baBeforePx: Float?
+    var baAfterPx: Float?
 }
 
 /// 世界座標彩色點。score 為採集品質分數（距離近、靠畫面中心、低模糊 → 高分），

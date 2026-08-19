@@ -40,6 +40,17 @@ struct CaptureView: View {
             HUDOverlay(controller: controller)
         }
         .statusBarHidden()
+        // 平面圖用獨立頁面而非疊層：它的資訊與操作跟點雲檢視完全不同一組，
+        // 疊在 HUD 上兩邊會互相打架（標頭被統計面板夾住、圖例被訓練按鈕壓掉）。
+        // fullScreenCover 也順便讓 HUD 整個退場，不必逐項判斷該不該隱藏。
+        .fullScreenCover(isPresented: $controller.showFloorPlan) {
+            if let fp = controller.floorPlanData {
+                FloorPlanView(data: fp,
+                              onClose: { controller.showFloorPlan = false },
+                              onRename: { i, name in controller.renameRoom(at: i, to: name) },
+                              showFurniture: $controller.showPlanFurniture)
+            }
+        }
         .onDisappear { controller.teardown() }
     }
 

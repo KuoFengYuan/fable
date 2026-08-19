@@ -80,6 +80,9 @@ nonisolated enum PointExtractor {
         let minConf = config.minDepthConfidence
         let edgeRatio = config.depthEdgeRejectRatio
         let sharpness = 1 / (1 + packet.blurPixels / 4)
+        // medium 信心深度降權（與重融合同一組參數，兩邊的覆蓋判定才一致 ——
+        // 預覽熱圖必須 ⊇ 重融合實際會用到的，否則熱圖會把已經夠的地方標成缺）
+        let mediumW = config.mediumConfidenceWeight
 
         return packet.depth.withUnsafeBytes { raw -> [CloudPoint] in
             let d = raw.bindMemory(to: Float32.self)
@@ -91,7 +94,8 @@ nonisolated enum PointExtractor {
                 while u < dw {
                     let i = v * dw + u
                     let z = d[i]
-                    if z.isFinite, z > minD, z < maxD, (conf?[i] ?? 2) >= minConf {
+                    let cv = conf?[i] ?? 2
+                    if z.isFinite, z > minD, z < maxD, cv >= minConf {
                         var ok = true
                         // 飛點過濾：物體輪廓的前後景插值拖影點
                         if u + 1 < dw {
@@ -115,7 +119,8 @@ nonisolated enum PointExtractor {
                             let central = 1 - min(1, (ru * ru + rv * rv).squareRoot() * 1.4) * 0.5
                             let near = 1 / (0.5 + z)
                             out.append(CloudPoint(x: w4.x, y: w4.y, z: w4.z, r: r, g: g, b: b,
-                                                  score: central * near * sharpness))
+                                                  score: central * near * sharpness
+                                                         * (cv >= 2 ? 1 : mediumW)))
                         }
                     }
                     u += stride

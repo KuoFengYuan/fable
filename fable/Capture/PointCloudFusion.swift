@@ -228,7 +228,8 @@ nonisolated struct TiledFusedGrid {
                                          score: c.bestScore * min(1, c.weight / 1.5)))
             }
         }
-        return PointCloudMath.stratifiedBest(points, startCell: voxelSize * 2, target: target)
+        // 同 RefusionEngine：起始用原生 voxelSize，加粗幅度交給解析步長決定
+        return PointCloudMath.stratifiedBest(points, startCell: voxelSize, target: target)
     }
 
     private static func translation(_ t: SIMD3<Float>) -> simd_float4x4 {

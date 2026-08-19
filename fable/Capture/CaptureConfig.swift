@@ -38,11 +38,28 @@ nonisolated struct CaptureConfig: Sendable {
     var maxPendingWrites = 3
 
     // MARK: - 品質門檻（兩級制：警告 → 提醒但照拍；遮斷 → 暫停抓幀）
-    /// 動態模糊警告門檻（像素）：blur ≈ (角速度 + 線速度/景深) × 焦距 × 曝光時間。
-    /// 8px/1920 寬 ≈ 0.4%，輕微模糊、仍可訓練 —— 只給橘色提醒，不擋拍。
-    var maxBlurPixels: Float = 8.0
-    /// 模糊遮斷門檻：超過才紅色警告＋暫停抓幀（1/60s 曝光下約等於角速度 0.66 rad/s 的甩動）
-    var blockBlurPixels: Float = 16.0
+    /// 幾何劣化警告門檻（像素）：
+    ///   blur ≈ (角速度 + 線速度/景深) × 焦距 × (曝光時間 ＋ 捲簾讀出時間)
+    ///
+    /// **門檻隨捲簾快門項一併重新校準過。** 加入讀出時間後，同樣的動作在明亮環境
+    /// （曝光 1/120s）算出來的值是原本的 2.2 倍 —— 舊的 8/16 是以「只算曝光」校準的，
+    /// 沿用會讓正常掃描一直跳紅字（實測回報過）。以 fx≈1450、總抹動時間 18.3ms 重算：
+    ///
+    ///   0.3 rad/s（17°/s，很慢的平移）→  8px
+    ///   0.5 rad/s（29°/s，正常掃描）  → 13px
+    ///   0.9 rad/s（52°/s，明顯轉身）  → 24px
+    ///   1.0 rad/s（57°/s）            → 27px ← 實機回報那張糊掉的照片就在這一級
+    ///
+    /// 警告設 10、遮斷設 24（≈0.9 rad/s）。
+    ///
+    /// 警告值由**實機資料**決定而非推導：一次回報中位數 11.4px 的掃描，
+    /// 清晰度閘門丟掉了 69% 的幀，而 HUD 全程沒有警告（當時警告線是 14）。
+    /// 也就是說清晰度閘門實際的作用點在 ~11px，警告必須落在它**之前**，
+    /// 否則使用者會在毫無提示的情況下流失大部分資料。
+    /// 遮斷維持 24：那是「連姿態都不能信」的層級，與清晰度無關。
+    var maxBlurPixels: Float = 10.0
+    /// 遮斷門檻：超過才紅色警告＋暫停抓幀
+    var blockBlurPixels: Float = 24.0
     /// 關鍵幀的清晰度門檻：本幀清晰度 ÷「近 0.5s 內同場景的最佳清晰度」須達此比例。
     ///
     /// 為什麼需要它 —— blockBlurPixels 是**推估**（角速度 × 曝光時間），只涵蓋動態模糊，
@@ -87,6 +104,21 @@ nonisolated struct CaptureConfig: Sendable {
     /// 且 3DGS 對同一表面吃 10~30 個視角、雜訊以 √N 收斂 —— 最終成品比任一單張都乾淨得多。
     var jpegQuality: Double = 0.95
     var saveDepth = true
+    /// 高 ISO 時對存檔影像做輕度降噪的門檻。低於此值不處理。
+    ///
+    /// **為什麼只在高 ISO 才做** —— 3DGS 對同一表面吃 10~30 個視角，感光雜訊是零均值的，
+    /// 光度損失收斂到的就是多視角平均，雜訊本來就會以 √N 消掉。
+    /// 也就是說：對訓練而言，逐幀降噪能拿掉的東西「平均」本來就會拿掉，
+    /// 但降噪順手削掉的真實細節，平均**救不回來** —— 純以訓練論，降噪是負分。
+    /// 它真正值得做的地方有兩個：(a) 匯出的照片是給人看的；
+    /// (b) 雜訊會製造假梯度，讓 MRNF 的密集化把高斯浪費在雜訊上（floaters）。
+    /// 所以策略是「只在雜訊真的壓過細節時才動手，而且下手要輕」。
+    /// ISO 400 以下的 iPhone 主鏡雜訊遠低於 JPEG 量化誤差，動它沒有意義。
+    var denoiseISOThreshold: Double = 400
+    /// 降噪強度上限（CINoiseReduction 的 inputNoiseLevel；Apple 預設 0.02）。
+    /// 由 ISO 在 [threshold, 4×threshold] 之間以 log 內插到此值，超過就封頂。
+    /// 設 0 等於關閉降噪。
+    var denoiseMaxNoiseLevel: Double = 0.022
     // 相機參數鎖定（曝光/白平衡；對焦維持連續自動）為使用者可切換選項，
     // 見 CaptureController.lockCameraParams（預設開啟）
 
@@ -156,8 +188,19 @@ nonisolated struct CaptureConfig: Sendable {
     /// 孤立點移除：占據 voxel 的 26 鄰域中占據數少於此值 → 視為飄浮雜點剔除（0 = 關閉）。
     /// 專清空間中不貼表面的白霧；過大會咬掉細線/薄物，3 為保守值。
     var refuseMinNeighbors = 3
-    /// 只接受此信心等級以上的深度（2 = ARConfidenceLevel.high）
-    var minDepthConfidence: UInt8 = 2
+    /// 只接受此信心等級以上的深度（ARConfidenceLevel：0=low, 1=medium, 2=high）。
+    ///
+    /// 從 2（只收 high）放寬到 1（收 medium）。medium 大多出現在物體邊緣、
+    /// 深色表面與較遠處 —— 比較吵，但**不是錯的**，而且飛點過濾
+    /// （depthEdgeRejectRatio）與孤立點移除本來就會擋掉真正的壞值。
+    /// 實機 log 顯示 26.4% 的格子完全沒有 LiDAR 覆蓋、只靠 mesh 撐著；
+    /// 在覆蓋率這麼吃緊的情況下，把可用但較吵的觀測整片丟掉並不划算 ——
+    /// 收進來給低權重，讓多視角加權平均自己決定要不要相信它。
+    var minDepthConfidence: UInt8 = 1
+    /// medium 信心深度的分數倍率（high = 1.0）。
+    /// 0.4 使得「一次 high 觀測」勝過「兩次 medium」，high 存在時由它主導；
+    /// 只有在完全沒有 high 的格子，medium 才成為唯一來源 —— 那正是要補的洞。
+    var mediumConfidenceWeight: Float = 0.4
     /// 深度圖取樣步長（256×192 下 stride 2 → 每次融合約 1.2 萬個候選點）
     var depthSampleStride = 2
     /// 點雲融合的深度有效範圍（LiDAR 超過 5m 雜訊明顯）
@@ -172,8 +215,9 @@ nonisolated struct CaptureConfig: Sendable {
     /// 空間磚尺寸（公尺）：點雲按磚分塊渲染，每磚掛一個 ARAnchor ——
     /// ARKit 漂移修正 / 重定位時磚跟著移動，點雲不會與實體表面錯位（防殘影核心）
     var previewTileSizeM: Float = 1.2
-    /// 點雲融合的模糊閘門（比抓幀遮斷更嚴）：模糊幀的姿態-深度錯位是殘影另一來源
-    var previewMaxBlurPixels: Float = 12
+    /// 點雲融合的模糊閘門（比抓幀遮斷更嚴）：模糊幀的姿態-深度錯位是殘影另一來源。
+    /// 與 maxBlurPixels/blockBlurPixels 同步隨捲簾項重新校準（18 ≈ 0.68 rad/s）
+    var previewMaxBlurPixels: Float = 18
     /// 融合的「相機穩定度」閘門：只在相機夠穩時才把深度融進點雲。
     /// 模糊值受曝光時間影響（亮處曝光短→快速移動仍判定為低模糊），無法反映「姿態延遲/誤差」；
     /// 移動過快時姿態不準 → 同一表面被投影到不同世界座標 → 殘影＋點不貼合。故另設速度硬閘門。
@@ -210,6 +254,59 @@ nonisolated struct CaptureConfig: Sendable {
     var trainPreviewEvery = 50
     /// 熱狀態達 .serious 以上時暫停訓練（散熱保護，避免 thermal shutdown）
     var trainThermalThrottle = true
+
+    // MARK: - 平面圖（RoomPlan，與 3DGS 採集共用同一個 ARSession）
+    /// 掃描時同步擷取 RoomPlan 平面圖，匯出時一併輸出 usdz / json / svg。
+    ///
+    /// 共生的前提我們本來就滿足（gravity 對齊、sceneDepth、mesh），所以「多掃一趟」的成本是零。
+    /// 但**運算成本不是零** —— RoomPlan 會持續跑牆面偵測與物件分類。
+    /// 本專案已經對散熱敏感（thermalState 到 .critical 會自動停拍），
+    /// 長時間整屋掃描若發現提早過熱，這是第一個該關掉的開關。
+    /// 只在支援 RoomPlan 的機型生效（見 FloorPlanCapture.isSupported）。
+    var captureFloorPlan = true
+
+    // MARK: - 位姿微調（以 LiDAR 共識點雲為固定結構，非完整 BA）
+    /// 局部 BA 的輪數（0 = 關閉）。以 ARKit＋錨點修正為初值，用掃描時同步建立的
+    /// 跨幀特徵對應做微調。殘差 = 重投影 ＋ 深度（後者擋住沿光軸的退化）。
+    /// 每輪自我驗證：RMS 沒下降就回退並停止。
+    /// 10 輪。實機資料跑完全部 3 輪仍持續改善（改善率 10%、從未觸發自我驗證的回退）
+    /// —— 也就是**迭代次數不足**而非收斂。離線測試在 8 輪達到 96% 改善。
+    /// 每輪只是對 ~3000 個觀測各做一次 6×6 求解，微秒級，輪數幾乎免費；
+    /// 而自我驗證會在真正收斂時自動停止，設大不會有壞處。
+    var baRounds = 10
+
+    /// （已停用的舊路徑）幾何式位姿微調的輪數。**目前為 0（關閉）** —— 求解器的對應方式被離線測試否決了。
+    ///
+    /// 原設計用「點落在哪個 voxel」建立對應。離線測試（tools/test_pose_refine.swift）
+    /// 拿單一平面做對照，結果決定性地否定了它：
+    ///
+    ///   沿平面切向偏 3cm → 只呈現 0.95cm 的表觀誤差（點落進同平面的鄰格）
+    ///   沿平面法向偏 3cm → **0/40000 點有對應**（全部落進空格）
+    ///
+    /// 也就是在最該修正的方向完全收不到訊號、在不該動的方向給誤導訊號。
+    /// 這不是調參問題，是對應方式錯了 —— 正解是鄰域最近點搜尋 ＋ 點到面殘差
+    /// （standard ICP），而不是 voxel containment。
+    ///
+    /// 程式碼保留（PoseRefiner 的 6×6 線性化求解、阻尼、夾住、去全域漂移都已驗證正確：
+    /// 無擾動時修正量 0mm、去漂移後平均為 0），等對應方式改對再打開。
+    /// 每輪的自我驗證機制也還在，所以就算誤開也只是白花時間、不會改壞資料。
+    var poseRefineRounds = 0
+    /// 微調時的深度取樣步長。3 在 256×192 下每幀約 5400 點 ——
+    /// 遠超求解 6 個未知數所需，而粗取樣讓每輪的重建成本降到 1/9。
+    /// 最終的高品質融合仍用 refuseSampleStride（全像素）。
+    var poseRefineStride = 3
+
+    // MARK: - 迴環閉合（降低累積漂移，投報率最高的一項）
+    /// 走多遠之後開始提示「回起點閉環」（公尺）。
+    ///
+    /// 為什麼需要提示：ARKit 只有在認出「我來過這裡」時才會做全域修正，
+    /// 把累積誤差攤回整條軌跡。走一條開放路徑不回頭的話，誤差一路累積、
+    /// 而且**不會有任何警告** —— 姿態看起來一樣正常，錯的是全域尺度與朝向。
+    /// 房間尺度的 VIO 漂移約軌跡長度的 0.5~2%，走 10m 就是 5~20cm。
+    var loopHintTravelM: Float = 8
+    /// 回到起點多近算閉合（公尺）。ARKit 的重定位需要看到相似的視野，
+    /// 1.5m 內大致就會觸發；太小會讓提示永遠不消失。
+    var loopClosedRadiusM: Float = 1.5
 
     // MARK: - 涵蓋率圓頂（物件模式）
     var domeAzimuthBins = 24

@@ -63,6 +63,25 @@ def main():
     else:
         print(f"    {OK} 全部 ≤ 1/60s")
 
+    # --- 1b. 感光度（顆粒感的直接成因）-----------------------------------
+    print("\n[1b] 感光度 ISO（顆粒感的直接成因）")
+    isos = sorted(r.get("iso", 0) for r in recs)
+    if isos[-1] <= 0:
+        print(f"    {WARN} 此掃描沒有 iso 欄位（舊版 App），跳過")
+    else:
+        med, hi = isos[n // 2], isos[-1]
+        over = sum(1 for i in isos if i > 400)
+        print(f"    中位數 {med:.0f}、最高 {hi:.0f}、超過 400 的有 {pct(over, n)}")
+        if med <= 200:
+            print(f"    {OK} ISO 很低 —— 顆粒感**不是**感光度造成的，降噪不會生效也不該生效。")
+            print("        剩下的顆粒是 ARKit video 幀本身的特性（無多幀降噪），")
+            print("        唯一的解法是改走照片管線 captureHighResolutionFrame()。")
+        elif med <= 800:
+            print(f"    {OK} ISO 中等 —— 自適應降噪會在超過 400 的那 {pct(over, n)} 幀上輕度介入")
+        else:
+            print(f"    {WARN} ISO 偏高 —— 現場光線不足。補光的效果會遠大於任何後處理；")
+            print("        或考慮放寬 CameraControls.kMaxShutter（代價是動態模糊變多）")
+
     # --- 2. 清晰度閘門 ---------------------------------------------------
     print("\n[2] 清晰度（sharpnessRatio：本幀 ÷ 同場景近期最佳）")
     if "sharpnessRatio" not in recs[0]:
@@ -82,10 +101,36 @@ def main():
             print(f"      {r['imageFile']}  ratio {r['sharpnessRatio']:.2f}"
                   f"  絕對值 {r['sharpness']:.3f}  估計劣化 {r['estimatedBlurPx']:.1f}px")
 
+    # --- 2b. 掃描後的全域模糊複核（BlurFilter）---------------------------
+    print("\n[2b] 掃描後全域複核 blurVerdict")
+    verdicts = [r.get("blurVerdict", "keep") for r in recs]
+    if "blurVerdict" not in recs[0]:
+        print(f"    {WARN} 此掃描沒有 blurVerdict 欄位（舊版 App），跳過")
+    else:
+        drop = [r for r in recs if r.get("blurVerdict") == "drop"]
+        demo = [r for r in recs if r.get("blurVerdict") == "demote"]
+        keep = n - len(drop) - len(demo)
+        print(f"    keep {keep} / demote {len(demo)} / drop {len(drop)}")
+        print("      demote = 顏色糊，不進訓練，但深度仍以降權併入點雲（幾何來自 LiDAR，丟了只會開洞）")
+        print("      drop   = 幾何不可信（轉太快 → 姿態錯位＋捲簾剪切），點雲也不用（殘影比破洞更糟）")
+        if (len(drop) + len(demo)) / n > 0.28:
+            print(f"    {WARN} 排除比例 {(len(drop)+len(demo))/n*100:.0f}% 已接近 30% 上限 ——")
+            print("        代表整段掃描普遍偏糊，補拍會比調參有效")
+        for r in (drop + demo)[:5]:
+            print(f"      {r['imageFile']}  {r['blurVerdict']:<6}"
+                  f"  sharpness {r.get('sharpness', 0):.3f}"
+                  f"  劣化 {r['estimatedBlurPx']:.1f}px")
+
     # --- 3. 幾何劣化估計（含捲簾快門）-----------------------------------
-    print("\n[3] 幾何劣化估計 estimatedBlurPx（運動模糊 ＋ 捲簾剪切）")
-    bl = sorted(r["estimatedBlurPx"] for r in recs)
-    print(f"    中位數 {bl[n//2]:.1f}px、最差 {bl[-1]:.1f}px")
+    # 只看實際會進訓練的幀 —— 被 BlurFilter 排除的本來就是要丟的，拿它們來判失敗是錯的
+    print("\n[3] 幾何劣化估計 estimatedBlurPx（運動模糊 ＋ 捲簾剪切，僅計 keep 的幀）")
+    kept = [r for r in recs if r.get("blurVerdict", "keep") == "keep"]
+    if not kept:
+        print(f"    {FAIL} 沒有任何幀通過複核")
+        return 1
+    bl = sorted(r["estimatedBlurPx"] for r in kept)
+    n = len(kept)
+    print(f"    {n} 幀，中位數 {bl[n//2]:.1f}px、最差 {bl[-1]:.1f}px")
     if bl[-1] > 16:
         problems += 1
         print(f"    {FAIL} 最差 {bl[-1]:.1f}px 超過 blockBlurPixels(16) 卻仍被存檔")
@@ -120,6 +165,49 @@ def main():
               f"（振幅 {spread:.2f}%，畫面邊緣 ≈ {edge_px:.1f}px）")
         print("        ← 這就是逐幀內參吸收掉的量。若 <0.1% 表示這台機器幾乎不呼吸，"
               "單一相機本來也夠；若 >1% 則逐幀內參是必要的。")
+
+    # --- 5. 平面圖（RoomPlan）--------------------------------------------
+    print("\n[5] 平面圖 floorplan.{usdz,json,svg}")
+    fp_path = args.scan_dir / "floorplan.json"
+    if not fp_path.exists():
+        print(f"    {WARN} 沒有 floorplan.json（未開啟 captureFloorPlan、機型不支援，或尚未匯出）")
+    else:
+        fp = json.loads(fp_path.read_text())
+        walls = fp.get("walls", [])
+        print(f"    {fp.get('roomCount', 1)} 房 · {len(walls)} 牆 · {len(fp.get('doors', []))} 門"
+              f" · {len(fp.get('windows', []))} 窗 · {len(fp.get('objects', []))} 家具")
+        for name in ("floorplan.usdz", "floorplan.svg"):
+            mark = OK if (args.scan_dir / name).exists() else WARN
+            print(f"    {mark} {name}")
+        if walls:
+            lens = sorted(w["lengthM"] for w in walls)
+            hts = sorted(w["dimensions"][1] for w in walls if len(w["dimensions"]) > 1)
+            b = fp.get("boundsM", [])
+            print(f"    牆長中位數 {lens[len(lens)//2]:.2f}m、最長 {lens[-1]:.2f}m")
+            if b and len(b) == 4:
+                print(f"    外接尺寸 {b[2]-b[0]:.2f} × {b[3]-b[1]:.2f} m"
+                      f"（外接面積 {fp.get('boundingAreaM2', 0):.1f} m²，非實際地板面積）")
+            # 掃描完整度。這裡原本判定的是「dimensions 軸序相反」，那是錯的 ——
+            # Apple 文件定義 Surface.dimensions 為 (width, height, depth)，假設本來就對；
+            # 樓高偏低的真正成因是牆沒被掃到頂。舊判斷只會對不完整的掃描說謊。
+            incomplete = []
+            if hts and hts[len(hts) // 2] < 2.0:
+                incomplete.append(f"牆只掃到 {hts[len(hts)//2]:.2f}m 高（鏡頭要帶到牆與天花板的交界）")
+            if b and len(b) == 4 and lens[-1] < max(b[2] - b[0], b[3] - b[1]) * 0.5:
+                incomplete.append("牆面破碎、房間未閉合（沿牆走一圈並回到起點）")
+            if not fp.get("doors") and not fp.get("windows"):
+                incomplete.append("沒有偵測到任何門窗（沿牆掃時讓門窗完整入鏡）")
+            if incomplete:
+                print(f"    {WARN} 掃描不完整：")
+                for r in incomplete:
+                    print(f"        · {r}")
+                print("        RoomPlan 要沿牆掃一圈，3DGS 要繞著物件多視角拍 ——")
+                print("        共用 session 是免費的，共用掃描路徑不是")
+            else:
+                hm = hts[len(hts) // 2] if hts else 0
+                print(f"    {OK} 樓高 {hm:.2f}m、牆完整、有門窗 → 掃描涵蓋看起來足夠")
+            print("    ↓ 拿雷射測距儀量最長那道牆與最長對角線，跟上面對一次 ——")
+            print("      這是唯一能確認平面圖精度的方法（VIO 漂移不會自己報錯）")
 
     print()
     print(f"{FAIL} {problems} 項未通過" if problems else f"{OK} 全部通過")

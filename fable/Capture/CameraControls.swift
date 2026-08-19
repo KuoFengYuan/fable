@@ -63,6 +63,9 @@ final class CameraControls: ObservableObject {
     @Published var focusManual = false
     @Published var lensPosition: Float = 0.5
 
+    /// 裝置當下的感光度（存進 FrameRecord 供診斷與自適應降噪；讀不到時回 0）
+    var currentISO: Double { device.map { Double($0.iso) } ?? 0 }
+
     /// 是否有任何手動覆寫（UI 用來提示「已手動」）
     var hasManualOverride: Bool {
         isoManual || shutterManual || wbManual || focusManual || ev != 0

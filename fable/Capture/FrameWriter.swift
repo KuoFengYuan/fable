@@ -18,13 +18,18 @@ actor FrameWriter {
     private let depthDir: URL?
     private var posesHandle: FileHandle?
     private let jpegQuality: Double
+    private let denoiseISOThreshold: Double
+    private let denoiseMaxNoiseLevel: Double
     private let ciContext = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
     private let encoder: JSONEncoder
     private(set) var records: [FrameRecord] = []
 
-    init(sessionDir: URL, saveDepth: Bool, jpegQuality: Double) throws {
+    init(sessionDir: URL, saveDepth: Bool, jpegQuality: Double,
+         denoiseISOThreshold: Double = .infinity, denoiseMaxNoiseLevel: Double = 0) throws {
         self.jpegQuality = jpegQuality
+        self.denoiseISOThreshold = denoiseISOThreshold
+        self.denoiseMaxNoiseLevel = denoiseMaxNoiseLevel
 
         imagesDir = sessionDir.appendingPathComponent("images", isDirectory: true)
         try FileManager.default.createDirectory(at: imagesDir, withIntermediateDirectories: true)
@@ -50,7 +55,16 @@ actor FrameWriter {
         var record = kf.record
         do {
             // JPEG 編碼（sensor 原始方向，與 intrinsics / transform 自洽）
-            let ci = CIImage(cvPixelBuffer: kf.pixelBuffer)
+            let src = CIImage(cvPixelBuffer: kf.pixelBuffer)
+            var ci = src
+            if let level = noiseLevel(forISO: record.iso) {
+                // inputSharpness 刻意壓在 0.2（Apple 預設 0.4）：降噪後的再銳化會沿邊緣造光暈，
+                // 那是憑空生出來、且各幀不一致的高頻 —— 3DGS 會試圖用高斯去解釋它。
+                ci = src.applyingFilter("CINoiseReduction",
+                                        parameters: ["inputNoiseLevel": level,
+                                                     "inputSharpness": 0.2])
+                        .cropped(to: src.extent)
+            }
             let qualityKey = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
             guard let jpeg = ciContext.jpegRepresentation(of: ci, colorSpace: colorSpace,
                                                           options: [qualityKey: jpegQuality]) else {
@@ -78,6 +92,16 @@ actor FrameWriter {
         } catch {
             print("[FrameWriter] 寫入失敗 frame \(record.id): \(error)")
         }
+    }
+
+    /// ISO → 降噪強度。門檻以下回 nil（完全不套濾鏡，連 GPU pass 都省）。
+    /// 強度隨 ISO 以 log2 內插：門檻處 0、4× 門檻處封頂。
+    /// 用 log 而非線性，是因為雜訊的標準差大致 ∝ √ISO、感知上也是對數的。
+    private func noiseLevel(forISO iso: Double) -> Double? {
+        guard denoiseMaxNoiseLevel > 0, iso > denoiseISOThreshold else { return nil }
+        let t = min(1, log2(iso / denoiseISOThreshold) / 2)     // 2 個 stop 到頂
+        let level = denoiseMaxNoiseLevel * t
+        return level > 1e-4 ? level : nil
     }
 
     /// 讀取目前累積的紀錄（不關檔 —— review 後仍可「繼續掃描」續寫）
