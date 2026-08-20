@@ -367,18 +367,20 @@ final class CaptureController: NSObject, ObservableObject {
             print(await featureTracker.stats())
             let ba = BundleAdjuster.refine(records: refinedRecords, observations: obs,
                                            rounds: config.baRounds)
-            if ba.roundsApplied > 0 && config.baApplyPoses {
+            // ba.poses 只在保留集通過閘門時才非空（見 BundleAdjuster.kHoldoutGate）——
+            // 也就是「這次掃描的 BA 確實讓沒參與求解的 track 也變準了」。
+            if !ba.poses.isEmpty && config.baApplyPoses {
                 refinedRecords = refinedRecords.map { r in
                     guard let m = ba.poses[r.id] else { return r }
                     var out = r
                     out.transform = RefusionEngine.rowMajor(m)
                     return out
                 }
-            } else if ba.roundsApplied > 0 {
+            } else if !ba.poses.isEmpty {
                 // 一定要講出來。BA 的那幾行 log 照樣印，若不說「沒套用」，
                 // 看 log 的人（包括我自己）會以為輸出用的是修正後的位姿。
-                print("  ⚠️ 以上 BA 結果**未套用** —— 輸出用的是 ARKit＋錨點修正的位姿"
-                      + "（config.baApplyPoses = false，理由見該欄註解）")
+                print("  ⚠️ 保留集通過但 config.baApplyPoses = false（硬總開關）"
+                      + " → 輸出仍用 ARKit＋錨點修正的位姿")
             }
             baResult = ba
         }
@@ -906,7 +908,7 @@ final class CaptureController: NSObject, ObservableObject {
         s.baAfterPx = baResult?.residualsPx.last
         // 這兩欄是為了讓摘要無法被誤讀：只有 baApplied 為真時，baAfterPx 才描述
         // 實際輸出；否則輸出的天花板是 baBeforePx，而 baHoldoutDelta 是「若套用會怎樣」。
-        s.baApplied = config.baApplyPoses && (baResult?.roundsApplied ?? 0) > 0
+        s.baApplied = config.baApplyPoses && !(baResult?.poses.isEmpty ?? true)
         s.baHoldoutDelta = baResult?.holdoutDelta
         defer { scanSummary = s }
         let byID = Dictionary(uniqueKeysWithValues: raw.map { ($0.id, $0.transform) })

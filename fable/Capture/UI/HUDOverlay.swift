@@ -439,12 +439,14 @@ struct HUDOverlay: View {
         if let d = s.baHoldoutDelta {
             let pct = String(format: "%+.0f%%", d * 100)
             if s.baApplied {
-                rows.append(("BA 已套用（保留集 \(pct)）", "checkmark.circle", .secondary))
-            } else if d < -0.03 {
-                rows.append(("BA 未套用，但保留集 \(pct) ⇒ 位姿真的變好，可考慮打開 baApplyPoses",
-                             "arrow.up.circle", .orange))
+                rows.append(("BA 已套用位姿（保留集 \(pct)）", "checkmark.circle", .secondary))
+            } else if d < BundleAdjuster.kHoldoutGate {
+                // 閘門過了卻沒套用 ⇒ 硬總開關被關著。這是非預期狀態，要看得見
+                rows.append(("BA 保留集 \(pct) 通過，但總開關關著 ⇒ 位姿未修正",
+                             "exclamationmark.triangle", .orange))
             } else {
-                rows.append(("BA 只量測未套用（保留集 \(pct) ⇒ 在擬合觀測雜訊）",
+                // 這是正常結果，不是問題：房間尺度下位姿誤差本來就低於觀測雜訊
+                rows.append(("BA 未套用（保留集 \(pct)，此距離下位姿誤差低於觀測雜訊）",
                              "pause.circle", .secondary))
             }
         }
