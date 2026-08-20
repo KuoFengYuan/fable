@@ -71,10 +71,31 @@ nonisolated enum FeatureParams {
     /// 實機實測其後果：匹配失敗有 72% 是「半徑內無候選」——
     /// 不是投影不準，是對應的角點在新幀根本沒被抽出來。
     /// 改用非極大值抑制：局部極大值在下一幀仍然是局部極大值，與網格對齊無關。
-    static let maxFeatures = 600
+    ///
+    /// **600 → 2400，因為 600 是先天不足的。** 實機每幀只存活 259 個特徵
+    /// （600 上限 → 深度過濾存活 43%），在 1920×1440 上平均最近鄰 52px，
+    /// 而引導搜尋半徑只有 28px —— 位姿完美也只有 21% 的投影找得到候選。
+    /// 「半徑內無候選 37%」這個最大的失配桶，主因是我們自己抽得太稀，不是位姿不準。
+    ///
+    /// 2400 是反推的，不是猜的：要讓平均最近鄰（Poisson 下 = 0.5/√密度）掉到
+    /// 搜尋半徑以內，1920×1440 上需要 ≥882 個**存活**特徵；深度過濾的實機存活率
+    /// 是 43%（600 抽出 → 259 存活），所以 NMS 要產出 ≥2051。取 2400 留一點餘裕
+    /// （→ 約 1030 存活、最近鄰 26px）。tools/test_feature_index.swift 會驗這條不變式，
+    /// 所以調小它時測試會直接告訴你密度論證破了。
+    ///
+    /// 這個數字只有在下面兩件事同時成立才付得起：
+    ///   · NMS 改成真半徑檢定（格子佔用法的容量只有 1/4，撐不到 2400）
+    ///   · 匹配改成空間索引（原本每個投影點掃過全部特徵，2400 個會變 1.2G 次檢查）
+    static let maxFeatures = 2400
+    /// 深度過濾的存活率（實機量到 259/600 ≈ 0.43）。只用於上面那條密度論證的自我檢查；
+    /// 實際存活數每次掃描都會印在 stats() 的「抽取關卡」那一行。
+    static let depthSurvivalRate: Double = 0.43
     /// NMS 的最小間距（stride 網格單位）。8 → 全解析度 16px，
     /// 約等於 patch 邊長，避免同一個角落被重複收好幾次
     static let nmsRadius = 8
+    /// 匹配用空間索引的格邊長（stride 網格單位）。取 searchRadius/stride 向上取整，
+    /// 這樣「半徑內」的候選一定落在 3×3 個格子內。
+    static let bucketSide = 15
     /// Shi-Tomasi 最小特徵值門檻（8-bit 影像的經驗值）。太低會收進平坦區的雜訊
     static let minCornerResponse: Float = 120
     /// 引導搜尋半徑（全解析度像素）。ARKit 位姿殘差約十幾 px，
@@ -104,6 +125,12 @@ nonisolated enum FeatureParams {
 
 nonisolated enum FeatureExtractor {
 
+    /// 每一關卡的存活數。**這是必要的診斷，不是可有可無的統計** ——
+    /// 特徵太稀是匹配率最大的失敗來源（實機「半徑內無候選」佔 37%），
+    /// 而「太稀」可能卡在三個完全不同的地方：角點響應門檻、NMS 容量、深度過濾。
+    /// 沒有這三個數字就只能猜哪一關該調，而我已經因為猜錯改過一次方向。
+    struct ExtractStats { var candidates = 0; var afterNMS = 0; var afterDepth = 0 }
+
     /// 從 ARKit capturedImage 的 luma plane 抽網格化的 Shi-Tomasi 角點，
     /// 並用深度圖給每個角點一個世界座標。
     ///
@@ -112,11 +139,13 @@ nonisolated enum FeatureExtractor {
     static func extract(luma pb: CVPixelBuffer,
                         depth: Data, conf: [UInt8]?, dw: Int, dh: Int,
                         K: CameraIntrinsics, c2w: simd_float4x4,
-                        minDepth: Float, maxDepth: Float) -> [TrackedFeature] {
-        guard CVPixelBufferGetPlaneCount(pb) >= 1 else { return [] }
+                        minDepth: Float, maxDepth: Float)
+        -> (features: [TrackedFeature], stats: ExtractStats) {
+        var stats = ExtractStats()
+        guard CVPixelBufferGetPlaneCount(pb) >= 1 else { return ([], stats) }
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return [] }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pb, 0) else { return ([], stats) }
         let w = CVPixelBufferGetWidthOfPlane(pb, 0)
         let h = CVPixelBufferGetHeightOfPlane(pb, 0)
         let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
@@ -127,7 +156,7 @@ nonisolated enum FeatureExtractor {
         // 網格座標範圍：留出 patch 與差分所需的邊界
         let margin = half + 2
         let gw = w / s, gh = h / s
-        guard gw > 2 * margin, gh > 2 * margin else { return [] }
+        guard gw > 2 * margin, gh > 2 * margin else { return ([], stats) }
 
         @inline(__always) func lum(_ gx: Int, _ gy: Int) -> Int {
             Int((p + gy * s * rowBytes)[gx * s])
@@ -183,25 +212,39 @@ nonisolated enum FeatureExtractor {
         }
 
         // 依響應由強到弱貪婪取點，彼此至少相隔 nmsRadius（空間 hash 做 O(1) 鄰域查詢）
+        stats.candidates = cand.count
         cand.sort { $0.resp > $1.resp }
         let nms = FeatureParams.nmsRadius
-        var occupied = Set<Int32>()
+        let nms2 = nms * nms
+        // **真正的距離檢定，不是格子佔用檢定。**
+        //
+        // 先前只判「自己或 8 個鄰格是否已被佔用」。格邊長 = nms = 8 網格單位，
+        // 所以那實際上排除到 3 格 ＝ 24 網格 ＝ 48 全解析度像素 ——
+        // 遠大於 nmsRadius 想表達的 16px，可容納密度因此只有預期的 1/4
+        // （2700 vs 10800）。而 maxFeatures 從 600 提到 2000 需要那個容量。
+        var buckets: [Int32: [(Int, Int)]] = [:]
         var bestPos: [(Int, Int)] = []
         bestPos.reserveCapacity(FeatureParams.maxFeatures)
         for c in cand {
             if bestPos.count >= FeatureParams.maxFeatures { break }
             let cx = c.gx / nms, cy = c.gy / nms
             var clash = false
-            for dy in -1...1 {
+            // 格邊長等於 nms ⇒ 距離 < nms 的既有點一定在這 3×3 格之內
+            search: for dy in -1...1 {
                 for dx in -1...1 {
-                    if occupied.contains(Int32((cy + dy) << 16 | (cx + dx))) { clash = true; break }
+                    guard let b = buckets[Int32((cy + dy) << 16 | (cx + dx))] else { continue }
+                    for (px, py) in b {
+                        let ddx = px - c.gx, ddy = py - c.gy
+                        if ddx * ddx + ddy * ddy < nms2 { clash = true; break search }
+                    }
                 }
-                if clash { break }
             }
             if clash { continue }
-            occupied.insert(Int32(cy << 16 | cx))
+            buckets[Int32(cy << 16 | cx), default: []].append((c.gx, c.gy))
             bestPos.append((c.gx, c.gy))
         }
+
+        stats.afterNMS = bestPos.count
 
         // 取 patch + 由深度賦予世界座標
         let side = FeatureParams.patchSide
@@ -270,7 +313,8 @@ nonisolated enum FeatureExtractor {
                                           patch: patch, mean: mean, invNorm: invNorm))
             }
         }
-        return out
+        stats.afterDepth = out.count
+        return (out, stats)
     }
 
     /// ZNCC。兩個 patch 都已預先算好 mean 與 invNorm，故只剩一次點積。
@@ -307,25 +351,34 @@ actor FeatureTracker {
     private var noCandidate = 0
     private var lowScore = 0
     private var ambiguous = 0
+    /// 抽取三關卡的累計存活數（角點候選 → NMS → 深度過濾），用來判斷特徵稀疏卡在哪
+    private var candTotal = 0, nmsTotal = 0, depthTotal = 0
 
     func reset() {
         frames.removeAll()
         nextTrackID = 0
         matchCount = 0
         attempted = 0; outOfView = 0; noCandidate = 0; lowScore = 0; ambiguous = 0
+        candTotal = 0; nmsTotal = 0; depthTotal = 0
     }
 
     /// 加入一幀：抽取 → 對最近數幀做引導式匹配 → 歸入既有 track 或開新 track
     func add(frameID: Int, luma: CVPixelBuffer, depth: Data, conf: [UInt8]?,
              dw: Int, dh: Int, K: CameraIntrinsics, c2w: simd_float4x4,
              minDepth: Float, maxDepth: Float) {
-        var feats = FeatureExtractor.extract(luma: luma, depth: depth, conf: conf,
-                                            dw: dw, dh: dh, K: K, c2w: c2w,
-                                            minDepth: minDepth, maxDepth: maxDepth)
+        let (extracted, es) = FeatureExtractor.extract(luma: luma, depth: depth, conf: conf,
+                                                       dw: dw, dh: dh, K: K, c2w: c2w,
+                                                       minDepth: minDepth, maxDepth: maxDepth)
+        var feats = extracted
+        candTotal += es.candidates
+        nmsTotal += es.afterNMS
+        depthTotal += es.afterDepth
         guard !feats.isEmpty else { return }
 
         let w2c = c2w.inverse
         let r2 = FeatureParams.searchRadius * FeatureParams.searchRadius
+
+        let index = Self.buildIndex(feats)
 
         for prev in frames.suffix(FeatureParams.matchAgainstRecent) {
             for pf in prev.features {
@@ -334,15 +387,8 @@ actor FeatureTracker {
                 guard let (pu, pv) = Self.project(pf.world, w2c: w2c, K: K) else {
                     outOfView += 1; continue
                 }
-                var bestIdx = -1
-                var best: Float = -1, second: Float = -1
-                for (i, f) in feats.enumerated() where f.trackID < 0 {
-                    let du = f.u - pu, dv = f.v - pv
-                    if du * du + dv * dv > r2 { continue }      // 只搜半徑內的角點
-                    let s = FeatureExtractor.zncc(pf, f)
-                    if s > best { second = best; best = s; bestIdx = i }
-                    else if s > second { second = s }
-                }
+                let (bestIdx, best, second) = Self.bestMatch(for: pf, at: (pu, pv),
+                                                            in: feats, index: index)
                 guard bestIdx >= 0 else { noCandidate += 1; continue }
                 guard best >= FeatureParams.minZNCC else { lowScore += 1; continue }
                 // 比值檢定：次佳太接近代表這區域自相似（磁磚、格紋），寧可不要
@@ -368,6 +414,64 @@ actor FeatureTracker {
             }
         }
         frames.append(FrameFeatures(frameID: frameID, c2w: c2w, K: K, features: feats))
+    }
+
+    /// 本幀特徵的空間索引：格座標 → 特徵下標。
+    ///
+    /// **沒有它，提高 maxFeatures 是負收益的。** 原本每個投影點都要掃過本幀全部特徵
+    /// 才知道哪些落在半徑內：600 個特徵時是 78M 次距離檢查（54 幀、回溯 4 幀），
+    /// 2000 個就變成 864M —— 而抽取＋匹配的預算是每關鍵幀 ~5ms。
+    ///
+    /// 格邊長取 ≥ searchRadius（30px vs 28px），所以半徑內的候選一定落在 3×3 格之內，
+    /// 每次查詢只碰到常數個特徵，成本與 maxFeatures 幾乎無關。
+    static func buildIndex(_ feats: [TrackedFeature]) -> [Int32: [Int]] {
+        var index: [Int32: [Int]] = [:]
+        for (i, f) in feats.enumerated() {
+            let c = cell(f.u, f.v)
+            index[cellKey(c.x, c.y), default: []].append(i)
+        }
+        return index
+    }
+
+    /// 格座標。**加了偏置讓它恆為非負**：project 允許投影落在畫面外
+    /// （到 -searchRadius），而負索引在 `y << 16 | x` 的打包裡會讓符號位吃掉另一個欄位。
+    /// 那種情況能不能自圓其說要推一段理，加偏置比推理便宜也比推理可靠。
+    @inline(__always)
+    static func cell(_ u: Float, _ v: Float) -> (x: Int, y: Int) {
+        let side = Float(FeatureParams.bucketSide * FeatureParams.stride)
+        return (Int((u / side).rounded(.down)) + 2, Int((v / side).rounded(.down)) + 2)
+    }
+
+    @inline(__always)
+    static func cellKey(_ x: Int, _ y: Int) -> Int32 { Int32(y << 16 | x) }
+
+    /// 在投影位置附近找最佳與次佳 ZNCC。回傳 (下標, 最佳, 次佳)；找不到候選時下標為 -1。
+    ///
+    /// 抽成函式是為了**可測**：索引化的搜尋若少看了某一格，症狀是「匹配數變少」而不是
+    /// 崩潰 —— 而少看的那些正是原本就稀少的匹配，很可能被當成場景難度而不是 bug。
+    /// tools/test_feature_index.swift 拿它跟暴力搜尋逐點對照。
+    static func bestMatch(for pf: TrackedFeature, at p: (Float, Float),
+                          in feats: [TrackedFeature],
+                          index: [Int32: [Int]]) -> (idx: Int, best: Float, second: Float) {
+        let r2 = FeatureParams.searchRadius * FeatureParams.searchRadius
+        let (pu, pv) = p
+        let b = cell(pu, pv)
+        var bestIdx = -1
+        var best: Float = -1, second: Float = -1
+        for dy in -1...1 {
+            for dx in -1...1 {
+                guard let bucket = index[cellKey(b.x + dx, b.y + dy)] else { continue }
+                for i in bucket where feats[i].trackID < 0 {
+                    let f = feats[i]
+                    let du = f.u - pu, dv = f.v - pv
+                    if du * du + dv * dv > r2 { continue }      // 只搜半徑內的角點
+                    let s = FeatureExtractor.zncc(pf, f)
+                    if s > best { second = best; best = s; bestIdx = i }
+                    else if s > second { second = s }
+                }
+            }
+        }
+        return (bestIdx, best, second)
     }
 
     /// 世界座標 → 影像座標。ARKit GL 慣例：相機看 -Z、Y 朝上，
@@ -423,6 +527,22 @@ actor FeatureTracker {
                         + "ZNCC 不足 %d、模糊匹配 %d",
                         matchCount, attempted, Double(matchCount) * 100 / Double(attempted),
                         outOfView, noCandidate, lowScore, ambiguous)
+        }
+        // 特徵稀疏卡在哪一關。附上「平均最近鄰 vs 搜尋半徑」——
+        // 前者大於後者時，即使位姿完美也有大半的投影找不到候選，
+        // 那時該調的是密度而不是 BA。
+        if !frames.isEmpty, depthTotal > 0 {
+            let perFrame = Double(depthTotal) / Double(frames.count)
+            // Poisson 下的平均最近鄰距離 = 0.5/√密度
+            let nn = 0.5 / (perFrame / (1920.0 * 1440)).squareRoot()
+            s += String(format: "\n  抽取關卡: 角點候選 %.0f → NMS %.0f（上限 %d）→ 深度過濾 %.0f /幀"
+                        + "；平均最近鄰 %.0f px vs 搜尋半徑 %.0f px%@",
+                        Double(candTotal) / Double(frames.count),
+                        Double(nmsTotal) / Double(frames.count),
+                        FeatureParams.maxFeatures, perFrame,
+                        nn, Double(FeatureParams.searchRadius),
+                        nn > Double(FeatureParams.searchRadius)
+                            ? " ⚠️ 特徵太稀，匹配率的上限由密度決定" : "")
         }
         return s
     }
