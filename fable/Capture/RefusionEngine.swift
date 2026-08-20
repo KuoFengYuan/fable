@@ -227,32 +227,45 @@ nonisolated enum RefusionEngine {
         // 模型不在 bundle 裡就是 nil → 整條 MDE 路徑靜默略過，行為與改動前相同
         let mde: DepthDensifier? = config.useMDEHoleFill ? DepthDensifier() : nil
         var mdeAccepted = 0, mdePoints = 0
-        // 分段計時：先前只能靠估算猜哪一段慢，實際數字才有依據
-        var tUnproject: Double = 0, tMesh: Double = 0, tDecode: Double = 0
+        // 分段計時：先前只能靠估算猜哪一段慢，實際數字才有依據。
+        // tProduce 與 tInsert 一定要分開 —— 前者可以平行、後者不行（共享 grid），
+        // 先前兩者混在同一個 tUnproject 裡，等於看不出並行化的上限在哪。
+        var tProduce: Double = 0, tInsert: Double = 0, tMesh: Double = 0, tDecode: Double = 0
 
-        for (i, r) in records.enumerated() {
-            defer { progress(Double(i + 1) / Double(total)) }
-            guard let depthFile = r.depthFile,
-                  let dw = r.depthWidth, let dh = r.depthHeight, dw > 0, dh > 0,
-                  let depth = try? Data(contentsOf: depthDir.appendingPathComponent(depthFile)),
-                  depth.count == dw * dh * 4 else { continue }
-
+        /// 一幀的產出。純函式、不碰共享狀態 —— 所以可以平行跑。
+        struct FrameYield {
+            var measured: [CloudPoint] = []
+            var mesh: [CloudPoint] = []
+            var depth: Data?          // MDE 補洞（序列階段）還要用
             var conf: [UInt8]?
-            if let confFile = r.confidenceFile,
-               let confData = try? Data(contentsOf: depthDir.appendingPathComponent(confFile)),
-               confData.count == dw * dh {
-                conf = [UInt8](confData)
-            }
-            let tD = Date()
-            guard let rgba = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
-                                        width: dw, height: dh) else { continue }
-            tDecode += Date().timeIntervalSince(tD)
+            var decodeSec: Double = 0
+            var meshSec: Double = 0
+        }
 
+        func produce(_ r: FrameRecord) -> FrameYield {
+            var y = FrameYield()
             // 幾何不可信的幀直接跳過：它的深度會被反投影到錯的世界座標，疊出殘影／雙層殼。
             // 殘影比破洞更糟 —— 破洞看得出來，殘影會被當成真的幾何。
             // 注意這裡**不**跳過 .demote：那些只是顏色糊，幾何來自 LiDAR、照樣可信，
             // 丟了只會白白開洞。它們改以降權併入（見下）。
-            if r.blurVerdict == .drop { continue }
+            //
+            // 這個檢查先前排在 JPEG 解碼**之後** —— 被排除的幀白白付了一次解碼。
+            if r.blurVerdict == .drop { return y }
+            guard let depthFile = r.depthFile,
+                  let dw = r.depthWidth, let dh = r.depthHeight, dw > 0, dh > 0,
+                  let depth = try? Data(contentsOf: depthDir.appendingPathComponent(depthFile)),
+                  depth.count == dw * dh * 4 else { return y }
+            y.depth = depth
+
+            if let confFile = r.confidenceFile,
+               let confData = try? Data(contentsOf: depthDir.appendingPathComponent(confFile)),
+               confData.count == dw * dh {
+                y.conf = [UInt8](confData)
+            }
+            let tD = Date()
+            guard let rgba = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
+                                        width: dw, height: dh) else { return y }
+            y.decodeSec = Date().timeIntervalSince(tD)
 
             let K = r.intrinsics.scaled(toWidth: dw, height: dh)
             let c2w = float4x4(rowMajor: r.transform)
@@ -260,44 +273,91 @@ nonisolated enum RefusionEngine {
             // 原本只看 estimatedBlurPx，於是「相機拿得很穩但失焦」的幀拿到滿分權重，
             // 它糊掉的顏色會主導那格的加權平均 —— 這是實測清晰度才看得到的破口。
             let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
-            let tU = Date()
-            grid.insert(unprojectStored(depth: depth, conf: conf, rgba: rgba,
-                                        dw: dw, dh: dh, K: K, c2w: c2w,
-                                        config: config, sharpness: sharpness))
-            tUnproject += Date().timeIntervalSince(tU)
+            y.measured = unprojectStored(depth: depth, conf: y.conf, rgba: rgba,
+                                         dw: dw, dh: dh, K: K, c2w: c2w,
+                                         config: config, sharpness: sharpness)
             // mesh 頂點：投影進本幀取色。同一頂點會被多幀命中 → 由 voxel 加權平均做多視角混色。
             if !meshVertices.isEmpty {
                 let tM = Date()
-                grid.insert(projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
-                                        K: K, c2w: c2w, config: config, sharpness: sharpness),
-                            measured: false)
-                tMesh += Date().timeIntervalSince(tM)
+                y.mesh = projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
+                                     K: K, c2w: c2w, config: config, sharpness: sharpness)
+                y.meshSec = Date().timeIntervalSince(tM)
             }
-            // MDE 補洞：只在 LiDAR 無回波處產生點
-            if let mde, config.useMDEHoleFill,
-               let hiRGBA = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
-                                       width: mde.width, height: mde.height),
-               let disp = mde.inferDisparity(rgba: hiRGBA) {
-                let hiK = r.intrinsics.scaled(toWidth: mde.width, height: mde.height)
-                let pts = mdeHoleFill(disp: disp, hiRGBA: hiRGBA, mw: mde.width, mh: mde.height,
-                                      hiK: hiK, depth: depth, conf: conf, dw: dw, dh: dh,
-                                      c2w: c2w, config: config, sharpness: sharpness)
-                mdeAccepted += pts.isEmpty ? 0 : 1
-                mdePoints += pts.count
-                grid.insert(pts, measured: false)
+            return y
+        }
+
+        // 分批：批內平行產出、批間序列插入。
+        //
+        // **為什麼分批而不是一次全平行。** 一次全平行要同時持有所有幀的點：
+        // 54 幀 × 49152 點 × 20B ≈ 53MB，而整屋掃描的 200 幀會到 220MB ——
+        // 這個 App 已經對記憶體敏感（點雲＋訓練都在同一台手機上）。
+        // 分批把峰值壓在「批大小 × 每幀點數」，同時仍然吃滿核心。
+        let lanes = max(1, min(8, ProcessInfo.processInfo.activeProcessorCount - 1))
+        var done = 0
+        var i = 0
+        while i < records.count {
+            let n = min(lanes, records.count - i)
+            var batch = [FrameYield](repeating: FrameYield(), count: n)
+            let tP = Date()
+            if n == 1 {
+                batch[0] = produce(records[i])
+            } else {
+                // 每條 lane 只寫自己那一格 → 沒有交疊，不需要鎖
+                batch.withUnsafeMutableBufferPointer { buf in
+                    DispatchQueue.concurrentPerform(iterations: n) { k in
+                        buf[k] = produce(records[i + k])
+                    }
+                }
             }
+            tProduce += Date().timeIntervalSince(tP)
+
+            let tI = Date()
+            for (k, y) in batch.enumerated() {
+                grid.insert(y.measured)
+                if !y.mesh.isEmpty { grid.insert(y.mesh, measured: false) }
+                tDecode += y.decodeSec
+                tMesh += y.meshSec
+                // MDE 補洞：只在 LiDAR 無回波處產生點。**留在序列階段** ——
+                // CoreML 模型不保證可重入，而這條路徑預設關閉（useMDEHoleFill = false）。
+                let r = records[i + k]
+                if let mde, config.useMDEHoleFill, let depth = y.depth,
+                   let dw = r.depthWidth, let dh = r.depthHeight,
+                   let hiRGBA = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
+                                           width: mde.width, height: mde.height),
+                   let disp = mde.inferDisparity(rgba: hiRGBA) {
+                    let hiK = r.intrinsics.scaled(toWidth: mde.width, height: mde.height)
+                    let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
+                    let pts = mdeHoleFill(disp: disp, hiRGBA: hiRGBA,
+                                          mw: mde.width, mh: mde.height,
+                                          hiK: hiK, depth: depth, conf: y.conf, dw: dw, dh: dh,
+                                          c2w: float4x4(rowMajor: r.transform),
+                                          config: config, sharpness: sharpness)
+                    mdeAccepted += pts.isEmpty ? 0 : 1
+                    mdePoints += pts.count
+                    grid.insert(pts, measured: false)
+                }
+                done += 1
+                progress(Double(done) / Double(total))
+            }
+            tInsert += Date().timeIntervalSince(tI)
+            i += n
         }
         // 診斷：這條鏈上有三處會悄悄粗化解析度（融合格觸頂、匯出擇優下採樣、訓練高斯預算），
         // 而初始點距直接決定初始高斯大小（msplat 的初始 scale = 3-NN 距離）。
         // 過去完全沒有數字，訓練端看到 15cm 的初始高斯卻無從得知是哪一段造成的。
-        print(String(format: "  重融合分段: 反投影+插入 %.2fs、mesh 投影 %.2fs、"
-                     + "JPEG 解碼 %.2fs（%d 幀）",
-                     tUnproject, tMesh, tDecode, records.count))
+        // 產出（可平行，牆鐘時間已除以 lanes）與插入（不可平行，共享 grid）分開報。
+        // 解碼/mesh 是各 lane 的 CPU 時間總和，會大於牆鐘 —— 那正是被並行吃掉的部分。
+        print(String(format: "  重融合分段: 產出 %.2fs（%d 路平行；其中 CPU 時間 "
+                     + "JPEG 解碼 %.2fs、mesh 投影 %.2fs）、插入 grid %.2fs（序列）、%d 幀",
+                     tProduce, lanes, tDecode, tMesh, tInsert, records.count))
         let rawCells = grid.count
         let inferredOnly = grid.inferredOnlyCount
         let gridVoxel = grid.voxelSize
+        let tE = Date()
         let out = grid.exportPoints(target: config.exportMaxPoints,
                                     minNeighbors: config.refuseMinNeighbors)
+        print(String(format: "  匯出擇優 %.2fs（%d 格 → %d 點）",
+                     Date().timeIntervalSince(tE), rawCells, out.count))
         var msg = "Refusion: \(records.count) frames"
         if !meshVertices.isEmpty { msg += " + \(meshVertices.count) mesh verts" }
         if config.useMDEHoleFill {

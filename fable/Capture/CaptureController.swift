@@ -314,6 +314,7 @@ final class CaptureController: NSObject, ObservableObject {
         let refined = snapshotRefinedTransforms()   // 必須在 pause 前讀 anchors
         let meshVerts = snapshotMeshVertices()      // 同上：pause 後 anchors 就讀不到了
         floorPlan.stopCapture()                     // 只是 stop()，最終資料由 delegate 稍後送達
+        let tStop = Date()
         Task {
             // pause 必須等 RoomPlan 交回 CapturedRoomData 之後 —— session 一 pause
             // 它就收不完那一段了。waitForSegment 自帶逾時，不會卡住匯出流程。
@@ -321,18 +322,50 @@ final class CaptureController: NSObject, ObservableObject {
             // build() 自己會等（逾時 20s），而它現在跑在背景、不擋 review。
             // 唯一的取捨是 ARSession 會早一點 pause；實測 RoomPlan 的最終優化
             // 不需要新的幀，資料照樣送達。
-            await saveWorldMap()                    // 必須在 pause 之前：地圖要從活著的 session 取
+            //
+            // 世界地圖：只有「取圖」需要活著的 session，序列化不需要。
+            // 所以取完就 pause，序列化丟到背景並與 processScan 並行 ——
+            // 先前是 await 整個存檔完成才開始後處理，那一整段是使用者的乾等，
+            // 而且序列化跑在 main actor 上，連進度條都動不了。
+            let box = await captureWorldMap()
             arView?.session.pause()                 // review 期間停止追蹤，省電省熱
             monitor.stop()
-            await processScan(refinedTransforms: refined, meshVertices: meshVerts)
+            let mapTask = Task { @MainActor [weak self] in
+                if let box { await self?.persistWorldMap(box) }
+            }
+            await processScan(refinedTransforms: refined, meshVertices: meshVerts, since: tStop)
+            // 地圖通常早就寫完了；這裡只是確保摘要拿得到大小（它比 review 晚到就補上去）
+            await mapTask.value
+            if scanSummary != nil { scanSummary?.worldMapMB = lastWorldMapMB }
         }
     }
 
-    private func processScan(refinedTransforms: [Int: [Double]], meshVertices: [SIMD3<Float>]) async {
+    private func processScan(refinedTransforms: [Int: [Double]], meshVertices: [SIMD3<Float>],
+                             since tStop: Date) async {
         guard let writer, let accumulator, let dir = sessionDir else {
             phase = .idle
             return
         }
+        // 分段計時從**按下停止**起算。先前 t0 設在重融合前面，於是「總計 1.81s」
+        // 完全不含世界地圖、BA、模糊複核 —— 一個叫「總計」卻不是總計的數字，
+        // 正是我在這個專案被誤導過三次的同一類錯誤。
+        var seg: [(String, Double)] = []
+        var tMark = tStop
+        func mark(_ name: String) {
+            seg.append((name, Date().timeIntervalSince(tMark)))
+            tMark = Date()
+        }
+        // 每一段都講出來，並且讓進度條涵蓋整條流程。
+        //
+        // 先前進度條只由重融合的回呼驅動，而重融合是**最後**一段 ——
+        // 前面三段使用者看到的是一條靜止在 0% 的進度條，那比沒有進度條更像卡住。
+        // 權重是暫定的：真實比例要等新的分段計時（見下方 mark）跑過實機才知道。
+        func stage(_ text: String, _ base: Double) {
+            statusText = text
+            exportProgress = base
+        }
+
+        stage("讀取關鍵幀…", 0)
         let raw = await writer.snapshotRecords()
         if !raw.isEmpty {
             let sharp = raw.map(\.sharpnessRatio).sorted()
@@ -362,7 +395,9 @@ final class CaptureController: NSObject, ObservableObject {
         // 位置在這裡的理由：
         //   · 必須在錨點修正**之後** —— 那是初值，BA 只做微調
         //   · 必須在 BlurFilter 與重融合**之前** —— 它們都吃姿態，晚了就白做
+        mark("讀取關鍵幀")
         if config.baRounds > 0 {
+            stage("校正相機位姿…", 0.10)
             let obs = await featureTracker.observations()
             print(await featureTracker.stats())
             let ba = BundleAdjuster.refine(records: refinedRecords, observations: obs,
@@ -388,6 +423,8 @@ final class CaptureController: NSObject, ObservableObject {
         // 模糊幀全域複核。必須在姿態修正**之後**：BlurFilter 靠位置/朝向找「看同一片表面」
         // 的鄰居，用未修正的姿態會找錯鄰居。判定寫回紀錄而非直接刪除，
         // poses_refined.jsonl 與 images/ 都保留完整，可回頭檢查判定對不對。
+        mark("位姿校正")
+        stage("複核模糊幀…", 0.35)
         refinedRecords = BlurFilter.annotate(refinedRecords)
         let dropped = refinedRecords.filter { $0.blurVerdict == .drop }.count
         let demoted = refinedRecords.filter { $0.blurVerdict == .demote }.count
@@ -404,7 +441,7 @@ final class CaptureController: NSObject, ObservableObject {
         // 「review 按平面圖」和「匯出」兩個時機才需要。
         // 改成背景建，好了再更新 @Published；review 的平面圖按鈕本來就綁 floorPlanData != nil，
         // 所以它會自己出現。
-        let t0 = Date()
+        mark("模糊複核")
         if config.captureFloorPlan, FloorPlanCapture.isSupported {
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -415,27 +452,31 @@ final class CaptureController: NSObject, ObservableObject {
         }
 
         var points: [CloudPoint] = []
-        var refuseSec: Double = 0
         if hasLiDAR && config.saveDepth && !refinedRecords.isEmpty {
+            stage("融合點雲…", 0.45)
             let records = refinedRecords
             let cfg = config
+            // 重融合佔進度條的後 55%（前面三段各自佔一段，見 stage）
             let onProg: @Sendable (Double) -> Void = { p in
-                Task { @MainActor [weak self] in self?.exportProgress = p }
+                Task { @MainActor [weak self] in self?.exportProgress = 0.45 + p * 0.55 }
             }
             let mesh = meshVertices
-            let tR = Date()
             points = await Task.detached(priority: .userInitiated) {
                 RefusionEngine.refuse(records: records, sessionDir: dir, config: cfg,
                                       meshVertices: mesh, progress: onProg)
             }.value
-            refuseSec = Date().timeIntervalSince(tR)
         }
         if points.isEmpty {                          // 無 LiDAR / 無深度時退回即時累積雲
             points = await accumulator.bestPoints(target: config.exportMaxPoints)
         }
+        mark("重融合")
 
-        print(String(format: "處理耗時: 總計 %.2fs（其中重融合 %.2fs；平面圖在背景建，不擋 review）",
-                     Date().timeIntervalSince(t0), refuseSec))
+        // 逐段列出，而且總計就是「按下停止到看到 review」的牆鐘時間 ——
+        // 這樣下次要優化才知道該動哪一段，不必再猜。
+        let total = seg.reduce(0) { $0 + $1.1 }
+        print(String(format: "處理耗時: 總計 %.2fs（按下停止 → review）= ", total)
+              + seg.map { String(format: "%@ %.2fs", $0.0, $0.1) }.joined(separator: " + ")
+              + "（世界地圖與平面圖在背景，不計入）")
 
         reviewPoints = points
         reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
@@ -848,20 +889,37 @@ final class CaptureController: NSObject, ObservableObject {
     /// 取出 ARKit 當下的地圖並存檔。必須在 session 還活著時呼叫。
     /// 追蹤狀態不佳時 ARKit 會拒絕給地圖（回 error）—— 那種地圖本來就不該留，
     /// 帶著它下次會一直重定位失敗。
-    private func saveWorldMap() async {
-        guard let session = arView?.session else { return }
-        let map: ARWorldMap? = await withCheckedContinuation { c in
+    /// 非 Sendable 的 ARKit 物件單向交給背景。交出後 main 這邊不再碰它，
+    /// 所以沒有共享可變狀態（與 Keyframe 的 pixelBuffer 同一個理由）。
+    private struct MapBox: @unchecked Sendable { let map: ARWorldMap }
+
+    /// 從**活著的** session 取出當下地圖。只有這一步需要 session，所以取完就能 pause。
+    private func captureWorldMap() async -> MapBox? {
+        guard let session = arView?.session else { return nil }
+        return await withCheckedContinuation { c in
             session.getCurrentWorldMap { m, error in
                 if let error { print("[WorldMap] 取得失敗（追蹤品質不足？）: \(error)") }
-                c.resume(returning: m)
+                c.resume(returning: m.map(MapBox.init))
             }
         }
-        guard let map else { return }
-        lastWorldMapMB = nil
-        if let bytes = WorldMapStore.save(map, sessionDir: sessionDir) {
-            lastWorldMapMB = Double(bytes) / 1_048_576
+    }
+
+    /// 序列化並寫檔。**必須離開 main actor。**
+    ///
+    /// 這是「按下停止之後的第一段乾等」的真正來源：ARWorldMap 動輒 10~40MB，
+    /// NSKeyedArchiver 是 CPU 密集的同步呼叫，先前直接跑在 main actor 上 ——
+    /// 不只擋住畫面，連重融合的進度條都動不了，於是使用者看到的是一段完全靜止的等待。
+    /// 而它跟後處理沒有任何依賴關係，本來就該平行。
+    private func persistWorldMap(_ box: MapBox) async {
+        let dir = sessionDir
+        let anchors = box.map.anchors.count
+        let bytes = await Task.detached(priority: .utility) {
+            WorldMapStore.save(box.map, sessionDir: dir)
+        }.value
+        lastWorldMapMB = bytes.map { Double($0) / 1_048_576 }
+        if let bytes {
             print(String(format: "世界地圖已保存 %.1f MB（%d 個錨點）—— 下次可選「延續上次座標系」",
-                         Double(bytes) / 1_048_576, map.anchors.count))
+                         Double(bytes) / 1_048_576, anchors))
         }
     }
 
