@@ -432,6 +432,22 @@ struct HUDOverlay: View {
             rows.append((String(format: "世界地圖已存 %.1f MB —— 下次可延續同一座標系", mb),
                          "point.3.filled.connected.trianglepath.dotted", .secondary))
         }
+        // BA 的判定。**用保留集，不用 BA 自己的殘差** —— 後者下降是必然的（那是它在
+        // 最小化的量），拿它報告「精度改善了幾 %」等於自我認證。
+        // 這一行的存在理由：BA 該不該開，唯一的證據來源是實機掃描；
+        // 要它每次掃完都被看到，就不能只印在 Xcode console 裡。
+        if let d = s.baHoldoutDelta {
+            let pct = String(format: "%+.0f%%", d * 100)
+            if s.baApplied {
+                rows.append(("BA 已套用（保留集 \(pct)）", "checkmark.circle", .secondary))
+            } else if d < -0.03 {
+                rows.append(("BA 未套用，但保留集 \(pct) ⇒ 位姿真的變好，可考慮打開 baApplyPoses",
+                             "arrow.up.circle", .orange))
+            } else {
+                rows.append(("BA 只量測未套用（保留集 \(pct) ⇒ 在擬合觀測雜訊）",
+                             "pause.circle", .secondary))
+            }
+        }
         return rows.map { (text: $0.0, symbol: $0.1, tint: $0.2) }
     }
 

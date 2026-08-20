@@ -123,8 +123,10 @@ final class CaptureController: NSObject, ObservableObject {
     private var lastTravelPosition: SIMD3<Float>?
     private var loopClosed = false
     private var lastWorldMapMB: Double?
-    /// BA 的每輪重投影 RMS（像素）。第 0 個是修正前 —— review 的摘要卡會顯示
-    private var baResidualsPx: [Float] = []
+    /// BA 的結果。**注意位姿不一定被套用**（config.baApplyPoses），
+    /// 所以摘要要一併記下「有沒有套用」與保留集判定，否則 baAfterPx 會被誤讀成
+    /// 「輸出的解析度天花板」，而實際輸出用的是 ARKit 位姿。
+    private var baResult: PoseRefineResult?
     /// 因清晰度不足而放棄抓幀的次數（診斷用：拿來判斷門檻是否過嚴）
     private var sharpnessRejects = 0
     /// 近幾秒被放棄的時間戳。用來即時告訴使用者「你正在掉幀」——
@@ -294,7 +296,7 @@ final class CaptureController: NSObject, ObservableObject {
         loopClosed = false
         loopHint = nil
         lastWorldMapMB = nil
-        baResidualsPx = []
+        baResult = nil
         scanSummary = nil
         phase = .scanning
         statusText = nil
@@ -365,15 +367,20 @@ final class CaptureController: NSObject, ObservableObject {
             print(await featureTracker.stats())
             let ba = BundleAdjuster.refine(records: refinedRecords, observations: obs,
                                            rounds: config.baRounds)
-            if ba.roundsApplied > 0 {
+            if ba.roundsApplied > 0 && config.baApplyPoses {
                 refinedRecords = refinedRecords.map { r in
                     guard let m = ba.poses[r.id] else { return r }
                     var out = r
                     out.transform = RefusionEngine.rowMajor(m)
                     return out
                 }
+            } else if ba.roundsApplied > 0 {
+                // 一定要講出來。BA 的那幾行 log 照樣印，若不說「沒套用」，
+                // 看 log 的人（包括我自己）會以為輸出用的是修正後的位姿。
+                print("  ⚠️ 以上 BA 結果**未套用** —— 輸出用的是 ARKit＋錨點修正的位姿"
+                      + "（config.baApplyPoses = false，理由見該欄註解）")
             }
-            baResidualsPx = ba.residualsPx
+            baResult = ba
         }
 
         // 模糊幀全域複核。必須在姿態修正**之後**：BlurFilter 靠位置/朝向找「看同一片表面」
@@ -895,8 +902,12 @@ final class CaptureController: NSObject, ObservableObject {
         s.blurDropped = refined.filter { $0.blurVerdict == .drop }.count
         s.blurDemoted = refined.filter { $0.blurVerdict == .demote }.count
         s.worldMapMB = lastWorldMapMB
-        s.baBeforePx = baResidualsPx.first
-        s.baAfterPx = baResidualsPx.last
+        s.baBeforePx = baResult?.residualsPx.first
+        s.baAfterPx = baResult?.residualsPx.last
+        // 這兩欄是為了讓摘要無法被誤讀：只有 baApplied 為真時，baAfterPx 才描述
+        // 實際輸出；否則輸出的天花板是 baBeforePx，而 baHoldoutDelta 是「若套用會怎樣」。
+        s.baApplied = config.baApplyPoses && (baResult?.roundsApplied ?? 0) > 0
+        s.baHoldoutDelta = baResult?.holdoutDelta
         defer { scanSummary = s }
         let byID = Dictionary(uniqueKeysWithValues: raw.map { ($0.id, $0.transform) })
         var deltas: [Double] = []
