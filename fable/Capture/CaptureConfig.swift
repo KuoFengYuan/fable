@@ -240,7 +240,19 @@ nonisolated struct CaptureConfig: Sendable {
     /// 本專案已經對散熱敏感（thermalState 到 .critical 會自動停拍），
     /// 長時間整屋掃描若發現提早過熱，這是第一個該關掉的開關。
     /// 只在支援 RoomPlan 的機型生效（見 FloorPlanCapture.isSupported）。
-    var captureFloorPlan = true
+    ///
+    /// **預設關閉。** 實機在辦公室隔間／貨架／桌面的場景下，RoomPlan 反覆給出
+    /// 「2 面牆、樓高 0.80m」與方向亂掉的假牆 —— 它需要場景「是個房間」
+    /// （有地板、成面的牆、牆與天花板的交界），而那個前提在這裡不成立。
+    /// 平面圖改走 pointCloudFloorPlan：點雲只需要表面被掃到。
+    ///
+    /// 關掉會一併失去的東西（都是 RoomPlan 餵的，不是 bug）：
+    ///   · 掃描時的即時發光線框與 dollhouse 縮圖
+    ///   · 牆高不足 / 靠太近 / 光線不足的即時引導
+    ///   · floorplan.usdz（帶門窗語意的 3D 幾何）
+    ///   · 門窗與家具的語意分類
+    /// 場景換成一般住宅／有完整牆面的房間時，把它設回 true 會明顯更好用。
+    var captureFloorPlan = false
 
     /// 由 LiDAR 點雲直接產生平面圖（不經過 RoomPlan）。
     ///

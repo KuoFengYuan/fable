@@ -479,8 +479,16 @@ final class CaptureController: NSObject, ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let fp = await self.floorPlan.build()
-                self.floorPlanData = fp
-                if let fp { self.logFloorPlan(fp) }
+                if let fp, !fp.walls.isEmpty {
+                    self.floorPlanData = fp
+                    self.logFloorPlan(fp)
+                } else {
+                    // RoomPlan 建不出東西（場景不是房間、或牆沒掃到）→ 退回點雲版。
+                    // 這比留一個空的平面圖有用：review 的按鈕綁 floorPlanData，
+                    // 沒有它使用者連「有沒有平面圖」都看不到。
+                    print("[FloorPlan] RoomPlan 沒有產出可用結構 → 改用點雲平面圖")
+                    self.usePointCloudPlan()
+                }
             }
         }
 
@@ -512,6 +520,10 @@ final class CaptureController: NSObject, ObservableObject {
               + "（世界地圖與平面圖在背景，不計入）")
 
         reviewPoints = points
+        // RoomPlan 沒開（或機型不支援）→ 平面圖直接用點雲版。
+        // 不這樣做的話 floorPlanData 永遠是 nil，review 的平面圖按鈕不會出現，
+        // 使用者要等到匯出才知道有沒有平面圖。
+        if !config.captureFloorPlan || !FloorPlanCapture.isSupported { usePointCloudPlan() }
         reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
         pointCount = points.count
         statusText = corrected > 0 ? "姿態已修正 \(corrected) 幀（ARKit 地圖優化）" : nil
@@ -913,23 +925,33 @@ final class CaptureController: NSObject, ObservableObject {
         // 螢幕邊桌緣硬判成牆，而且第一片判錯之後後續會跟著它對齊。
         // 點雲沒有這個前提。所以兩者各自輸出、互不覆蓋，
         // 使用者拿哪一份由現場決定，而不是由我事先猜。
-        if config.pointCloudFloorPlan, !reviewPoints.isEmpty {
-            let pts = reviewPoints.map { SIMD3<Float>($0.x, $0.y, $0.z) }
-            if let r = PointCloudFloorPlan.extract(points: pts) {
-                print(r.summary)
-                writePlan(r.plan, to: dir, prefix: "floorplan_pointcloud")
-            } else {
-                print("點雲平面圖: 抽不出牆（點太少、或沒有垂直跨度足夠的表面）")
-            }
-        }
+        // RoomPlan 關掉時 floorPlanData 已經是點雲版（見 processScan / usePointCloudPlan），
+        // 這裡不重算；只有它還空著（例如匯出比 review 早）才補一次。
+        if floorPlanData == nil { usePointCloudPlan() }
 
-        guard config.captureFloorPlan, FloorPlanCapture.isSupported else { return }
-        // 平面圖是背景建的（見 processScan），匯出時若還沒好就在這裡等 ——
-        // 匯出是使用者明確要求的動作，少一個檔比多等幾秒糟。
-        if floorPlanData == nil { floorPlanData = await floorPlan.build() }
-        await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
+        if config.captureFloorPlan, FloorPlanCapture.isSupported {
+            // 平面圖是背景建的（見 processScan），匯出時若還沒好就在這裡等 ——
+            // 匯出是使用者明確要求的動作，少一個檔比多等幾秒糟。
+            if floorPlanData == nil { floorPlanData = await floorPlan.build() }
+            await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
+        }
         guard let fp = floorPlanData else { return }
         writePlan(fp, to: dir, prefix: "floorplan")
+    }
+
+    /// 由已融合的點雲算出平面圖並填進 floorPlanData。
+    ///
+    /// 算一次就存著：review 的預覽、房間命名、匯出都吃同一份，
+    /// 不然使用者看到的圖和匯出的圖可能不是同一張（點雲不會變，但重算沒有意義）。
+    private func usePointCloudPlan() {
+        guard config.pointCloudFloorPlan, !reviewPoints.isEmpty else { return }
+        let pts = reviewPoints.map { SIMD3<Float>($0.x, $0.y, $0.z) }
+        guard let r = PointCloudFloorPlan.extract(points: pts) else {
+            print("點雲平面圖: 抽不出牆（點太少、或沒有垂直跨度足夠的表面）")
+            return
+        }
+        print(r.summary)
+        floorPlanData = r.plan
     }
 
     /// 一份平面圖的三種格式。

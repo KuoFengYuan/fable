@@ -175,7 +175,9 @@ struct HUDOverlay: View {
 
                 if controller.phase == .scanning {
                     // RoomPlan 即時結構：掃到的牆／門／窗以發光邊框疊在實景上。
-                    // 排在點雲前面 —— 它是預設開著的那一個。
+                    // **RoomPlan 關掉時要一起藏起來** —— 沒有資料來源，
+                    // 留著就是一顆按了沒反應的按鈕，比沒有更糟。
+                    if controller.config.captureFloorPlan, FloorPlanCapture.isSupported {
                     Button {
                         controller.toggleRoomPlan()
                     } label: {
@@ -187,6 +189,7 @@ struct HUDOverlay: View {
                             .hudGlass(Circle())
                     }
                     .foregroundStyle(controller.showRoomPlan ? .white : .secondary)
+                    }
 
                     Button {
                         controller.togglePointCloud()
