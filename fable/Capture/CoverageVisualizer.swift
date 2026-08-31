@@ -309,25 +309,39 @@ final class CoverageVisualizer {
 
     // MARK: - Dollhouse：掃到哪就長到哪的房間縮圖
 
-    /// 縮圖的邊長上限（公尺）。25cm 在手臂距離看起來與 RoomPlan 原生接近
-    private static let kDollSize: Float = 0.25
+    /// 縮圖的邊長上限（公尺）。
+    ///
+    /// **這是角尺寸問題，不是「大小」問題。** 固定距離 ＋ 固定邊長 ＝ 固定的螢幕占比：
+    ///   0.25m @ 0.55m 遠 → 張角 ~25°，在 ~60° 的垂直視角下佔掉螢幕四成
+    /// 實機畫面因此被縮圖蓋住下半部。官方大約只佔 15~18%，換算張角 ~10°：
+    ///   0.12m @ 0.65m 遠 → 張角 ~10.6°
+    private static let kDollSize: Float = 0.12
     /// 擺放位置：相機前方 / 下方（公尺）。低一點才不會擋住正在掃的牆面
-    private static let kDollForward: Float = 0.55
-    private static let kDollDown: Float = 0.30
+    private static let kDollForward: Float = 0.65
+    private static let kDollDown: Float = 0.22
 
     /// 用 RoomPlan 當下的房間長出白色實體縮圖：地板板 + 半透明牆 + 家具方塊。
     ///
     /// 為什麼要有它：線框告訴使用者「這個面被認出來了」，但看不出**整體**掃到多少。
     /// 縮圖把已辨識的房間整個攤在眼前，缺一面牆、少一塊角落一眼就看得到 ——
     /// 那正是大範圍掃描最需要、而掃完才發現就來不及的資訊。
+    /// 縮圖出現的門檻：至少兩面牆、且水平跨度像個房間。
+    ///
+    /// **沒有這道閘門，縮圖會在還不成房間的時候就畫出一堆歪斜白面。**
+    /// RoomPlan 是房間掃描器 —— 對著桌面掃時它會把螢幕邊、桌緣硬判成「牆」，
+    /// 那時的「房間」只是兩三片方向亂七八糟的面。把它縮放到 12cm 擺在眼前，
+    /// 看起來就是幾片橫跨畫面的白色斜板，而不是房間縮圖。
+    /// 線框那一層不必等（單獨一面牆被認出來也是有用的回饋），但縮圖要。
+    private static let kDollMinWalls = 2
+    private static let kDollMinSpanM: Float = 1.2
+
     func updateDollhouse(_ surfaces: [RoomSurface]) {
-        guard !surfaces.isEmpty else {
+        func clear() {
             for n in dollNodes { n.removeFromParentNode() }
             dollNodes.removeAll()
             dollContent.isHidden = true
-            return
         }
-        dollContent.isHidden = false
+        guard !surfaces.isEmpty else { return clear() }
 
         // 房間的世界包圍盒：逐元素轉換 8 個角點（元素不多，精確算比估算省事）
         var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
@@ -342,6 +356,12 @@ final class CoverageVisualizer {
         }
         let extent = hi - lo
         let center = (hi + lo) / 2
+
+        let walls = surfaces.reduce(0) { $1.kind == .wall ? $0 + 1 : $0 }
+        guard walls >= Self.kDollMinWalls,
+              max(extent.x, extent.z) >= Self.kDollMinSpanM else { return clear() }
+        dollContent.isHidden = false
+
         let scale = Self.kDollSize / max(0.1, max(extent.x, max(extent.y, extent.z)))
 
         // 節點增減必須在交易**之外**：新節點要以 opacity 0 起步，
@@ -402,6 +422,11 @@ final class CoverageVisualizer {
         if let m = dollMaterials[key] { return m }
         let m = SCNMaterial()
         m.lightingModel = .constant
+        m.isDoubleSided = true
+        // **半透明幾何不能寫深度。** 先寫入的面會把它後面、還沒畫到的半透明面
+        // 整片剔掉 —— 結果就是大塊的白色多邊形硬邊，而不是層層疊透的房間。
+        // 實機畫面上那些橫跨螢幕的白色斜面就是這個。
+        m.writesToDepthBuffer = false
         switch part {
         case .floor:  m.diffuse.contents = UIColor.white;                    m.transparency = 0.95
         case .wall:   m.diffuse.contents = UIColor(white: 0.88, alpha: 1);   m.transparency = 0.55
