@@ -22,8 +22,11 @@ import ARKit
 nonisolated enum WorldMapStore {
 
     /// 地圖檔上限。ARWorldMap 會隨掃描範圍成長，整層樓可能到數十 MB；
-    /// 過大的地圖 relocalization 會變慢且記憶體吃緊，超過就不留（寧可下次重新開始）。
-    static let maxBytes = 64 * 1024 * 1024
+    /// 過大的地圖 relocalization 會變慢且記憶體吃緊。
+    ///
+    /// 64 → 128MB：這個上限本來就是為「跨 session 接著掃下一個房間」存在的，
+    /// 而會踩到上限的正好就是整層掃描 —— 也就是最需要它的情況。
+    static let maxBytes = 128 * 1024 * 1024
 
     static var latestURL: URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -50,8 +53,14 @@ nonisolated enum WorldMapStore {
             let data = try NSKeyedArchiver.archivedData(withRootObject: map,
                                                         requiringSecureCoding: true)
             guard data.count <= maxBytes else {
-                print("[WorldMap] 地圖 \(data.count / 1_048_576)MB 超過上限，不保存")
-                try? FileManager.default.removeItem(at: latestURL)   // 舊的也作廢，避免接到過時地圖
+                // **不刪舊的。** 先前這裡會連同既有的 latest 一起刪掉，理由寫的是
+                // 「避免接到過時地圖」—— 但那個理由不成立：舊地圖描述的是同一個空間、
+                // 同一個座標系，只是涵蓋範圍小一些。拿它重定位仍然接得上，
+                // 而刪掉之後下一次 session 是完全沒有地圖可接 —— 嚴格更差。
+                // 而且會踩到上限的正是整層掃描，也就是最需要跨 session 續掃的情況。
+                print("[WorldMap] 地圖 \(data.count / 1_048_576)MB 超過上限"
+                      + "（\(maxBytes / 1_048_576)MB），本次不保存；"
+                      + (hasLatest ? "保留既有地圖，下次仍可延續" : "目前沒有可延續的地圖"))
                 return nil
             }
             try data.write(to: latestURL, options: [.atomic])
