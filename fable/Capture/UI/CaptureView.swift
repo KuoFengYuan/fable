@@ -84,9 +84,9 @@ private struct ARViewContainer: UIViewRepresentable {
         let controller: CaptureController
         init(controller: CaptureController) { self.controller = controller }
 
-        @objc func handleTap(_ gesture: UITapGestureRecognizer) {
-            controller.placeObjectAnchor(at: gesture.location(in: gesture.view))
-        }
+        // 物件模式移除後，點擊畫面已無作用（原本是放置涵蓋圓頂）。
+        // 保留 Coordinator 骨架 —— 之後若要加「點選重掃某區」之類的互動會用到。
+        @objc func handleTap(_ gesture: UITapGestureRecognizer) {}
     }
 }
 

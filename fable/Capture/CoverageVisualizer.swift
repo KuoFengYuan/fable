@@ -2,11 +2,14 @@
 //  CoverageVisualizer.swift
 //  fable — AR 實景中的「拍過哪裡」視覺化
 //
-//  兩層線索疊加在 ARSCNView 上：
-//  1. 軌跡折線 + 每個關鍵幀的視向箭錐（全模式）：看得出走過的路徑與拍攝方向
-//  2. 視角圓頂（物件模式）：以物件為中心、azimuth × elevation 分格的半球，
-//     從某方向拍到物件該格即轉綠 —— 灰格就是尚未涵蓋的死角，
-//     直接引導使用者「往灰的地方走」，避免 3DGS 訓練出現破洞。
+//  疊在 ARSCNView 上的三層線索：
+//  1. 即時點雲（空間磚 + ARAnchor 錨定，防漂移殘影）—— 掃到哪就長到哪
+//  2. 軌跡折線 + 每個關鍵幀的視向箭錐：看得出走過的路徑與拍攝方向
+//  3. RoomPlan 的即時結構線框與 dollhouse 縮圖（RoomPlan 開啟時）
+//
+//  註：物件模式的「視角圓頂」已移除。它假設場景中有一個明確的中心物件，
+//  而實際用途已經轉向室內空間掃描 —— 那裡沒有中心可放，
+//  涵蓋率該回答的是「哪一片表面觀測不足」，那是融合熱圖在做的事。
 //
 
 import Foundation
@@ -114,20 +117,6 @@ final class CoverageVisualizer {
     private var tileNodes: [Int64: SCNNode] = [:]  // tileKey → 節點（幾何為錨點局部座標）
     private var pathPoints: [SCNVector3] = []
 
-    private var domeRoot: SCNNode?
-    private var cellNodes: [SCNNode] = []
-    private var cellCovered: [Bool] = []
-    private var objectCenter: SIMD3<Float>?
-    private var domeRadius: Float = 1
-    private var guidanceCellIdx: Int = -1   // 目前高亮的「最近缺角」格
-
-    /// 涵蓋率變動回呼（0...1），供 HUD 顯示
-    var onCoverageChanged: ((Double) -> Void)?
-    /// 缺角提醒回呼：往哪補掃的一句提示（nil＝無圓頂或已全涵蓋，隱藏提示）
-    var onGuidanceChanged: ((String?) -> Void)?
-
-    var hasDome: Bool { domeRoot != nil }
-
     init(config: CaptureConfig) {
         self.config = config
         root.addChildNode(pathNode)
@@ -159,14 +148,6 @@ final class CoverageVisualizer {
             tile.removeFromParentNode()
         }
         tileNodes = [:]
-        domeRoot = nil
-        cellNodes = []
-        cellCovered = []
-        objectCenter = nil
-        domeRadius = 1
-        guidanceCellIdx = -1
-        onCoverageChanged?(0)
-        onGuidanceChanged?(nil)
     }
 
     // MARK: - 即時點雲疊加（空間磚 + ARAnchor 錨定，防漂移殘影）
@@ -585,119 +566,14 @@ final class CoverageVisualizer {
 
     // MARK: - 圓頂
 
-    /// 以物件為中心建立視角圓頂。radius 通常取「使用者目前站位到中心的距離」，
-    /// 讓圓頂剛好罩在使用者的拍攝球面上。
-    func setObjectCenter(_ center: SIMD3<Float>, radius: Float) {
-        domeRoot?.removeFromParentNode()
-        let dome = SCNNode()
-        dome.simdPosition = center
-
-        let azN = config.domeAzimuthBins
-        let elN = config.domeElevationBins
-        cellNodes = []
-        cellNodes.reserveCapacity(azN * elN)
-        cellCovered = Array(repeating: false, count: azN * elN)
-        let elMax = config.domeElevationMaxDeg * .pi / 180
-
-        for e in 0..<elN {
-            let el0 = elMax * Float(e) / Float(elN)
-            let el1 = elMax * Float(e + 1) / Float(elN)
-            for a in 0..<azN {
-                let az0 = 2 * .pi * Float(a) / Float(azN)
-                let az1 = 2 * .pi * Float(a + 1) / Float(azN)
-                let node = SCNNode(geometry: Self.cellGeometry(radius: radius,
-                                                               az0: az0, az1: az1,
-                                                               el0: el0, el1: el1))
-                dome.addChildNode(node)
-                cellNodes.append(node)
-            }
-        }
-        root.addChildNode(dome)
-        domeRoot = dome
-        objectCenter = center
-        domeRadius = radius
-        guidanceCellIdx = -1
-        onCoverageChanged?(0)
-    }
-
-    // MARK: - 缺角提醒（往哪補掃）
-
-    /// 每幀（可節流）呼叫：找出離目前相機最近的未涵蓋格、以橘色高亮，並回報一句「往哪補」的視角相對提示。
-    func updateGuidance(pose: simd_float4x4) {
-        guard let center = objectCenter, !cellNodes.isEmpty else { onGuidanceChanged?(nil); return }
-        let camPos = MatrixUtil.position(pose)
-        let toCam = camPos - center
-        let dist = simd_length(toCam)
-        guard dist > 0.05 else { return }
-        let camDir = toCam / dist
-        let camAz = atan2(camDir.z, camDir.x)
-        let camEl = asin(max(-1, min(1, camDir.y)))
-
-        let azN = config.domeAzimuthBins, elN = config.domeElevationBins
-        let elMax = config.domeElevationMaxDeg * .pi / 180
-
-        // 最近的未涵蓋格（az/el 角距最小）
-        var bestIdx = -1
-        var bestScore = Float.greatestFiniteMagnitude
-        for e in 0..<elN {
-            let cellEl = elMax * (Float(e) + 0.5) / Float(elN)
-            for a in 0..<azN {
-                let idx = e * azN + a
-                if cellCovered[idx] { continue }
-                let cellAz = 2 * .pi * (Float(a) + 0.5) / Float(azN)
-                var dAz = cellAz - camAz
-                while dAz > .pi { dAz -= 2 * .pi }
-                while dAz < -.pi { dAz += 2 * .pi }
-                let dEl = cellEl - camEl
-                let score = dAz * dAz + dEl * dEl
-                if score < bestScore { bestScore = score; bestIdx = idx }
-            }
-        }
-        if bestIdx < 0 { setGuidanceCell(-1); onGuidanceChanged?(nil); return }  // 已全涵蓋
-        setGuidanceCell(bestIdx)
-
-        // 目標格中心的世界座標 → 相機視角相對方向（不需螢幕投影即給明確提示）
-        let e = bestIdx / azN, a = bestIdx % azN
-        let cellEl = elMax * (Float(e) + 0.5) / Float(elN)
-        let cellAz = 2 * .pi * (Float(a) + 0.5) / Float(azN)
-        let tdir = SIMD3<Float>(cos(cellEl) * cos(cellAz), sin(cellEl), cos(cellEl) * sin(cellAz))
-        let target = center + tdir * domeRadius
-        let right = SIMD3<Float>(pose[0][0], pose[0][1], pose[0][2])
-        let up    = SIMD3<Float>(pose[1][0], pose[1][1], pose[1][2])
-        let back  = SIMD3<Float>(pose[2][0], pose[2][1], pose[2][2])   // 相機 +z（背向；視線為 -back）
-        let v = target - camPos
-        let cx = simd_dot(v, right), cy = simd_dot(v, up), cz = simd_dot(v, back)
-        let missing = cellCovered.lazy.filter { !$0 }.count
-
-        let dir: String
-        if cz > 0 { dir = "缺角在你後方 — 轉過去補掃" }
-        else if abs(cx) >= abs(cy) { dir = cx > 0 ? "往右邊繞去補掃" : "往左邊繞去補掃" }
-        else { dir = cy > 0 ? "把視角抬高補掃" : "把視角放低補掃" }
-        onGuidanceChanged?("還缺 \(missing) 個視角 · \(dir)")
-    }
-
-    /// 高亮「最近缺角」格為橘色；還原前一個（若仍未涵蓋）為原本淡色。
-    private func setGuidanceCell(_ idx: Int) {
-        if guidanceCellIdx == idx { return }
-        if guidanceCellIdx >= 0, guidanceCellIdx < cellNodes.count, !cellCovered[guidanceCellIdx] {
-            cellNodes[guidanceCellIdx].geometry?.firstMaterial?.diffuse.contents = UIColor.white.withAlphaComponent(0.14)
-        }
-        guidanceCellIdx = idx
-        if idx >= 0 {
-            cellNodes[idx].geometry?.firstMaterial?.diffuse.contents = UIColor.systemOrange.withAlphaComponent(0.7)
-        }
-    }
-
-    // MARK: - 關鍵幀
-
     func addKeyframe(pose: simd_float4x4) {
         let p = MatrixUtil.position(pose)
         pathPoints.append(SCNVector3(p.x, p.y, p.z))
         if pathPoints.count >= 2 {
-            pathNode.geometry = Self.polyline(pathPoints)
+            pathNode.geometry = PointCloudRendering.polyline(pathPoints,
+                                                            color: .systemGreen)
         }
         addDirectionMarker(pose: pose)
-        updateDome(pose: pose)
     }
 
     /// 小箭錐標記已拍視角（線框，底面貼相機、尖端指向拍攝方向）
@@ -717,69 +593,4 @@ final class CoverageVisualizer {
         root.addChildNode(node)
     }
 
-    private func updateDome(pose: simd_float4x4) {
-        guard let center = objectCenter, !cellNodes.isEmpty else { return }
-        let camPos = MatrixUtil.position(pose)
-        let toCam = camPos - center
-        let dist = simd_length(toCam)
-        guard dist > 0.05 else { return }
-
-        // 相機必須大致朝向物件中心，該視角格才算「拍到」
-        let forward = -SIMD3<Float>(pose[2][0], pose[2][1], pose[2][2])
-        let toCenter = simd_normalize(center - camPos)
-        let cosLimit = cos(config.domeViewAngleDeg * .pi / 180)
-        guard simd_dot(simd_normalize(forward), toCenter) > cosLimit else { return }
-
-        let dir = toCam / dist
-        let elevation = asin(max(-1, min(1, dir.y)))
-        guard elevation >= 0 else { return }          // 圓頂僅涵蓋水平面以上
-        var azimuth = atan2(dir.z, dir.x)
-        if azimuth < 0 { azimuth += 2 * .pi }
-
-        let elMax = config.domeElevationMaxDeg * .pi / 180
-        let e = min(config.domeElevationBins - 1, Int(elevation / elMax * Float(config.domeElevationBins)))
-        let a = min(config.domeAzimuthBins - 1, Int(azimuth / (2 * .pi) * Float(config.domeAzimuthBins)))
-        let idx = e * config.domeAzimuthBins + a
-
-        guard !cellCovered[idx] else { return }
-        cellCovered[idx] = true
-        cellNodes[idx].geometry?.firstMaterial?.diffuse.contents =
-            UIColor.systemGreen.withAlphaComponent(0.45)
-        let covered = cellCovered.lazy.filter { $0 }.count
-        onCoverageChanged?(Double(covered) / Double(cellCovered.count))
-    }
-
-    // MARK: - 幾何生成
-
-    private static func polyline(_ points: [SCNVector3]) -> SCNGeometry {
-        PointCloudRendering.polyline(points, color: .systemGreen)
-    }
-
-    /// 球面上的一格四邊形（az/el 各內縮 8% 形成格線間隙）
-    private static func cellGeometry(radius: Float, az0: Float, az1: Float,
-                                     el0: Float, el1: Float) -> SCNGeometry {
-        let azInset = (az1 - az0) * 0.08
-        let elInset = (el1 - el0) * 0.08
-        let a0 = az0 + azInset, a1 = az1 - azInset
-        let e0 = el0 + elInset, e1 = el1 - elInset
-
-        func vertex(_ az: Float, _ el: Float) -> SCNVector3 {
-            SCNVector3(cos(el) * cos(az) * radius,
-                       sin(el) * radius,
-                       cos(el) * sin(az) * radius)
-        }
-        let vertices = [vertex(a0, e0), vertex(a1, e0), vertex(a1, e1), vertex(a0, e1)]
-        let indices: [Int32] = [0, 1, 2, 0, 2, 3]
-        let source = SCNGeometrySource(vertices: vertices)
-        let element = SCNGeometryElement(indices: indices, primitiveType: .triangles)
-        let geometry = SCNGeometry(sources: [source], elements: [element])
-
-        let mat = SCNMaterial()
-        mat.diffuse.contents = UIColor.white.withAlphaComponent(0.14)
-        mat.lightingModel = .constant
-        mat.isDoubleSided = true
-        mat.writesToDepthBuffer = false
-        geometry.materials = [mat]
-        return geometry
-    }
 }

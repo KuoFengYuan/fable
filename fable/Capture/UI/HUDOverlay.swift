@@ -33,7 +33,6 @@ struct HUDOverlay: View {
         }
         .animation(.easeInOut(duration: 0.25), value: controller.assessment.worst)
         .animation(.easeInOut(duration: 0.25), value: controller.phase)
-        .animation(.easeInOut(duration: 0.25), value: controller.coverageHint)
         .animation(.easeInOut(duration: 0.25), value: controller.loopHint)
         .animation(.easeInOut(duration: 0.25), value: controller.floorPlanHint)
         .animation(.easeInOut(duration: 0.25), value: controller.recentRejectCount >= 4)
@@ -102,10 +101,6 @@ struct HUDOverlay: View {
         if let hint = controller.loopHint {
             return Guidance(text: hint, symbol: "arrow.triangle.capsulepath",
                             tint: .yellow)
-        }
-        if let hint = controller.coverageHint {
-            return Guidance(text: hint, symbol: "scope",
-                            tint: .orange)
         }
         if let w = a.worst {
             return Guidance(text: w.message, symbol: w.symbol,
@@ -225,10 +220,6 @@ struct HUDOverlay: View {
             VStack(alignment: .trailing, spacing: 3) {
                 Label("\(controller.keyframeCount) 幀", systemImage: "camera.viewfinder")
                 Label("\(controller.pointCount / 1000)k 點", systemImage: "circle.grid.3x3.fill")
-                if controller.mode == .object && controller.domePlaced {
-                    Label(String(format: "涵蓋 %.0f%%", controller.coverage * 100),
-                          systemImage: "globe.asia.australia.fill")
-                }
                 // 融合完成度：場景模式沒有涵蓋率圓頂，這是唯一的「掃夠了沒」訊號。
                 // 顏色即結論——紅/橘代表大部分表面觀測不足，別急著停。
                 if controller.phase == .scanning {
@@ -311,7 +302,6 @@ struct HUDOverlay: View {
         switch controller.phase {
         case .idle:
             if !controller.trackingReady { return "初始化中：請緩慢平移手機讓 ARKit 建立追蹤" }
-            if controller.mode == .object && !controller.domePlaced { return "點擊畫面中的物件，放置視角涵蓋圓頂" }
             return "按下快門開始掃描（每移動 10cm 或轉動 6° 自動抓幀）"
         case .scanning:
             return nil
@@ -363,14 +353,6 @@ struct HUDOverlay: View {
                 .frame(width: 290)
                 .hudGlass(Capsule())
                 .foregroundStyle(.white)
-
-                Picker("模式", selection: $controller.mode) {
-                    ForEach(ScanMode.allCases) { m in
-                        Text(m.label).tag(m)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 180)
             }
 
             switch controller.phase {

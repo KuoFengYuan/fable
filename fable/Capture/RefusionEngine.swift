@@ -477,6 +477,7 @@ nonisolated enum RefusionEngine {
         let minConf = config.minDepthConfidence
         let edgeRatio = config.depthEdgeRejectRatio
         let stride = max(1, config.refuseSampleStride)
+        let minCosInc = cos(config.depthMaxIncidenceDeg * .pi / 180)
 
         return depth.withUnsafeBytes { raw -> [CloudPoint] in
             let d = raw.bindMemory(to: Float32.self)
@@ -491,14 +492,35 @@ nonisolated enum RefusionEngine {
                     let cv = conf?[i] ?? 2
                     if z.isFinite, z > minD, z < maxD, cv >= minConf {
                         var ok = true
+                        // 入射角：由相鄰像素的深度梯度算出來。
+                        //
+                        // **這是牆面疊影的主因。** 一個深度像素在 z 處的橫向足跡是 z/fx，
+                        // 而相鄰像素的深度差 Δz 與入射角的關係是 tanθ = Δz·fx/z。
+                        // 掠射（θ→90°）時，同一個像素涵蓋牆面上一大片，深度沿光線的
+                        // 誤差被 1/cosθ 放大 —— 那些點會落在真實表面前後好幾公分處，
+                        // 每一趟掃描各偏一點，於是在 voxel 格上排成一片片平行的殼，
+                        // 就是畫面上看到的垂直條紋與「掃多次疊在一起」。
+                        //
+                        // 原本的 depthEdgeRejectRatio 是深度比例（5%），換算下來
+                        // 不論遠近都相當於放行到 84° —— 幾乎什麼掠射樣本都收。
+                        // 改成直接用角度，物理意義明確且與距離無關。
+                        var tanU: Float = 0, tanV: Float = 0
                         if u + 1 < dw {
                             let dr = d[i + 1]
                             if !dr.isFinite || abs(dr - z) > z * edgeRatio { ok = false }
+                            else { tanU = abs(dr - z) * fx / z }
                         }
                         if ok, v + 1 < dh {
                             let db = d[i + dw]
                             if !db.isFinite || abs(db - z) > z * edgeRatio { ok = false }
+                            else { tanV = abs(db - z) * fy / z }
                         }
+                        // cosθ = 1/√(1+tan²θ)。用它同時做硬拒絕與權重：
+                        // 硬拒絕留得寬（只擋掉幾乎與視線平行的），主要靠權重 ——
+                        // 直接刪會在只能斜看到的牆面上開洞，而降權不會：
+                        // 之後有正面觀測進來時，加權平均自然被拉回正確的表面。
+                        let cosInc = 1 / (1 + tanU * tanU + tanV * tanV).squareRoot()
+                        if cosInc < minCosInc { ok = false }
                         if ok {
                             let xc = (Float(u) - cx) / fx * z
                             let yc = (Float(v) - cy) / fy * z
@@ -511,7 +533,11 @@ nonisolated enum RefusionEngine {
                             let confW: Float = cv >= 2 ? 1 : config.mediumConfidenceWeight
                             out.append(CloudPoint(x: w4.x, y: w4.y, z: w4.z,
                                                   r: rgba[px], g: rgba[px + 1], b: rgba[px + 2],
-                                                  score: central * near * sharpness * confW))
+                                                  // cos²θ：掠射樣本降到 3% 左右
+                                                  // （80° → cos²=0.03），正面觀測因此
+                                                  // 一進來就主導這一格的加權平均
+                                                  score: central * near * sharpness
+                                                         * confW * cosInc * cosInc))
                         }
                     }
                     u += stride

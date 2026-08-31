@@ -6,15 +6,6 @@
 import Foundation
 import CoreGraphics
 
-/// 掃描模式：物件環繞（顯示涵蓋率圓頂）或場景漫遊（顯示軌跡緞帶）
-nonisolated enum ScanMode: String, CaseIterable, Identifiable, Sendable {
-    case object
-    case scene
-
-    var id: String { rawValue }
-    var label: String { self == .object ? "物件" : "場景" }
-}
-
 /// 所有可調參數集中於此。門檻值以 iPhone Pro（LiDAR）室內拍攝為基準。
 nonisolated struct CaptureConfig: Sendable {
 
@@ -185,6 +176,18 @@ nonisolated struct CaptureConfig: Sendable {
     var pointMaxDepthM: Float = 5.0
     /// 飛點過濾：與相鄰像素深度差超過 depth×此比例 → 視為物體邊緣拖影，剔除
     var depthEdgeRejectRatio: Float = 0.05
+    /// 入射角上限（度）。超過就不收這個深度樣本。
+    ///
+    /// **這是牆面疊影的主要對策。** 掠射時一個深度像素涵蓋牆面上一大片，
+    /// 深度沿光線的誤差被 1/cosθ 放大，點會落在真實表面前後好幾公分；
+    /// 每一趟掃描各偏一點，就在 voxel 格上排成一片片平行的殼
+    /// —— 那就是畫面上的垂直條紋與「掃多次疊在一起」。
+    ///
+    /// 80° 刻意留得寬：硬拒絕會在只能斜看到的牆面上開洞。
+    /// 真正在做事的是 cos²θ 的權重（80° → 3%）—— 之後有正面觀測進來時，
+    /// 加權平均會被拉回正確的表面，而不是留著兩層殼。
+    /// 想更乾淨可以收到 70~75°，代價是斜面覆蓋率下降。
+    var depthMaxIncidenceDeg: Float = 80
 
     // MARK: - 即時點雲預覽（AR 疊加，Scaniverse 式）
     /// 每 N 個 ARFrame 融合一次（60fps → 每 0.1s），與智慧快門解耦，點雲連續長出
@@ -306,10 +309,4 @@ nonisolated struct CaptureConfig: Sendable {
     /// 1.5m 內大致就會觸發；太小會讓提示永遠不消失。
     var loopClosedRadiusM: Float = 1.5
 
-    // MARK: - 涵蓋率圓頂（物件模式）
-    var domeAzimuthBins = 24
-    var domeElevationBins = 5
-    var domeElevationMaxDeg: Float = 75
-    /// 相機視線需與「相機→物件中心」夾角小於此值，該視角格才算已涵蓋
-    var domeViewAngleDeg: Float = 35
 }

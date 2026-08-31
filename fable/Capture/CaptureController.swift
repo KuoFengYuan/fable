@@ -31,18 +31,14 @@ final class CaptureController: NSObject, ObservableObject {
 
     // MARK: - UI 狀態
     @Published var phase: Phase = .idle
-    @Published var mode: ScanMode = .object
     @Published var assessment = QualityAssessment()
     @Published var keyframeCount = 0
     @Published var pointCount = 0
     /// 融合完成度：已被足夠多幀觀測的表面占比。場景模式沒有涵蓋率圓頂，
     /// 這是唯一能回答「掃夠了沒」的訊號；也比幀數有意義（站原地拍 100 幀是沒用的）。
     @Published var fusionCompleteness: Double = 0
-    @Published var coverage: Double = 0
-    @Published var coverageHint: String?   // 缺角提醒：往哪補掃（物件模式圓頂）
     @Published var exportedZip: URL?
     @Published var statusText: String?
-    @Published var domePlaced = false
     @Published var trackingReady = false
     /// 即時點雲疊加。**預設顯示** —— RoomPlan 的即時線框已經關掉了，
     /// 少了它，點雲就是掃描當下唯一能回答「這裡掃到了沒」的東西。
@@ -172,8 +168,6 @@ final class CaptureController: NSObject, ObservableObject {
 
         let viz = CoverageVisualizer(config: config)
         viz.attach(to: arView.scene)
-        viz.onCoverageChanged = { [weak self] c in self?.coverage = c }
-        viz.onGuidanceChanged = { [weak self] hint in self?.coverageHint = hint }
         // 初始狀態必須在這裡套用一次 —— 先前只有 toggle 時才呼叫 setPointCloudHidden，
         // 所以預設值改成 false 之後，第一次進畫面仍然會看到點雲。
         viz.setPointCloudHidden(!showPointCloud)
@@ -265,27 +259,6 @@ final class CaptureController: NSObject, ObservableObject {
         // 曝光上限要在取景階段就設好，AE 才有時間在上限內收斂；
         // session.run 會重設裝置設定，故必須在 run 之後。
         cameraControls.capExposureDuration()
-    }
-
-    // MARK: - 物件模式：點擊放置涵蓋圓頂
-
-    func placeObjectAnchor(at point: CGPoint) {
-        guard phase == .idle, mode == .object, let arView else { return }
-        guard let query = arView.raycastQuery(from: point, allowing: .estimatedPlane, alignment: .any),
-              let hit = arView.session.raycast(query).first else {
-            statusText = "找不到表面，請將準心對準物件再點一次"
-            return
-        }
-        let p = hit.worldTransform.columns.3
-        // 圓頂中心略高於命中表面，較貼近物件幾何中心
-        let center = SIMD3<Float>(p.x, p.y, p.z) + SIMD3<Float>(0, 0.15, 0)
-        let camPos = arView.session.currentFrame.map { MatrixUtil.position($0.camera.transform) }
-            ?? (center + SIMD3<Float>(1, 0, 0))
-        // 把「使用者目前站位」當作標準拍攝半徑
-        let radius = max(0.4, simd_distance(camPos, center) * 0.9)
-        visualizer?.setObjectCenter(center, radius: radius)
-        domePlaced = true
-        statusText = "圓頂已放置，按快門開始掃描；繞行讓灰格全部變綠"
     }
 
     // MARK: - 開始 / 停止
@@ -795,10 +768,7 @@ final class CaptureController: NSObject, ObservableObject {
         statusText = nil
         keyframeCount = 0
         pointCount = 0
-        coverage = 0
-        coverageHint = nil
         exportProgress = 0
-        domePlaced = false
         reviewPoints = []
         reviewTrajectory = []
         refinedRecords = []
@@ -873,7 +843,7 @@ final class CaptureController: NSObject, ObservableObject {
         let meta = SessionMeta(device: Self.deviceModel(),
                                osVersion: UIDevice.current.systemVersion,
                                startedAt: ISO8601DateFormatter().string(from: Date()),
-                               mode: mode.rawValue,
+                               mode: "scene",   // 物件模式已移除；欄位保留給既有資料集相容
                                lidarAvailable: hasLiDAR)
         try ExportManager.writeMeta(meta, to: dir.appendingPathComponent("meta.json"))
     }
@@ -1192,10 +1162,6 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             integratePreview(frame, blurPixels: a.blurPixels)
         }
 
-        // 缺角提醒（物件模式圓頂）：每 ~12 幀（~5Hz）更新「離你最近的缺角在哪、往哪補」
-        if let viz = visualizer, viz.hasDome, frameCounter % 12 == 0 {
-            viz.updateGuidance(pose: frame.camera.transform)
-        }
         // Dollhouse 擺位：**每幀**都要更新，不能像上面那樣抽幀 ——
         // 它跟著視線走，抽幀會看起來一頓一頓的。內容只是一次 transform 賦值，
         // 真正的重建是在 onRoomUpdated 那裡（節流 0.2s）。
