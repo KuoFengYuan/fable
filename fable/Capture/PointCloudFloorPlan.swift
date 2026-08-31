@@ -126,7 +126,10 @@ nonisolated enum PointCloudFloorPlan {
             let b = SIMD2<Float>(s.b.x * bt - s.b.y * bst, s.b.x * bst + s.b.y * bt)
             let len = simd_distance(a, b)
             guard len >= kMinWallLengthM else { continue }
-            walls.append(surface(a: a, b: b, thickness: s.thickness, height: roomHeight))
+            // **牆高填實際觀測到的跨度，不是樓高。**
+            // 填樓高的話 medianWallHeightM 永遠等於整個 Y 範圍，
+            // 「牆只掃到多高」這個檢查就完全失效 —— 而那正是點雲版最常見的問題。
+            walls.append(surface(a: a, b: b, thickness: s.thickness, height: s.spanM))
         }
         guard !walls.isEmpty else { return nil }
 
@@ -150,11 +153,21 @@ nonisolated enum PointCloudFloorPlan {
         plan.floorAreaM2 = Float(floorCells) * kCellM * kCellM
         plan.roomCount = 1
 
+        // 跨度分佈：卡在「牆太少」時，這一行直接分辨得出是門檻太嚴還是根本沒掃到牆。
+        // 沒有它只能猜，而猜錯就是白改一輪。
+        var sp = pass2.spans
+        sp.sort()
+        func pct(_ q: Double) -> Float {
+            sp.isEmpty ? 0 : sp[min(sp.count - 1, Int(Double(sp.count - 1) * q))]
+        }
         let summary = String(
-            format: "點雲平面圖: %d 點 → %d 佔用格 → %d 牆格（垂直跨度 ≥%.2fm）→ %d 段牆；"
-                    + "樓高 %.2fm、主方向 %.1f°、地板 %.1f m²",
+            format: "點雲平面圖: %d 點 → %d 佔用格 → %d 牆格（跨度 ≥%.2fm）→ %d 段牆；"
+                    + "樓高 %.2fm、主方向 %.1f°、地板 %.1f m²\n"
+                    + "  格跨度分佈 p50 %.2f / p75 %.2f / p90 %.2f / p99 %.2fm"
+                    + "（門檻 %.2fm；牆掃到的高度中位數 %.2fm）",
             points.count, grid, pass2.cells.count, needSpan, walls.count,
-            roomHeight, theta * 180 / .pi, plan.floorAreaM2)
+            roomHeight, theta * 180 / .pi, plan.floorAreaM2,
+            pct(0.5), pct(0.75), pct(0.9), pct(0.99), needSpan, plan.medianWallHeightM)
         return Result(plan: plan, summary: summary)
     }
 
@@ -163,9 +176,11 @@ nonisolated enum PointCloudFloorPlan {
     /// **必須先排除地板與天花板帶。** 房間裡每一個水平格子都同時有地板點與天花板點，
     /// 垂直跨度就是整個樓高 —— 空曠的地板中央會跟牆一樣被判成「牆」。
     /// 只看中間那一段，空地就真的是空的，而牆仍然橫跨整段。
+    struct WallCell { var at: SIMD2<Float>; var span: Float }
+
     private static func wallCells(_ points: [SIMD3<Float>],
                                   bandLo: Float, bandHi: Float, needSpan: Float)
-        -> (cells: [SIMD2<Float>], occupied: Int, floorCells: Int) {
+        -> (cells: [WallCell], occupied: Int, floorCells: Int, spans: [Float]) {
         struct Column { var minY: Float; var maxY: Float; var count: Int }
         var grid: [Int64: Column] = [:]
         var floor = Set<Int64>()
@@ -182,11 +197,14 @@ nonisolated enum PointCloudFloorPlan {
                 grid[k] = Column(minY: p.y, maxY: p.y, count: 1)
             }
         }
-        var out: [SIMD2<Float>] = []
-        for (k, c) in grid where c.count >= kMinPointsPerCell && c.maxY - c.minY >= needSpan {
-            out.append(cellCenter(k))
+        var out: [WallCell] = []
+        var spans: [Float] = []
+        for (k, c) in grid where c.count >= kMinPointsPerCell {
+            let span = c.maxY - c.minY
+            spans.append(span)
+            if span >= needSpan { out.append(WallCell(at: cellCenter(k), span: span)) }
         }
-        return (out, grid.count, floor.count)
+        return (out, grid.count, floor.count, spans)
     }
 
     // MARK: - 主方向
@@ -198,14 +216,15 @@ nonisolated enum PointCloudFloorPlan {
     /// 後者只看一面牆，一段誤判就把整張圖轉歪。
     ///
     /// 只需搜 0~90°：矩形格局在 90° 下自我重複。
-    static func dominantAngle(_ cells: [SIMD2<Float>]) -> Float {
+    static func dominantAngle(_ cells: [WallCell]) -> Float {
         var best: Float = 0, bestScore: Float = -1
         var a: Float = 0
         while a < 90 {
             let r = a * .pi / 180
             let c = cos(-r), s = sin(-r)
             var hx: [Int: Int] = [:], hz: [Int: Int] = [:]
-            for p in cells {
+            for w in cells {
+                let p = w.at
                 let x = p.x * c - p.y * s, z = p.x * s + p.y * c
                 hx[Int((x / kCellM).rounded()), default: 0] += 1
                 hz[Int((z / kCellM).rounded()), default: 0] += 1
@@ -221,7 +240,10 @@ nonisolated enum PointCloudFloorPlan {
 
     // MARK: - 線段抽取
 
-    struct Seg { var a: SIMD2<Float>; var b: SIMD2<Float>; var thickness: Float }
+    struct Seg { var a: SIMD2<Float>; var b: SIMD2<Float>; var thickness: Float
+             /// 這段牆實際被掃到的垂直跨度中位數（公尺）——
+             /// 不是樓高。它才回答得了「牆掃到多高」。
+             var spanM: Float }
 
     /// 在已對齊的座標系裡抽出軸向線段。
     ///
@@ -229,10 +251,14 @@ nonisolated enum PointCloudFloorPlan {
     /// 取較長者。**不這樣做的話牆角會同時被算進兩條線**，而且薄牆會沿著兩軸各長出
     /// 一條重疊的線段。這一步讓角落的格子歸給比較長的那面牆 ——
     /// 誤差最多一格（5cm），可以忽略。
-    static func segments(from cells: [SIMD2<Float>]) -> [Seg] {
+    static func segments(from cells: [WallCell]) -> [Seg] {
         var occupied = Set<Int64>()
-        for p in cells { occupied.insert(key(Int(( p.x / kCellM).rounded()),
-                                             Int(( p.y / kCellM).rounded()))) }
+        var spanOf: [Int64: Float] = [:]
+        for w in cells {
+            let k = key(Int((w.at.x / kCellM).rounded()), Int((w.at.y / kCellM).rounded()))
+            occupied.insert(k)
+            spanOf[k] = max(spanOf[k] ?? 0, w.span)
+        }
         func has(_ i: Int, _ j: Int) -> Bool { occupied.contains(key(i, j)) }
 
         /// 沿某方向數連續長度（含自己）
@@ -246,7 +272,8 @@ nonisolated enum PointCloudFloorPlan {
         }
 
         var horiz = Set<Int64>(), vert = Set<Int64>()
-        for p in cells {
+        for w in cells {
+            let p = w.at
             let i = Int((p.x / kCellM).rounded()), j = Int((p.y / kCellM).rounded())
             if run(i, j, dx: 1, dy: 0) >= run(i, j, dx: 0, dy: 1) {
                 horiz.insert(key(i, j))
@@ -256,8 +283,8 @@ nonisolated enum PointCloudFloorPlan {
         }
 
         var out: [Seg] = []
-        out += runs(in: horiz, all: occupied, horizontal: true)
-        out += runs(in: vert, all: occupied, horizontal: false)
+        out += runs(in: horiz, all: occupied, spanOf: spanOf, horizontal: true)
+        out += runs(in: vert, all: occupied, spanOf: spanOf, horizontal: false)
         return out
     }
 
@@ -273,7 +300,7 @@ nonisolated enum PointCloudFloorPlan {
     ///
     /// 合併後的厚度直接由「跨了幾列」得出，比另外去探鄰格更準也更簡單。
     private static func runs(in set: Set<Int64>, all: Set<Int64>,
-                             horizontal: Bool) -> [Seg] {
+                             spanOf: [Int64: Float], horizontal: Bool) -> [Seg] {
         // 依「列」分組：橫向牆同 j、縱向牆同 i
         var lines: [Int: [Int]] = [:]
         for k in set {
@@ -332,7 +359,17 @@ nonisolated enum PointCloudFloorPlan {
                 a = SIMD2(center, Float(lo) * kCellM)
                 b = SIMD2(center, Float(hi) * kCellM)
             }
-            out.append(Seg(a: a, b: b, thickness: thickness))
+            // 這段牆的跨度取所屬格子的中位數 —— 平均會被單一格的極值拉走
+            var spans: [Float] = []
+            for r in g {
+                for v in r.lo...r.hi {
+                    let k = horizontal ? key(v, r.line) : key(r.line, v)
+                    if let sp = spanOf[k] { spans.append(sp) }
+                }
+            }
+            spans.sort()
+            let span = spans.isEmpty ? 0 : spans[spans.count / 2]
+            out.append(Seg(a: a, b: b, thickness: thickness, spanM: span))
         }
         return out
 
