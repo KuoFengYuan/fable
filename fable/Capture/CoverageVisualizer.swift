@@ -335,10 +335,13 @@ final class CoverageVisualizer {
     ///   0.12m @ 0.65m 遠 → 張角 ~10.6°
     private static let kDollSize: Float = 0.12
     /// 擺放位置：視點前方 / 下方（公尺）。
-    /// 往下的角度 = atan(down/forward)，在 ~60° 垂直視角下換算成螢幕位置：
-    ///   0.26 / 0.65 → 21.8° → 約螢幕 73% 高度處（官方參考圖大致在這個位置）
+    ///
+    /// 螢幕上的高度由俯角決定：atan(down / forward)，在 ~60° 的垂直視角下
+    /// 每 0.6° 約等於螢幕 1%。0.19 / 0.65 → 16.3° → 中心約在螢幕 77% 高度、
+    /// 整塊佔 68~86%，剛好落在快門鈕上方。
+    /// （60° 是估的 —— 不同機型的視角有差，這兩個值是可以直接調的。）
     private static let kDollForward: Float = 0.65
-    private static let kDollDown: Float = 0.26
+    private static let kDollDown: Float = 0.19
 
     /// 用 RoomPlan 當下的房間長出白色實體縮圖：地板板 + 半透明牆 + 家具方塊。
     ///
