@@ -242,6 +242,18 @@ nonisolated struct CaptureConfig: Sendable {
     /// 只在支援 RoomPlan 的機型生效（見 FloorPlanCapture.isSupported）。
     var captureFloorPlan = true
 
+    /// 由 LiDAR 點雲直接產生平面圖（不經過 RoomPlan）。
+    ///
+    /// **與 captureFloorPlan 互相獨立，兩者可以同時開。** 它們的失效模式完全不同：
+    ///   · RoomPlan 需要場景「是個房間」——有地板、成面的牆、牆與天花板的交界。
+    ///     辦公室隔間、貨架、桌面前它會把螢幕邊桌緣硬判成牆，
+    ///     而且第一片判錯之後後續的面會跟著它對齊。回報過 2 面牆、樓高 0.80m。
+    ///   · 點雲只需要表面被掃到，但分不出門窗與家具語意（那要靠 RoomPlan）。
+    ///
+    /// 幾乎不花錢：重融合已經算好點雲了，這一步只是再掃一遍那些點
+    /// （10 萬點約數十毫秒），而且只在匯出時做，不影響掃描。
+    var pointCloudFloorPlan = true
+
     // MARK: - 局部 BA（**目前整條關閉**）
     /// 局部 BA 的輪數。**0 = 整條路徑關閉，掃描時的特徵抽取與匹配也一起不做。**
     ///

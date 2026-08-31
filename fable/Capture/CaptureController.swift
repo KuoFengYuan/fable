@@ -906,22 +906,49 @@ final class CaptureController: NSObject, ObservableObject {
     /// 座標維持 ARKit 原生（+Y up、公尺），與 points.ply / poses.jsonl 一致；
     /// 匯出 COLMAP 用的世界翻轉**不**套用在這裡 —— 那是 3DGS 生態的慣例，平面圖不需要。
     private func writeFloorPlan(to dir: URL) async {
+        // ── 點雲平面圖：不需要 RoomPlan，只要有掃到表面 ──
+        //
+        // 為什麼要有兩套：RoomPlan 是**房間**掃描器，它要有地板、成面的牆、
+        // 牆與天花板的交界才給得出正確結構；在辦公室隔間、貨架、桌面前它會把
+        // 螢幕邊桌緣硬判成牆，而且第一片判錯之後後續會跟著它對齊。
+        // 點雲沒有這個前提。所以兩者各自輸出、互不覆蓋，
+        // 使用者拿哪一份由現場決定，而不是由我事先猜。
+        if config.pointCloudFloorPlan, !reviewPoints.isEmpty {
+            let pts = reviewPoints.map { SIMD3<Float>($0.x, $0.y, $0.z) }
+            if let r = PointCloudFloorPlan.extract(points: pts) {
+                print(r.summary)
+                writePlan(r.plan, to: dir, prefix: "floorplan_pointcloud")
+            } else {
+                print("點雲平面圖: 抽不出牆（點太少、或沒有垂直跨度足夠的表面）")
+            }
+        }
+
         guard config.captureFloorPlan, FloorPlanCapture.isSupported else { return }
         // 平面圖是背景建的（見 processScan），匯出時若還沒好就在這裡等 ——
         // 匯出是使用者明確要求的動作，少一個檔比多等幾秒糟。
         if floorPlanData == nil { floorPlanData = await floorPlan.build() }
         await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
         guard let fp = floorPlanData else { return }
+        writePlan(fp, to: dir, prefix: "floorplan")
+    }
+
+    /// 一份平面圖的三種格式。
+    ///   .json — 參數化資料 ＋ 已投影到水平面的 2D 線段，給程式化後處理用
+    ///   .svg  — 直接看得到的俯視平面圖（含 1m 網格、牆長標註、比例尺）
+    ///   .dxf  — 帶圖層的 CAD 圖元，AutoCAD / QCAD / Rhino 直接開，可量可續繪
+    private func writePlan(_ fp: FloorPlanData, to dir: URL, prefix: String) {
         do {
             let enc = JSONEncoder()
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try enc.encode(fp).write(to: dir.appendingPathComponent("floorplan.json"),
+            try enc.encode(fp).write(to: dir.appendingPathComponent("\(prefix).json"),
                                      options: [.atomic])
             let svg = fp.svg(showAllFurniture: showPlanFurniture)
-            try Data(svg.utf8).write(to: dir.appendingPathComponent("floorplan.svg"),
+            try Data(svg.utf8).write(to: dir.appendingPathComponent("\(prefix).svg"),
                                      options: [.atomic])
+            try Data(FloorPlanDXF.make(fp).utf8)
+                .write(to: dir.appendingPathComponent("\(prefix).dxf"), options: [.atomic])
         } catch {
-            print("[FloorPlan] 寫檔失敗: \(error)")
+            print("[FloorPlan] 寫檔失敗（\(prefix)）: \(error)")
         }
     }
 
