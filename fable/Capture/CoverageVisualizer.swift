@@ -334,9 +334,11 @@ final class CoverageVisualizer {
     /// 實機畫面因此被縮圖蓋住下半部。官方大約只佔 15~18%，換算張角 ~10°：
     ///   0.12m @ 0.65m 遠 → 張角 ~10.6°
     private static let kDollSize: Float = 0.12
-    /// 擺放位置：相機前方 / 下方（公尺）。低一點才不會擋住正在掃的牆面
+    /// 擺放位置：視點前方 / 下方（公尺）。
+    /// 往下的角度 = atan(down/forward)，在 ~60° 垂直視角下換算成螢幕位置：
+    ///   0.26 / 0.65 → 21.8° → 約螢幕 73% 高度處（官方參考圖大致在這個位置）
     private static let kDollForward: Float = 0.65
-    private static let kDollDown: Float = 0.22
+    private static let kDollDown: Float = 0.26
 
     /// 用 RoomPlan 當下的房間長出白色實體縮圖：地板板 + 半透明牆 + 家具方塊。
     ///
@@ -454,21 +456,26 @@ final class CoverageVisualizer {
         return m
     }
 
-    /// 每幀擺位：**相機座標**的固定偏移（螢幕位置固定），但朝向維持世界對齊。
+    /// 每幀擺位：**畫面座標**的固定偏移（螢幕位置固定），但朝向維持世界對齊。
     ///
-    /// 位置用相機座標、朝向用世界座標，這個組合才對：
+    /// 位置用視點座標、朝向用世界座標，這個組合才對：
     ///   · 位置若用世界座標（相機位置 ＋ 水平前方，忽略俯仰）——
     ///     低頭掃地板時那個世界點沒動，但視線轉下去了，縮圖就往螢幕上方跑掉。
-    ///     實機回報的「往下掃時中間的重建會往上跑」就是這個。
     ///   · 朝向若也跟著相機轉，它就變成一張貼在鏡頭上的貼紙，讀不出方位；
     ///     維持世界對齊才像一張攤在眼前的地圖。
     ///
+    /// - Parameter pov: **必須是 ARSCNView.pointOfView 的世界變換，不是
+    ///   ARCamera.transform。** 後者的座標系與介面方向無關：X 軸永遠沿著裝置長軸
+    ///   （前鏡頭 → Home 鍵）、Y 軸是 landscapeRight 下的「上」。
+    ///   直向 App 直接拿它當「下方」用，實際會偏到螢幕左邊 ——
+    ///   實機看到縮圖跑到左上角就是這個。
+    ///   pointOfView 已經套過介面方向，+X 右、+Y 上、-Z 前，各方向都不必再換算。
+    ///
     /// 位置做指數平滑，否則手震會讓它抖。
-    func placeDollhouse(camera: simd_float4x4) {
+    func placeDollhouse(pov: simd_float4x4) {
         guard !dollContent.isHidden else { return }
-        // ARKit 相機座標：-Z 前方、-Y 下方
         let local = SIMD4<Float>(0, -Self.kDollDown, -Self.kDollForward, 1)
-        let w = camera * local
+        let w = pov * local
         let target = SIMD3<Float>(w.x, w.y, w.z)
         if dollPlaced {
             dollRoot.simdPosition += (target - dollRoot.simdPosition) * 0.18

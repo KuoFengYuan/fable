@@ -1144,9 +1144,15 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             viz.updateGuidance(pose: frame.camera.transform)
         }
         // Dollhouse 擺位：**每幀**都要更新，不能像上面那樣抽幀 ——
-        // 它跟著相機走，5Hz 會看起來一頓一頓的。內容只是一次 transform 賦值，
-        // 真正的重建是在 onRoomUpdated（節流 0.4s）那裡。
-        if showRoomPlan { visualizer?.placeDollhouse(camera: frame.camera.transform) }
+        // 它跟著視線走，抽幀會看起來一頓一頓的。內容只是一次 transform 賦值，
+        // 真正的重建是在 onRoomUpdated 那裡（節流 0.2s）。
+        //
+        // 用 pointOfView 而不是 frame.camera.transform：後者的座標系與介面方向無關
+        // （X 軸沿裝置長軸、Y 軸是 landscapeRight 的「上」），直向 App 拿它當
+        // 「下方」會偏到螢幕左邊。pointOfView 已經套過介面方向。
+        if showRoomPlan, let pov = arView?.pointOfView {
+            visualizer?.placeDollhouse(pov: pov.simdWorldTransform)
+        }
 
         guard a.allowCapture else { return }
         // 速度閘門：blur 擋不住「亮處快速移動」（曝光短 → 模糊低，但 VIO 姿態仍有延遲誤差）。
