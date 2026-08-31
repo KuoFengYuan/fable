@@ -206,6 +206,9 @@ final class CoverageVisualizer {
     /// 這樣每一次更新的補間都還沒走完就接上下一次，看起來是連續長出來的；
     /// 短於節流間隔的話會變成「動一下、停一下」，比直接跳還難看。
     private static let kGrowDuration: CFTimeInterval = 0.24
+    /// 新面「畫出來」的時間。刻意比延伸慢 —— 那一段是要被看見的過程本身，
+    /// 用 0.24s 畫完等於又回到「一口氣出現」。
+    private static let kDrawDuration: CFTimeInterval = 0.5
 
     func updateRoomSurfaces(_ surfaces: [RoomSurface]) {
         while roomNodes.count > surfaces.count {
@@ -226,9 +229,21 @@ final class CoverageVisualizer {
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0
             for i in fresh {
-                Self.layoutEdges(roomNodes[i], size: .zero, box: surfaces[i].isBox,
-                                 color: Self.roomColor(surfaces[i].kind))
-                roomNodes[i].simdTransform = surfaces[i].transform
+                let s = surfaces[i]
+                // **起點放在這面牆的一端，不是中心。**
+                //
+                // 尺寸 0 擺在最終中心的話，補間出來是「從中間往兩邊綻開」——
+                // 那看起來像一個矩形憑空長大，不是線被畫出去。
+                // 退到局部 -X 那一端再長回來，才是「掃到哪畫到哪」的手感。
+                //
+                // （既有面的延伸本來就已經是端點錨定的：RoomPlan 把牆加長時
+                //   會同時回報新的中心與新的寬度，兩者一起線性補間的結果
+                //   就是一端不動、另一端往外走。缺的一直只有第一次出現。）
+                var t = s.transform
+                t.columns.3 -= t.columns.0 * (s.size.x / 2)
+                Self.layoutEdges(roomNodes[i], size: .zero, box: s.isBox,
+                                 color: Self.roomColor(s.kind))
+                roomNodes[i].simdTransform = t
             }
             SCNTransaction.commit()
         }
@@ -241,9 +256,10 @@ final class CoverageVisualizer {
         // 疊起來就是規律的脈動，正是「不夠流暢」的來源。
         // 線性讓速度跨段一致，看起來就是一條穩定往前長的線。
         let existing = Set(0..<surfaces.count).subtracting(fresh)
-        func apply(_ indices: some Sequence<Int>, timing: CAMediaTimingFunctionName) {
+        func apply(_ indices: some Sequence<Int>, timing: CAMediaTimingFunctionName,
+                   duration: CFTimeInterval) {
             SCNTransaction.begin()
-            SCNTransaction.animationDuration = Self.kGrowDuration
+            SCNTransaction.animationDuration = duration
             SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: timing)
             for i in indices {
                 let s = surfaces[i]
@@ -254,8 +270,10 @@ final class CoverageVisualizer {
             }
             SCNTransaction.commit()
         }
-        apply(fresh, timing: .easeOut)
-        apply(existing.sorted(), timing: .linear)
+        // 新面用比較長的時間 —— 這一段是「線被畫出去」，太快就看不出過程；
+        // 既有面則要跟上 0.2s 的資料節奏，慢了會落後於實際掃到的範圍。
+        apply(fresh, timing: .easeOut, duration: Self.kDrawDuration)
+        apply(existing.sorted(), timing: .linear, duration: Self.kGrowDuration)
     }
 
     /// 一個面的邊框 = 四條**圓管**（上下左右），每條再套一層外暈。
@@ -436,18 +454,24 @@ final class CoverageVisualizer {
         return m
     }
 
-    /// 每幀擺位：相機前下方，但**維持世界朝向** —— 這樣它讀起來像一張攤在眼前的地圖，
-    /// 而不是跟著頭轉的貼紙。位置做指數平滑，否則手震會讓它抖。
+    /// 每幀擺位：**相機座標**的固定偏移（螢幕位置固定），但朝向維持世界對齊。
+    ///
+    /// 位置用相機座標、朝向用世界座標，這個組合才對：
+    ///   · 位置若用世界座標（相機位置 ＋ 水平前方，忽略俯仰）——
+    ///     低頭掃地板時那個世界點沒動，但視線轉下去了，縮圖就往螢幕上方跑掉。
+    ///     實機回報的「往下掃時中間的重建會往上跑」就是這個。
+    ///   · 朝向若也跟著相機轉，它就變成一張貼在鏡頭上的貼紙，讀不出方位；
+    ///     維持世界對齊才像一張攤在眼前的地圖。
+    ///
+    /// 位置做指數平滑，否則手震會讓它抖。
     func placeDollhouse(camera: simd_float4x4) {
         guard !dollContent.isHidden else { return }
-        let pos = SIMD3<Float>(camera.columns.3.x, camera.columns.3.y, camera.columns.3.z)
-        let fwd = -SIMD3<Float>(camera.columns.2.x, camera.columns.2.y, camera.columns.2.z)
-        // 前方向投影到水平面：相機仰俯時縮圖不該跟著上下飄
-        var flat = SIMD3<Float>(fwd.x, 0, fwd.z)
-        flat = simd_length(flat) > 1e-4 ? simd_normalize(flat) : SIMD3<Float>(0, 0, -1)
-        let target = pos + flat * Self.kDollForward + SIMD3<Float>(0, -Self.kDollDown, 0)
+        // ARKit 相機座標：-Z 前方、-Y 下方
+        let local = SIMD4<Float>(0, -Self.kDollDown, -Self.kDollForward, 1)
+        let w = camera * local
+        let target = SIMD3<Float>(w.x, w.y, w.z)
         if dollPlaced {
-            dollRoot.simdPosition += (target - dollRoot.simdPosition) * 0.12
+            dollRoot.simdPosition += (target - dollRoot.simdPosition) * 0.18
         } else {
             dollRoot.simdPosition = target
             dollPlaced = true

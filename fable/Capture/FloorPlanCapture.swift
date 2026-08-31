@@ -89,6 +89,28 @@ final class FloorPlanCapture: NSObject, ObservableObject {
 
     static var isSupported: Bool { RoomCaptureSession.isSupported }
 
+    /// 這個面是不是一面**站得直**的牆（門窗開口同理）。
+    ///
+    /// **這個檢查在幾何上是硬的，不是啟發式。** ARSession 用
+    /// worldAlignment = .gravity，世界 +Y 永遠是反重力方向 ——
+    /// 所以真正的牆，法向必然是水平的（與 +Y 垂直）。
+    /// 法向明顯偏離水平的「牆」不可能是牆，是 RoomPlan 在非房間場景
+    /// （對著桌面、螢幕、隔板堆掃）硬判出來的東西。
+    ///
+    /// 為什麼要擋：那些面會以歪斜的巨大線框橫跨整個畫面，
+    /// 而且第一片判錯之後後續的面會跟著它對齊 ——
+    /// 實機回報的「地板一開始歪，牆壁和桌子都會歪」就是這樣連鎖出來的。
+    /// Surface 的區域座標系是面躺在 XY 平面、Z 為法向，所以取第 2 欄。
+    ///
+    /// 15° 的容許量：RoomPlan 自己的牆面擬合有幾度誤差，太嚴會把真牆也擋掉。
+    /// 家具（object）不套這個檢查 —— 它們本來就可以是任意朝向。
+    static func isUpright(_ transform: simd_float4x4) -> Bool {
+        let n = SIMD3<Float>(transform.columns.2.x, transform.columns.2.y, transform.columns.2.z)
+        let len = simd_length(n)
+        guard len > 1e-5 else { return false }
+        return abs(n.y / len) <= 0.26        // sin(15°)
+    }
+
     // MARK: - 生命週期
 
     /// 掛到既有的 ARSession 上開始一段擷取。arSession 必須已在 run
@@ -250,8 +272,11 @@ extension FloorPlanCapture: @preconcurrency RoomCaptureSessionDelegate {
     ///   · 在**掃描當下**就知道牆掃得夠不夠高（dimensions 是 (width, height, depth)，牆高取 .y）
     ///   · 把面交給渲染層疊在相機畫面上，讓使用者看得到「已經掃到哪」
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
-        wallCount = room.walls.count
-        maxWallHeightM = room.walls.reduce(Float(0)) { max($0, $1.dimensions.y) }
+        // 牆數與牆高也只算站得直的那些 —— 否則「牆只掃到 0.8m」的提示會被
+        // 誤判出來的歪斜面餵飽，該提示的時候反而不提示
+        let upright = room.walls.filter { Self.isUpright($0.transform) }
+        wallCount = upright.count
+        maxWallHeightM = upright.reduce(Float(0)) { max($0, $1.dimensions.y) }
 
         // 節流：didUpdate 觸發得比畫面更新還密，每次都重建幾何會讓 SceneKit 一直重上傳。
         //
@@ -267,7 +292,7 @@ extension FloorPlanCapture: @preconcurrency RoomCaptureSessionDelegate {
         out.reserveCapacity(room.walls.count + room.doors.count + room.windows.count
                             + room.openings.count + room.objects.count)
         func add(_ list: [CapturedRoom.Surface], _ kind: RoomSurface.Kind) {
-            for s in list {
+            for s in list where Self.isUpright(s.transform) {
                 out.append(RoomSurface(transform: s.transform, size: s.dimensions, kind: kind))
             }
         }
