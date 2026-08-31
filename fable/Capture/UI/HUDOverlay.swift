@@ -35,6 +35,7 @@ struct HUDOverlay: View {
         .animation(.easeInOut(duration: 0.25), value: controller.phase)
         .animation(.easeInOut(duration: 0.25), value: controller.coverageHint)
         .animation(.easeInOut(duration: 0.25), value: controller.loopHint)
+        .animation(.easeInOut(duration: 0.25), value: controller.floorPlanHint)
         .animation(.easeInOut(duration: 0.25), value: controller.recentRejectCount >= 4)
         .animation(.easeInOut(duration: 0.25), value: controller.relocalizing)
     }
@@ -87,6 +88,14 @@ struct HUDOverlay: View {
             return Guidance(text: "畫面不夠清晰，已略過 \(controller.recentRejectCount) 次抓幀 —— 請放慢",
                             symbol: "camera.metering.none",
                             background: .red.opacity(0.85), foreground: .white)
+        }
+        // RoomPlan 的引導排在閉環之前：它講的是「現在這一刻正在丟失資料」
+        // （靠太近、光線不足、紋理不足），而閉環提示是走了 8m 之後的長期建議。
+        // 牆高不足也走這個插槽 —— 那是平面圖失敗最常見的成因，
+        // 而它只有在掃描當下講才有用。
+        if let hint = controller.floorPlanHint {
+            return Guidance(text: hint, symbol: "square.split.bottomrightquarter",
+                            background: .yellow.opacity(0.92), foreground: .black)
         }
         if let hint = controller.loopHint {
             return Guidance(text: hint, symbol: "arrow.triangle.capsulepath",

@@ -94,6 +94,11 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var relocalizing = false
     /// 迴環閉合提示：走遠之後提醒回起點，讓 ARKit 修正整條軌跡的累積漂移
     @Published private(set) var loopHint: String?
+    /// RoomPlan 的即時引導 ＋ 牆高不足提示（見 FloorPlanCapture.coachingHint）。
+    /// **這是平面圖品質最重要的一條回饋**：每一份實機 log 都是
+    /// 「2 牆、樓高 0.80m ⚠️ 掃描不完整」，而那行警告先前只在 review 才印 ——
+    /// 大範圍場景到那時已經不可能重走一遍。
+    @Published private(set) var floorPlanHint: String?
     /// 近 4 秒因清晰度不足而放棄的抓幀數（0 = 沒在掉幀）
     @Published private(set) var recentRejectCount = 0
     /// 掃描品質摘要，review 階段顯示（原本只印在 log 裡，使用者看不到）
@@ -295,6 +300,7 @@ final class CaptureController: NSObject, ObservableObject {
         traveledM = 0
         loopClosed = false
         loopHint = nil
+        floorPlanHint = nil
         lastWorldMapMB = nil
         baResult = nil
         scanSummary = nil
@@ -949,6 +955,15 @@ final class CaptureController: NSObject, ObservableObject {
             loopHint = String(format: "已走 %.0f m —— 走回起點閉環，讓 ARKit 修正累積漂移",
                               traveledM)
         }
+        // RoomPlan 的引導與牆高檢查。
+        //
+        // **為什麼在這裡同步而不是讓 HUD 直接讀 floorPlan**：SwiftUI 的
+        // @ObservedObject 不會觀察巢狀的 ObservableObject，所以 controller.floorPlan
+        // 改變時畫面不會更新。而這個專案沒有其他 Combine 訂閱，為了一個字串
+        // 引入一套 publisher 管線不划算 —— 照 loopHint 既有的做法逐幀同步即可。
+        // 只在值真的改變時寫入，否則每幀都會觸發一次 SwiftUI 更新。
+        let fpHint = floorPlan.coachingHint
+        if fpHint != floorPlanHint { floorPlanHint = fpHint }
     }
 
     /// 量化 ARKit 實際修正了多少漂移。

@@ -31,6 +31,33 @@ final class FloorPlanCapture: NSObject, ObservableObject {
     /// 已完成的掃描段數（＝將被合併的房間數）
     @Published private(set) var segmentCount = 0
 
+    /// 本段目前偵測到的牆數與最高的一面牆（公尺）。
+    ///
+    /// **這兩個數字必須在掃描當下就看得到，不能等到掃完。** 每一份實機 log 都是
+    /// 「1 房、2 牆、樓高 0.80m ⚠️ 掃描不完整」—— 而那行警告印在 review 階段，
+    /// 那時整趟掃描已經結束、大範圍場景不可能重走一遍。
+    /// RoomPlan 的 didUpdate 每幀都給出當下的房間幾何，資訊本來就在，只是沒被用。
+    @Published private(set) var wallCount = 0
+    @Published private(set) var maxWallHeightM: Float = 0
+
+    /// 給 HUD 的單一提示字串。優先序：RoomPlan 自己的引導 > 我們的牆高檢查。
+    /// RoomPlan 的引導比較急迫（它知道自己正在丟失追蹤），牆高則是慢性問題。
+    var coachingHint: String? {
+        if let instruction { return instruction }
+        // 一面牆都還沒偵測到時不催 —— 剛開始掃本來就沒有
+        guard wallCount > 0 else { return nil }
+        if maxWallHeightM < Self.kMinWallHeightM {
+            return String(format: "牆只掃到 %.1fm 高 —— 請把鏡頭往上帶到牆與天花板的交界",
+                          maxWallHeightM)
+        }
+        return nil
+    }
+
+    /// 牆高低於此值就提示往上掃（公尺）。
+    /// 一般住宅樓高 2.4~2.8m；掃到 1.8m 以上代表使用者確實有往上帶，
+    /// 剩下的由 RoomPlan 自己外推。設太高會在正常掃描時一直跳提示。
+    static let kMinWallHeightM: Float = 1.8
+
     private var session: RoomCaptureSession?
     private var segments: [CapturedRoomData] = []
     private var capturing = false
@@ -58,6 +85,8 @@ final class FloorPlanCapture: NSObject, ObservableObject {
         segments.removeAll()
         segmentCount = 0
         instruction = nil
+        wallCount = 0
+        maxWallHeightM = 0
         invalidateBuilt()
     }
 
@@ -183,6 +212,13 @@ extension FloorPlanCapture: @preconcurrency RoomCaptureSessionDelegate {
     func captureSession(_ session: RoomCaptureSession,
                         didProvide instruction: RoomCaptureSession.Instruction) {
         self.instruction = Self.text(for: instruction)
+    }
+
+    /// 即時房間幾何。用來在**掃描當下**就知道牆掃得夠不夠高 ——
+    /// dimensions 是 (width, height, depth)，所以牆高取 .y。
+    func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
+        wallCount = room.walls.count
+        maxWallHeightM = room.walls.reduce(Float(0)) { max($0, $1.dimensions.y) }
     }
 
     private static func text(for i: RoomCaptureSession.Instruction) -> String? {
