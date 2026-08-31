@@ -89,15 +89,14 @@ nonisolated enum PointCloudFloorPlan {
         let bandLo = floorY + kFloorCeilMarginM
         let bandHi = ceilY - kFloorCeilMarginM
         let bandH = bandHi - bandLo
-        // 門檻以**帶狀高度**為基準（不是整個樓高）—— 帶狀才是實際能觀測到跨度的範圍。
-        // 同時吃絕對值與比例：挑高空間用 1.0m 太鬆，矮空間用比例又太嚴，取較嚴者。
-        let needSpan = min(bandH * 0.9, max(kWallMinVerticalM, bandH * 0.5))
-
-        let pass1 = wallCells(points, bandLo: bandLo, bandHi: bandHi, needSpan: needSpan)
-        guard pass1.cells.count >= 20 else { return nil }
+        let pass1 = wallCells(points, bandLo: bandLo, bandHi: bandHi)
+        // 門檻由實際觀測到的跨度分佈決定，不是從樓高推（見 spanThreshold）
+        let needSpan = spanThreshold(pass1.cells, bandH: bandH)
+        let cells1 = pass1.cells.filter { $0.span >= needSpan }
+        guard cells1.count >= 20 else { return nil }
 
         // ── 3. Manhattan 主方向 ──
-        let theta = dominantAngle(pass1.cells)
+        let theta = dominantAngle(cells1)
 
         // ── 4. **把點雲轉正之後重新建格**，再抽線段 ──
         //
@@ -112,10 +111,11 @@ nonisolated enum PointCloudFloorPlan {
         let rotated = points.map {
             SIMD3<Float>($0.x * ct - $0.z * st, $0.y, $0.x * st + $0.z * ct)
         }
-        let pass2 = wallCells(rotated, bandLo: bandLo, bandHi: bandHi, needSpan: needSpan)
-        guard pass2.cells.count >= 20 else { return nil }
+        let pass2 = wallCells(rotated, bandLo: bandLo, bandHi: bandHi)
+        let cells2 = pass2.cells.filter { $0.span >= needSpan }
+        guard cells2.count >= 20 else { return nil }
 
-        let segs = segments(from: pass2.cells)
+        let segs = segments(from: cells2)
         let grid = pass2.occupied
         let floorCells = pass1.floorCells
         // 線段是在轉正的座標系抽出來的，要轉回世界座標
@@ -155,7 +155,7 @@ nonisolated enum PointCloudFloorPlan {
 
         // 跨度分佈：卡在「牆太少」時，這一行直接分辨得出是門檻太嚴還是根本沒掃到牆。
         // 沒有它只能猜，而猜錯就是白改一輪。
-        var sp = pass2.spans
+        var sp = pass2.cells.map(\.span)
         sp.sort()
         func pct(_ q: Double) -> Float {
             sp.isEmpty ? 0 : sp[min(sp.count - 1, Int(Double(sp.count - 1) * q))]
@@ -165,7 +165,7 @@ nonisolated enum PointCloudFloorPlan {
                     + "樓高 %.2fm、主方向 %.1f°、地板 %.1f m²\n"
                     + "  格跨度分佈 p50 %.2f / p75 %.2f / p90 %.2f / p99 %.2fm"
                     + "（門檻 %.2fm；牆掃到的高度中位數 %.2fm）",
-            points.count, grid, pass2.cells.count, needSpan, walls.count,
+            points.count, grid, cells2.count, needSpan, walls.count,
             roomHeight, theta * 180 / .pi, plan.floorAreaM2,
             pct(0.5), pct(0.75), pct(0.9), pct(0.99), needSpan, plan.medianWallHeightM)
         return Result(plan: plan, summary: summary)
@@ -179,8 +179,8 @@ nonisolated enum PointCloudFloorPlan {
     struct WallCell { var at: SIMD2<Float>; var span: Float }
 
     private static func wallCells(_ points: [SIMD3<Float>],
-                                  bandLo: Float, bandHi: Float, needSpan: Float)
-        -> (cells: [WallCell], occupied: Int, floorCells: Int, spans: [Float]) {
+                                  bandLo: Float, bandHi: Float)
+        -> (cells: [WallCell], occupied: Int, floorCells: Int) {
         struct Column { var minY: Float; var maxY: Float; var count: Int }
         var grid: [Int64: Column] = [:]
         var floor = Set<Int64>()
@@ -198,13 +198,32 @@ nonisolated enum PointCloudFloorPlan {
             }
         }
         var out: [WallCell] = []
-        var spans: [Float] = []
         for (k, c) in grid where c.count >= kMinPointsPerCell {
-            let span = c.maxY - c.minY
-            spans.append(span)
-            if span >= needSpan { out.append(WallCell(at: cellCenter(k), span: span)) }
+            out.append(WallCell(at: cellCenter(k), span: c.maxY - c.minY))
         }
-        return (out, grid.count, floor.count, spans)
+        return (out, grid.count, floor.count)
+    }
+
+    /// 由**實際觀測到的跨度分佈**決定「多高才算牆」。
+    ///
+    /// 不能只從樓高推。實機那次：樓高 2.87m 推出門檻 1.28m，
+    /// 但整份點雲的跨度 p90 才 1.16m、p99 也只有 1.88m ——
+    /// 門檻直接訂在分佈的尾巴之外，4160 格只剩 235 格過關。
+    ///
+    /// 為什麼掃到的跨度上不去：**受限於掃描距離**。垂直視角約 60°，
+    /// 單幀能看到牆面的垂直範圍 = 2·d·tan(30°) —— 距離 1m 只有 1.15m，
+    /// 要 2.3m 得站到 2m 外。貼著牆掃的人永遠達不到由樓高推出來的門檻。
+    ///
+    /// 取分佈的 p90：不管掃描距離多近，永遠留下最「立」的那 10% 的格子。
+    /// 再夾在 [kWallMinVerticalM, 帶高一半] 之間 ——
+    /// 下限擋住「整個場景根本沒有垂直結構」時把櫃檯桌面當牆，
+    /// 上限避免掃得很完整時門檻反而被拉高、把矮一點的真牆濾掉。
+    static func spanThreshold(_ cells: [WallCell], bandH: Float) -> Float {
+        guard !cells.isEmpty else { return kWallMinVerticalM }
+        var sp = cells.map(\.span)
+        sp.sort()
+        let p90 = sp[min(sp.count - 1, Int(Double(sp.count - 1) * 0.9))]
+        return min(max(p90, kWallMinVerticalM), max(kWallMinVerticalM, bandH * 0.5))
     }
 
     // MARK: - 主方向

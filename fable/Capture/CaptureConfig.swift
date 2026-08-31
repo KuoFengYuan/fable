@@ -194,14 +194,21 @@ nonisolated struct CaptureConfig: Sendable {
     var previewTileSizeM: Float = 1.2
     /// 點雲融合的模糊閘門（比抓幀遮斷更嚴）：模糊幀的姿態-深度錯位是殘影另一來源。
     /// 與 maxBlurPixels/blockBlurPixels 同步隨捲簾項重新校準（18 ≈ 0.68 rad/s）
-    var previewMaxBlurPixels: Float = 18
-    /// 融合的「相機穩定度」閘門：只在相機夠穩時才把深度融進點雲。
-    /// 模糊值受曝光時間影響（亮處曝光短→快速移動仍判定為低模糊），無法反映「姿態延遲/誤差」；
-    /// 移動過快時姿態不準 → 同一表面被投影到不同世界座標 → 殘影＋點不貼合。故另設速度硬閘門。
-    /// 角速度上限（rad/s）：~0.6 允許正常掃描平移、擋掉甩動。
-    var previewMaxAngularSpeedRadS: Float = 0.6
-    /// 線速度上限（m/s）：~0.5 允許走動掃描、擋掉「來回快步」造成的殘影。想更乾淨可調小（但覆蓋變慢）。
-    var previewMaxLinearSpeedMS: Float = 0.5
+    /// 預覽的三個閘門**直接沿用關鍵幀的門檻**，不再各自設一套。
+    ///
+    /// 先前預覽比關鍵幀嚴（模糊 18 vs 24px、角速度 0.6 vs 1.0、線速度 0.5 vs 0.8），
+    /// 理由是「移動快 → 姿態延遲 → 殘影」。但後果是一個幀好到足以被存成關鍵幀、
+    /// 進到匯出的點雲，卻不夠格顯示在預覽上 ——
+    /// 使用者看到「我明明掃過這裡但沒有點」，而掃完之後那裡是有點的。
+    ///
+    /// 預覽的**唯一用途就是回報覆蓋率**。顯示得比實際收到的少是直接的誤導：
+    /// 熱圖會把其實已經夠的區域標成缺點，害使用者回去重掃不需要重掃的地方。
+    /// 殘影本來就另有機制在防（點雲磚掛 ARAnchor，漂移修正時整磚跟著移動）。
+    ///
+    /// 寫成衍生值而不是複製常數 —— 兩份各自維護的門檻遲早會再漂開。
+    var previewMaxBlurPixels: Float { blockBlurPixels }
+    var previewMaxAngularSpeedRadS: Float { keyframeMaxAngularSpeedRadS }
+    var previewMaxLinearSpeedMS: Float { keyframeMaxLinearSpeedMS }
 
     // MARK: - 手機端 3DGS 訓練（msplat，on-device）
     /// 訓練迭代數（手機縮規模；桌機版通常 30000）。3–7k 在物件尺度已可觀。

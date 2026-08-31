@@ -44,9 +44,9 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var statusText: String?
     @Published var domePlaced = false
     @Published var trackingReady = false
-    /// 即時點雲疊加。**預設關閉** —— 掃描當下最該看的是「哪裡還沒掃到」，
-    /// 而滿畫面的點會把真實場景與 RoomPlan 的結構線都蓋掉。要看隨時可以開。
-    @Published var showPointCloud = false
+    /// 即時點雲疊加。**預設顯示** —— RoomPlan 的即時線框已經關掉了，
+    /// 少了它，點雲就是掃描當下唯一能回答「這裡掃到了沒」的東西。
+    @Published var showPointCloud = true
     /// RoomPlan 即時結構疊加（牆／門／窗的發光邊框）。預設開啟：
     /// 它直接回答「掃到哪了」，而且面積小、不擋畫面。
     @Published var showRoomPlan = true
@@ -1180,7 +1180,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         // 點雲連續融合（~10Hz，與快門解耦）：只收「姿態可靠 + 清晰 + 相機夠穩」的幀。
         // 追蹤丟失/模糊（captureBlocked, blurPixels）+ 相機速度閘門（angular/linear）三管齊下：
         // 移動過快時姿態延遲/誤差大 → 深度投影到錯位的世界座標 → 點不貼合表面且出殘影，故直接跳過。
-        if frameCounter % config.previewFrameInterval == 0,
+        // 取樣用「距上次融合隔了幾幀」而不是 frameCounter % N：
+        // 取模的話，被抽中的那一幀只要剛好稍微糊一點或轉快一點，
+        // **整個 0.1 秒的窗就整個丟掉**，要再等下一個倍數。
+        // 改成隔夠久就試，沒過就下一幀再試 —— 一有合格的幀立刻補上。
+        if frameCounter - lastPreviewFrame >= config.previewFrameInterval,
            !a.captureBlocked, a.blurPixels <= config.previewMaxBlurPixels,
            a.angularSpeedRadS <= config.previewMaxAngularSpeedRadS,
            a.linearSpeedMS <= config.previewMaxLinearSpeedMS {
@@ -1220,11 +1224,12 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         guard shutter.shouldCapture(pose: frame.camera.transform,
                                     time: frame.timestamp,
                                     config: config) else { return }
-        // 關鍵幀一律也進預覽融合。預覽的閘門比關鍵幀嚴很多
-        // （10Hz 取樣 + 角速度 0.6 vs 1.0、線速度 0.5 vs 0.8、模糊 12 vs 16），
-        // 所以會出現「掃了、關鍵幀也存了，但預覽沒點」——停止後重融合才冒出來。
-        // 這會讓融合熱圖說謊：把其實會有點的區域標成缺點，害使用者去重掃已經夠的地方。
-        // 讓預覽的覆蓋 ⊇ 重融合會用到的，熱圖才有參考價值。
+        // 關鍵幀一律也進預覽融合 —— 保證「預覽的覆蓋 ⊇ 重融合會用到的」。
+        //
+        // 門檻本身已經對齊了（見 CaptureConfig.previewMax*，現在是關鍵幀門檻的衍生值），
+        // 但取樣仍是 10Hz，兩個關鍵幀之間可能都沒輪到融合。
+        // 這一行補上那個縫：只要成為關鍵幀就一定也融進預覽，
+        // 否則熱圖會把其實會有點的區域標成缺點，害使用者回去重掃不需要重掃的地方。
         if frameCounter != lastPreviewFrame {
             lastPreviewFrame = frameCounter
             integratePreview(frame, blurPixels: a.blurPixels)
