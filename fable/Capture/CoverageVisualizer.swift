@@ -105,6 +105,8 @@ final class CoverageVisualizer {
     private let root = SCNNode()
     private let pathNode = SCNNode()
     private let pointsRoot = SCNNode()             // 即時點雲（空間磚節點掛載處）
+    private let roomRoot = SCNNode()               // RoomPlan 即時面（發光邊框）
+    private var roomNodes: [SCNNode] = []          // 每個面一個節點，底下四條邊
     private var tileNodes: [Int64: SCNNode] = [:]  // tileKey → 節點（幾何為錨點局部座標）
     private var pathPoints: [SCNVector3] = []
 
@@ -126,6 +128,7 @@ final class CoverageVisualizer {
         self.config = config
         root.addChildNode(pathNode)
         root.addChildNode(pointsRoot)
+        root.addChildNode(roomRoot)
     }
 
     func attach(to scene: SCNScene) {
@@ -135,9 +138,12 @@ final class CoverageVisualizer {
     func reset() {
         pathPoints.removeAll()
         pathNode.geometry = nil
-        for child in root.childNodes where child !== pathNode && child !== pointsRoot {
+        for child in root.childNodes
+        where child !== pathNode && child !== pointsRoot && child !== roomRoot {
             child.removeFromParentNode()
         }
+        for n in roomNodes { n.removeFromParentNode() }
+        roomNodes.removeAll()
         for tile in pointsRoot.childNodes {
             tile.removeFromParentNode()
         }
@@ -156,6 +162,153 @@ final class CoverageVisualizer {
 
     func setPointCloudHidden(_ hidden: Bool) {
         pointsRoot.isHidden = hidden
+    }
+
+    // MARK: - RoomPlan 即時疊加（掃到哪就看到哪）
+
+    func setRoomHidden(_ hidden: Bool) {
+        roomRoot.isHidden = hidden
+    }
+
+    /// 發光核心的半徑（公尺）。2.4cm 直徑在 1~4m 的觀看距離下與 RoomPlan 原生接近
+    private static let kEdgeRadius: CGFloat = 0.012
+    /// 外暈半徑。約核心的 3 倍 —— 這一層才是「發光」的來源：
+    /// 加法混色下，外圈的低 alpha 會在核心周圍疊出柔和的光暈。
+    private static let kGlowRadius: CGFloat = 0.036
+
+    /// 用 RoomPlan 當下偵測到的面疊出**發光白色邊框**。
+    ///
+    /// 為什麼是邊框不是填色面板：填色會把整面牆蓋掉，使用者反而看不到真實畫面
+    /// 與點雲；而 RoomPlan 要傳達的資訊是「這個面已經被認出來了、範圍到哪」，
+    /// 邊框剛好只講這件事。這也是 Apple 自己的 RoomCaptureView 的做法。
+    ///
+    /// **重用節點而不是每次重建。** didUpdate 觸發得比畫面更新還密，
+    /// 每次重建整組節點會讓 SceneKit 不斷重新上傳幾何 —— 掃描中最不能做的就是
+    /// 在主執行緒上製造這種尖峰（會餓死 ARKit 的 VIO）。
+    /// 面數變動時只增減差額，其餘就地改尺寸與變換。
+    func updateRoomSurfaces(_ surfaces: [RoomSurface]) {
+        while roomNodes.count > surfaces.count {
+            roomNodes.removeLast().removeFromParentNode()
+        }
+        while roomNodes.count < surfaces.count {
+            roomNodes.append(Self.makeFrameNode(parent: roomRoot))
+        }
+        for (i, s) in surfaces.enumerated() {
+            Self.layoutEdges(roomNodes[i], size: s.size, box: s.isBox,
+                             color: Self.roomColor(s.kind))
+            roomNodes[i].simdTransform = s.transform
+        }
+    }
+
+    /// 一個面的邊框 = 四條**圓管**（上下左右），每條再套一層外暈。
+    ///
+    /// **為什麼是圓管不是平面細條。** 邊框躺在牆面的平面上，而掃描時使用者
+    /// 大多是沿著牆走、以掠射角看它 —— 平面細條在那個角度會縮成一條看不見的線，
+    /// 於是「掃到哪了」這件事在最需要的時候剛好消失。
+    /// 圓管的截面從任何方向看都一樣，這也是 RoomPlan 原生視覺的做法。
+    /// 一律配 12 條邊（3D 盒的上限）。平面矩形只用前 4 條，其餘隱藏 ——
+    /// 這樣同一個節點可以在「牆」與「家具」之間重用，不必因為種類變了就重建。
+    private static let kMaxEdges = 12
+
+    private static func makeFrameNode(parent: SCNNode) -> SCNNode {
+        let node = SCNNode()
+        for _ in 0..<kMaxEdges {
+            let edge = SCNNode()
+            // 外暈掛成子節點：跟著同一個位置與旋轉，只是更粗更淡。
+            // 它不再自己縮放 —— 長度由父節點的 scale 帶著走。
+            edge.addChildNode(SCNNode())
+            node.addChildNode(edge)
+        }
+        node.renderingOrder = 10
+        parent.addChildNode(node)
+        return node
+    }
+
+    /// 共用的單位圓柱（高度 1），長度改由節點的 Y 縮放決定。
+    ///
+    /// **不要每條邊各自持有一份幾何。** 一個房間可能有 30 個元素 × 最多 12 條邊
+    /// × 2 層（核心＋外暈）＝ 720 份幾何與 draw call ——
+    /// 而這是疊在 ARKit 之上、每幀都要畫的東西，主執行緒與 GPU 都吃不消。
+    /// 依「顏色 × 層」快取之後只剩 8 份，SceneKit 就能把它們批次掉。
+    private static var tubeCache: [String: SCNCylinder] = [:]
+
+    private static func tube(color: UIColor, glow: Bool) -> SCNCylinder {
+        let key = "\(color.hashValue)-\(glow)"
+        if let c = tubeCache[key] { return c }
+        let c = SCNCylinder(radius: glow ? kGlowRadius : kEdgeRadius, height: 1)
+        // 圓周分段壓到 8：這是 2cm 粗的管子，再細分也看不出來
+        c.radialSegmentCount = 8
+        let m = SCNMaterial()
+        m.lightingModel = .constant     // 不吃場景光照：這是 HUD 疊加不是實體
+        m.writesToDepthBuffer = false   // 不遮住點雲與真實畫面的深度關係
+        m.blendMode = .add              // 加法混色 → 亮處發光，暗處不會變成灰塊
+        m.diffuse.contents = color
+        m.transparency = glow ? 0.22 : 1.0
+        c.materials = [m]
+        tubeCache[key] = c
+        return c
+    }
+
+    /// 一條邊：長度、中心位置、沿哪個軸
+    private enum EdgeAxis { case x, y, z }
+    private struct Edge { var length: Float; var at: SIMD3<Float>; var axis: EdgeAxis }
+
+    /// 平面矩形取 4 條邊（XY 平面上），3D 盒取 12 條。
+    private static func edges(size: SIMD3<Float>, box: Bool) -> [Edge] {
+        let hx = max(0.01, size.x) / 2, hy = max(0.01, size.y) / 2
+        let w = hx * 2, h = hy * 2
+        guard box else {
+            return [Edge(length: w, at: [0,  hy, 0], axis: .x),
+                    Edge(length: w, at: [0, -hy, 0], axis: .x),
+                    Edge(length: h, at: [-hx, 0, 0], axis: .y),
+                    Edge(length: h, at: [ hx, 0, 0], axis: .y)]
+        }
+        let hz = max(0.01, size.z) / 2
+        let d = hz * 2
+        var out: [Edge] = []
+        for sy in [hy, -hy] { for sz in [hz, -hz] {
+            out.append(Edge(length: w, at: [0, sy, sz], axis: .x))
+        } }
+        for sx in [hx, -hx] { for sz in [hz, -hz] {
+            out.append(Edge(length: h, at: [sx, 0, sz], axis: .y))
+        } }
+        for sx in [hx, -hx] { for sy in [hy, -hy] {
+            out.append(Edge(length: d, at: [sx, sy, 0], axis: .z))
+        } }
+        return out
+    }
+
+    /// SCNCylinder 的軸是 +Y：沿 X 的邊繞 Z 轉 90°，沿 Z 的邊繞 X 轉 90°，沿 Y 的不動。
+    private static func layoutEdges(_ node: SCNNode, size: SIMD3<Float>, box: Bool,
+                                    color: UIColor) {
+        let list = edges(size: size, box: box)
+        for (i, child) in node.childNodes.enumerated() {
+            guard i < list.count else { child.isHidden = true; continue }
+            child.isHidden = false
+            let e = list[i]
+            // 幾何是共用的單位圓柱，長度用 Y 縮放做出來（子節點的外暈跟著一起拉）
+            child.geometry = tube(color: color, glow: false)
+            child.childNodes.first?.geometry = tube(color: color, glow: true)
+            child.simdScale = SIMD3<Float>(1, max(0.01, e.length), 1)
+            child.simdPosition = e.at
+            switch e.axis {
+            case .x: child.simdEulerAngles = SIMD3<Float>(0, 0, .pi / 2)
+            case .y: child.simdEulerAngles = .zero
+            case .z: child.simdEulerAngles = SIMD3<Float>(.pi / 2, 0, 0)
+            }
+        }
+    }
+
+    /// 牆用白色 —— 那是 RoomPlan 原生的視覺語言，使用者一眼認得出「這是房間結構」。
+    /// 門窗開口給顏色，因為那正是最該檢查有沒有被誤判的地方。
+    /// 疊加混色下顏色會被相機畫面加亮，所以不必再調高 alpha。
+    private static func roomColor(_ kind: RoomSurface.Kind) -> UIColor {
+        switch kind {
+        case .wall, .object: UIColor.white
+        case .door:          UIColor.systemGreen
+        case .window:        UIColor.systemTeal
+        case .opening:       UIColor.systemOrange
+        }
     }
 
     /// 刷新一塊空間磚：geometry 的頂點是「錨點局部座標」，節點變換 = 該磚錨點當下變換。

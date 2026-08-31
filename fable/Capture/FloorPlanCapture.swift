@@ -23,6 +23,22 @@ import Combine
 import RoomPlan
 import simd
 
+/// RoomPlan 偵測到的一個元素，已剝離 RoomPlan 型別 —— 渲染層不必認識 CapturedRoom。
+/// transform 是它的局部座標系，size 為 (寬, 高, 深)。
+nonisolated struct RoomSurface: Sendable {
+    enum Kind: Sendable { case wall, door, window, opening, object }
+    var transform: simd_float4x4
+    var size: SIMD3<Float>
+    var kind: Kind
+
+    /// 家具畫成 3D 線框盒（12 條邊），牆／門／窗畫成平面矩形（4 條邊）。
+    ///
+    /// **家具的盒子才是那個視覺的主角。** RoomPlan 原生畫面裡最醒目的就是沙發、
+    /// 桌子、櫃子上那些發光立方體 —— 它們直接告訴使用者「這件東西已經被認出來了」。
+    /// 只畫牆的話畫面幾乎是空的，因為牆通常在視野邊緣。
+    var isBox: Bool { kind == .object }
+}
+
 @MainActor
 final class FloorPlanCapture: NSObject, ObservableObject {
 
@@ -39,6 +55,12 @@ final class FloorPlanCapture: NSObject, ObservableObject {
     /// RoomPlan 的 didUpdate 每幀都給出當下的房間幾何，資訊本來就在，只是沒被用。
     @Published private(set) var wallCount = 0
     @Published private(set) var maxWallHeightM: Float = 0
+
+    /// 即時房間面的回呼，交給渲染層疊在相機畫面上。
+    /// 用回呼而不是 @Published：這是每 0.4s 一組陣列，走 SwiftUI 的發佈管線
+    /// 等於每次都讓整個 HUD 重新求值，而它其實只有 SceneKit 需要。
+    var onRoomUpdated: (([RoomSurface]) -> Void)?
+    private var lastSurfacePush: CFTimeInterval = 0
 
     /// 給 HUD 的單一提示字串。優先序：RoomPlan 自己的引導 > 我們的牆高檢查。
     /// RoomPlan 的引導比較急迫（它知道自己正在丟失追蹤），牆高則是慢性問題。
@@ -61,7 +83,9 @@ final class FloorPlanCapture: NSObject, ObservableObject {
     private var session: RoomCaptureSession?
     private var segments: [CapturedRoomData] = []
     private var capturing = false
-    private var endContinuation: CheckedContinuation<Void, Never>?
+    /// 多個並行等待者（見 waitForSegment）。用 id 索引，讓各自的逾時只喚醒自己
+    private var waiters: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var nextWaiterID = 0
 
     static var isSupported: Bool { RoomCaptureSession.isSupported }
 
@@ -100,29 +124,37 @@ final class FloorPlanCapture: NSObject, ObservableObject {
 
     /// 等 didEndWith 把 CapturedRoomData 交回來。帶逾時，避免 delegate 不觸發時卡住整個流程
     /// （寧可少一張平面圖，不能讓掃描結果匯不出去）。
+    ///
+    /// **同時可以有多個等待者**：停止流程要等它才敢 pause（session 一停 RoomPlan
+    /// 就收不完），背景建模也要等它。先前只存一個 continuation，
+    /// 第二個呼叫會直接覆蓋掉第一個 —— 那個 task 就永遠不會恢復。
+    /// 這種洩漏的症狀正是「平面圖有時候出不來」，而且不會有任何錯誤訊息。
     func waitForSegment(timeout: TimeInterval = 8) async {
         guard capturing else { return }      // idempotent：已收完就直接返回
+        let id = nextWaiterID
+        nextWaiterID += 1
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            endContinuation = c
+            waiters[id] = c
             Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(timeout))
-                if self?.endContinuation != nil {
-                    // 這不是失敗：build() 會再等一次（見 build()），
-                    // 資料晚到仍然算得出平面圖。這裡放行只是為了不擋住 session.pause()。
-                    print("[FloorPlan] RoomPlan 最終資料尚未送達（等了 \(Int(timeout))s），"
-                          + "先繼續後續處理 —— 建模時會再等")
-                }
-                self?.releaseWait()
+                guard let self, let w = self.waiters.removeValue(forKey: id) else { return }
+                // 逾時**不**把 capturing 設 false —— 資料可能還在路上，
+                // 後面的等待者（build()）應該真的再等一次，而不是立刻返回。
+                // 先前逾時也會清掉 capturing，於是 build() 的「再等一次」其實是空的。
+                print("[FloorPlan] RoomPlan 最終資料尚未送達（等了 \(Int(timeout))s），"
+                      + "先繼續後續處理 —— 建模時會再等")
+                w.resume()
             }
         }
-        capturing = false
-        session = nil
     }
 
+    /// 資料到手：喚醒**所有**等待者，並結束擷取狀態
     private func releaseWait() {
-        guard let c = endContinuation else { return }   // 已被另一方取走 → 不重複 resume
-        endContinuation = nil
-        c.resume()
+        capturing = false
+        session = nil
+        let all = waiters
+        waiters.removeAll()
+        for c in all.values { c.resume() }
     }
 
     // MARK: - 建模
@@ -214,11 +246,38 @@ extension FloorPlanCapture: @preconcurrency RoomCaptureSessionDelegate {
         self.instruction = Self.text(for: instruction)
     }
 
-    /// 即時房間幾何。用來在**掃描當下**就知道牆掃得夠不夠高 ——
-    /// dimensions 是 (width, height, depth)，所以牆高取 .y。
+    /// 即時房間幾何。兩個用途：
+    ///   · 在**掃描當下**就知道牆掃得夠不夠高（dimensions 是 (width, height, depth)，牆高取 .y）
+    ///   · 把面交給渲染層疊在相機畫面上，讓使用者看得到「已經掃到哪」
     func captureSession(_ session: RoomCaptureSession, didUpdate room: CapturedRoom) {
         wallCount = room.walls.count
         maxWallHeightM = room.walls.reduce(Float(0)) { max($0, $1.dimensions.y) }
+
+        // 節流：didUpdate 觸發得比畫面更新還密，每次都重建幾何會讓 SceneKit 一直重上傳。
+        // 0.4s 對「看得到掃描進度」已經很即時，而 RoomPlan 的牆本來也不會抖動。
+        let now = CACurrentMediaTime()
+        guard now - lastSurfacePush > 0.4 else { return }
+        lastSurfacePush = now
+
+        var out: [RoomSurface] = []
+        out.reserveCapacity(room.walls.count + room.doors.count + room.windows.count
+                            + room.openings.count + room.objects.count)
+        func add(_ list: [CapturedRoom.Surface], _ kind: RoomSurface.Kind) {
+            for s in list {
+                out.append(RoomSurface(transform: s.transform, size: s.dimensions, kind: kind))
+            }
+        }
+        add(room.walls, .wall)
+        add(room.doors, .door)
+        add(room.windows, .window)
+        add(room.openings, .opening)
+        // 家具：AR 疊加**不過濾**活動家具。
+        // 平面圖那邊會濾掉椅子沙發（見 FloorPlanData+RoomPlan 的 kFixtureCategories），
+        // 但那是製圖的取捨；在掃描當下，「沙發已經被認出來了」正是使用者要的回饋。
+        for o in room.objects {
+            out.append(RoomSurface(transform: o.transform, size: o.dimensions, kind: .object))
+        }
+        onRoomUpdated?(out)
     }
 
     private static func text(for i: RoomCaptureSession.Instruction) -> String? {

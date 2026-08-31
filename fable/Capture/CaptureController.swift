@@ -44,7 +44,12 @@ final class CaptureController: NSObject, ObservableObject {
     @Published var statusText: String?
     @Published var domePlaced = false
     @Published var trackingReady = false
-    @Published var showPointCloud = true
+    /// 即時點雲疊加。**預設關閉** —— 掃描當下最該看的是「哪裡還沒掃到」，
+    /// 而滿畫面的點會把真實場景與 RoomPlan 的結構線都蓋掉。要看隨時可以開。
+    @Published var showPointCloud = false
+    /// RoomPlan 即時結構疊加（牆／門／窗的發光邊框）。預設開啟：
+    /// 它直接回答「掃到哪了」，而且面積小、不擋畫面。
+    @Published var showRoomPlan = true
     /// 預覽點雲上色模式。掃描當下使用者最需要知道的不是顏色對不對，
     /// 而是「這塊融合夠了沒、要不要再繞一次」——熱圖直接把觀測不足的表面標紅。
     @Published var colorMode: PointColorMode = .rgb
@@ -169,6 +174,13 @@ final class CaptureController: NSObject, ObservableObject {
         viz.attach(to: arView.scene)
         viz.onCoverageChanged = { [weak self] c in self?.coverage = c }
         viz.onGuidanceChanged = { [weak self] hint in self?.coverageHint = hint }
+        // 初始狀態必須在這裡套用一次 —— 先前只有 toggle 時才呼叫 setPointCloudHidden，
+        // 所以預設值改成 false 之後，第一次進畫面仍然會看到點雲。
+        viz.setPointCloudHidden(!showPointCloud)
+        viz.setRoomHidden(!showRoomPlan)
+        // RoomPlan 的即時面直接進渲染層，不繞 SwiftUI（每 0.4s 一組陣列，
+        // 走 @Published 等於每次都讓整個 HUD 重新求值）
+        floorPlan.onRoomUpdated = { [weak viz] surfaces in viz?.updateRoomSurfaces(surfaces) }
         visualizer = viz
 
         runSession()
@@ -322,26 +334,37 @@ final class CaptureController: NSObject, ObservableObject {
         floorPlan.stopCapture()                     // 只是 stop()，最終資料由 delegate 稍後送達
         let tStop = Date()
         Task {
-            // pause 必須等 RoomPlan 交回 CapturedRoomData 之後 —— session 一 pause
-            // 它就收不完那一段了。waitForSegment 自帶逾時，不會卡住匯出流程。
-            // 不在這裡等 RoomPlan（它要 8 秒以上）—— 那 8 秒使用者是乾等的。
-            // build() 自己會等（逾時 20s），而它現在跑在背景、不擋 review。
-            // 唯一的取捨是 ARSession 會早一點 pause；實測 RoomPlan 的最終優化
-            // 不需要新的幀，資料照樣送達。
-            //
             // 世界地圖：只有「取圖」需要活著的 session，序列化不需要。
-            // 所以取完就 pause，序列化丟到背景並與 processScan 並行 ——
+            // 所以取完就把序列化丟到背景並與 processScan 並行 ——
             // 先前是 await 整個存檔完成才開始後處理，那一整段是使用者的乾等，
             // 而且序列化跑在 main actor 上，連進度條都動不了。
             let box = await captureWorldMap()
-            arView?.session.pause()                 // review 期間停止追蹤，省電省熱
-            monitor.stop()
             let mapTask = Task { @MainActor [weak self] in
                 if let box { await self?.persistWorldMap(box) }
             }
+
+            // **pause 必須等 RoomPlan 交回 CapturedRoomData** —— session 一停它就收不完。
+            //
+            // 這裡踩過一次坑：先前是「取完地圖立刻 pause」，而註解寫「實測資料照樣送達」。
+            // 那個實測成立是因為當時 pause 之前還夾著 saveWorldMap（序列化 10~40MB
+            // ＋ 兩次寫檔，1~3 秒），剛好給了 RoomPlan 送資料的時間。
+            // 把序列化搬到背景之後那段緩衝消失，平面圖就出不來了 ——
+            // 一個「加速」改動意外拿掉了另一件事賴以成立的前提。
+            //
+            // 正解是不要靠巧合：pause **不在使用者的等待路徑上**（使用者等的是
+            // processScan），所以讓它明確地等 RoomPlan，與後處理並行。
+            // 代價只是 ARSession 多活幾秒，而幀處理本來就被 phase != .scanning 擋掉了。
+            let roomTask = Task { @MainActor [weak self] in
+                await self?.floorPlan.waitForSegment(timeout: 12)
+                self?.arView?.session.pause()       // review 期間停止追蹤，省電省熱
+                self?.monitor.stop()
+            }
+
             await processScan(refinedTransforms: refined, meshVertices: meshVerts, since: tStop)
-            // 地圖通常早就寫完了；這裡只是確保摘要拿得到大小（它比 review 晚到就補上去）
+            // 兩者通常早就完成了；等一下只是確保摘要拿得到地圖大小、
+            // 以及 session 一定有被 pause 掉（不然 review 期間會一直吃電）
             await mapTask.value
+            await roomTask.value
             if scanSummary != nil { scanSummary?.worldMapMB = lastWorldMapMB }
         }
     }
@@ -731,6 +754,11 @@ final class CaptureController: NSObject, ObservableObject {
     func togglePointCloud() {
         showPointCloud.toggle()
         visualizer?.setPointCloudHidden(!showPointCloud)
+    }
+
+    func toggleRoomPlan() {
+        showRoomPlan.toggle()
+        visualizer?.setRoomHidden(!showRoomPlan)
     }
 
     /// 切換「真實顏色 / 融合品質熱圖」。切換後必須把所有磚標記重畫，

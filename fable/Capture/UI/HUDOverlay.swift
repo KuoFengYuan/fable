@@ -170,6 +170,20 @@ struct HUDOverlay: View {
                 .opacity(controller.phase == .scanning ? 0 : 1)
 
                 if controller.phase == .scanning {
+                    // RoomPlan 即時結構：掃到的牆／門／窗以發光邊框疊在實景上。
+                    // 排在點雲前面 —— 它是預設開著的那一個。
+                    Button {
+                        controller.toggleRoomPlan()
+                    } label: {
+                        Image(systemName: controller.showRoomPlan
+                              ? "square.split.bottomrightquarter.fill"
+                              : "square.split.bottomrightquarter")
+                            .font(.headline)
+                            .padding(10)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .foregroundStyle(controller.showRoomPlan ? .white : .secondary)
+
                     Button {
                         controller.togglePointCloud()
                     } label: {
