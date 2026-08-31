@@ -29,9 +29,9 @@ struct CameraControlBar: View {
             controls.railExpanded = true
         } label: {
             Text(controls.hasManualOverride ? "M" : "A")
-                .font(.system(size: 17, weight: .bold, design: .rounded))
+                .font(.system(size: 17, weight: .medium, design: .rounded))
                 .frame(width: 44, height: 44)
-                .background(.ultraThinMaterial, in: Circle())
+                .hudGlass(Circle())
         }
         .foregroundStyle(controls.hasManualOverride ? .yellow : .white)
     }
@@ -46,7 +46,7 @@ struct CameraControlBar: View {
                 controls.railExpanded = false
             } label: {
                 Text(controls.hasManualOverride ? "M" : "A")
-                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                    .font(.system(size: 16, weight: .medium, design: .rounded))
                     .frame(width: 40, height: 40)
             }
             .foregroundStyle(controls.hasManualOverride ? .yellow : .white)
@@ -58,7 +58,7 @@ struct CameraControlBar: View {
                     controls.expanded = (controls.expanded == item) ? nil : item
                 } label: {
                     Image(systemName: item.symbol)
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(.system(size: 16, weight: .regular))
                         .frame(width: 40, height: 40)
                 }
                 .foregroundStyle(tint(for: item))
@@ -69,13 +69,13 @@ struct CameraControlBar: View {
                 controls.expanded = nil
             } label: {
                 Image(systemName: "arrow.uturn.backward")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 15, weight: .regular))
                     .frame(width: 40, height: 36)
             }
             .foregroundStyle(controls.hasManualOverride ? .white : .white.opacity(0.45))
         }
         .padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22))
+        .hudGlass(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     /// 黃色 = 該項已被手動指定（一眼看出哪些脫離自動）
@@ -98,7 +98,7 @@ struct CameraControlBar: View {
     private func slider(for item: CameraControls.Item) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(item.label).font(.caption.weight(.semibold))
+                Text(item.label).font(.caption.weight(.medium))
                 Spacer()
                 Text(valueText(item)).font(.caption.monospacedDigit())
             }
@@ -145,10 +145,10 @@ struct CameraControlBar: View {
             }
         }
         .tint(.cyan)
-        .foregroundStyle(.white)
+        .hudText()
         .frame(width: 190)
         .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .hudGlass(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     private func valueText(_ item: CameraControls.Item) -> String {

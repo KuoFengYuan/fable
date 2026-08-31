@@ -33,8 +33,8 @@ struct HUDOverlay: View {
         }
         .animation(.easeInOut(duration: 0.25), value: controller.assessment.worst)
         .animation(.easeInOut(duration: 0.25), value: controller.phase)
-        .animation(.easeInOut(duration: 0.25), value: controller.coverageHint)
         .animation(.easeInOut(duration: 0.25), value: controller.loopHint)
+        .animation(.easeInOut(duration: 0.25), value: controller.floorPlanHint)
         .animation(.easeInOut(duration: 0.25), value: controller.recentRejectCount >= 4)
         .animation(.easeInOut(duration: 0.25), value: controller.relocalizing)
     }
@@ -63,42 +63,48 @@ struct HUDOverlay: View {
     ///   3. 迴環提示   影響全域精度，且錯過就補不回來
     ///   4. 缺角提醒   局部覆蓋，之後還能補
     ///   5. 提醒級警告 照拍，只是品質差一點
+    /// tint 取代原本的 background/foreground：膠囊統一是深色玻璃，
+    /// 嚴重度改由「圖示與文字的色調 ＋ 一層很淡的底色」表達 ——
+    /// 整片實色橫幅在相機畫面上太搶，官方那套是靠色調而不是靠面積。
     private struct Guidance {
         let text: String
         let symbol: String
-        let background: Color
-        let foreground: Color
+        let tint: Color
     }
 
     private var guidance: Guidance? {
         if controller.relocalizing {
             return Guidance(text: "重新定位中：請把鏡頭對準上次掃描過的區域",
                             symbol: "point.3.connected.trianglepath.dotted",
-                            background: .blue.opacity(0.9), foreground: .white)
+                            tint: .blue)
         }
         guard controller.phase == .scanning else { return nil }
         let a = controller.assessment
         if a.captureBlocked, let w = a.worst {
             return Guidance(text: w.message, symbol: w.symbol,
-                            background: .red.opacity(0.88), foreground: .white)
+                            tint: .red)
         }
         // 正在掉幀：這是實測結果不是推估，優先於所有「可能會怎樣」的提示
         if controller.recentRejectCount >= 4 {
             return Guidance(text: "畫面不夠清晰，已略過 \(controller.recentRejectCount) 次抓幀 —— 請放慢",
                             symbol: "camera.metering.none",
-                            background: .red.opacity(0.85), foreground: .white)
+                            tint: .red)
+        }
+        // RoomPlan 的引導排在閉環之前：它講的是「現在這一刻正在丟失資料」
+        // （靠太近、光線不足、紋理不足），而閉環提示是走了 8m 之後的長期建議。
+        // 牆高不足也走這個插槽 —— 那是平面圖失敗最常見的成因，
+        // 而它只有在掃描當下講才有用。
+        if let hint = controller.floorPlanHint {
+            return Guidance(text: hint, symbol: "square.split.bottomrightquarter",
+                            tint: .yellow)
         }
         if let hint = controller.loopHint {
             return Guidance(text: hint, symbol: "arrow.triangle.capsulepath",
-                            background: .yellow.opacity(0.92), foreground: .black)
-        }
-        if let hint = controller.coverageHint {
-            return Guidance(text: hint, symbol: "scope",
-                            background: .orange.opacity(0.85), foreground: .white)
+                            tint: .yellow)
         }
         if let w = a.worst {
             return Guidance(text: w.message, symbol: w.symbol,
-                            background: .orange.opacity(0.88), foreground: .white)
+                            tint: .orange)
         }
         return nil
     }
@@ -106,13 +112,15 @@ struct HUDOverlay: View {
     @ViewBuilder
     private var guidanceBanner: some View {
         if let g = guidance {
-            Label(g.text, systemImage: g.symbol)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(g.foreground)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(g.background, in: Capsule())
-                .transition(.move(edge: .top).combined(with: .opacity))
+            HStack(spacing: 7) {
+                Image(systemName: g.symbol).font(.footnote).foregroundStyle(g.tint)
+                Text(g.text).font(.subheadline)
+            }
+            .hudText()
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 15).padding(.vertical, 9)
+            .hudGlass(Capsule(), tint: g.tint)
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 
@@ -125,7 +133,7 @@ struct HUDOverlay: View {
         if controller.phase == .scanning, controller.showPointCloud,
            controller.colorMode == .fusionQuality {
             HStack(spacing: 8) {
-                Text("視角").font(.caption2.weight(.semibold))
+                Text("視角").font(.caption2)
                 HStack(spacing: 3) {
                     ForEach(0..<7) { i in
                         let q = Double(i) / 6
@@ -138,9 +146,9 @@ struct HUDOverlay: View {
                 }
                 Text("單一角度 → 多角度").font(.caption2)
             }
-            .foregroundStyle(.white)
+            .hudText()
             .padding(.horizontal, 12).padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
+            .hudGlass(Capsule())
         }
     }
 
@@ -153,22 +161,39 @@ struct HUDOverlay: View {
                     dismiss()
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.headline)
+                        .font(.system(size: 17, weight: .regular))
                         .padding(10)
-                        .background(.ultraThinMaterial, in: Circle())
+                        .hudGlass(Circle())
                 }
                 .foregroundStyle(.white)
                 .opacity(controller.phase == .scanning ? 0 : 1)
 
                 if controller.phase == .scanning {
+                    // RoomPlan 即時結構：掃到的牆／門／窗以發光邊框疊在實景上。
+                    // **RoomPlan 關掉時要一起藏起來** —— 沒有資料來源，
+                    // 留著就是一顆按了沒反應的按鈕，比沒有更糟。
+                    if controller.config.captureFloorPlan, FloorPlanCapture.isSupported {
+                    Button {
+                        controller.toggleRoomPlan()
+                    } label: {
+                        Image(systemName: controller.showRoomPlan
+                              ? "square.split.bottomrightquarter.fill"
+                              : "square.split.bottomrightquarter")
+                            .font(.system(size: 17, weight: .regular))
+                            .padding(10)
+                            .hudGlass(Circle())
+                    }
+                    .foregroundStyle(controller.showRoomPlan ? .white : .secondary)
+                    }
+
                     Button {
                         controller.togglePointCloud()
                     } label: {
                         Image(systemName: controller.showPointCloud
                               ? "circle.grid.3x3.fill" : "circle.grid.3x3")
-                            .font(.headline)
+                            .font(.system(size: 17, weight: .regular))
                             .padding(10)
-                            .background(.ultraThinMaterial, in: Circle())
+                            .hudGlass(Circle())
                     }
                     .foregroundStyle(controller.showPointCloud ? .cyan : .white)
 
@@ -180,9 +205,9 @@ struct HUDOverlay: View {
                         } label: {
                             Image(systemName: controller.colorMode == .fusionQuality
                                   ? "thermometer.medium" : "paintpalette")
-                                .font(.headline)
+                                .font(.system(size: 17, weight: .regular))
                                 .padding(10)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .hudGlass(Circle())
                         }
                         .foregroundStyle(controller.colorMode == .fusionQuality ? .orange : .white)
                     }
@@ -195,10 +220,6 @@ struct HUDOverlay: View {
             VStack(alignment: .trailing, spacing: 3) {
                 Label("\(controller.keyframeCount) 幀", systemImage: "camera.viewfinder")
                 Label("\(controller.pointCount / 1000)k 點", systemImage: "circle.grid.3x3.fill")
-                if controller.mode == .object && controller.domePlaced {
-                    Label(String(format: "涵蓋 %.0f%%", controller.coverage * 100),
-                          systemImage: "globe.asia.australia.fill")
-                }
                 // 融合完成度：場景模式沒有涵蓋率圓頂，這是唯一的「掃夠了沒」訊號。
                 // 顏色即結論——紅/橘代表大部分表面觀測不足，別急著停。
                 if controller.phase == .scanning {
@@ -213,10 +234,10 @@ struct HUDOverlay: View {
                         .foregroundStyle(.yellow)
                 }
             }
-            .font(.caption.monospacedDigit())
-            .foregroundStyle(.white)
+            .font(.caption.monospacedDigit().weight(.regular))
+            .hudText()
             .padding(10)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .hudGlass(RoundedRectangle(cornerRadius: 14, style: .continuous))
             // 純資訊面板，不吃手勢 —— review 階段底下是可旋轉的點雲
             .allowsHitTesting(false)
             }
@@ -251,10 +272,10 @@ struct HUDOverlay: View {
                     .frame(width: 130)
                 Image(systemName: "hare.fill").font(.caption2)
             }
-            .foregroundStyle(.white)
+            .hudText()
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
-            .background(.ultraThinMaterial, in: Capsule())
+            .hudGlass(Capsule())
         }
     }
 
@@ -265,11 +286,11 @@ struct HUDOverlay: View {
         if let text = statusHint {
             Text(text)
                 .font(.footnote)
-                .foregroundStyle(.white)
+                .hudText()
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
-                .background(.ultraThinMaterial, in: Capsule())
+                .hudGlass(Capsule())
                 // 純提示，不該吃手勢。review 階段底下是可旋轉的 3D 點雲，
                 // 有背景的 View 會在自己的範圍內攔截觸控 —— 實機回報「不好轉動」就是這個。
                 .allowsHitTesting(false)
@@ -281,7 +302,6 @@ struct HUDOverlay: View {
         switch controller.phase {
         case .idle:
             if !controller.trackingReady { return "初始化中：請緩慢平移手機讓 ARKit 建立追蹤" }
-            if controller.mode == .object && !controller.domePlaced { return "點擊畫面中的物件，放置視角涵蓋圓頂" }
             return "按下快門開始掃描（每移動 10cm 或轉動 6° 自動抓幀）"
         case .scanning:
             return nil
@@ -316,7 +336,7 @@ struct HUDOverlay: View {
                     .tint(.blue)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 7)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .hudGlass(Capsule())
                     .foregroundStyle(.white)
                 }
 
@@ -331,16 +351,8 @@ struct HUDOverlay: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
                 .frame(width: 290)
-                .background(.ultraThinMaterial, in: Capsule())
+                .hudGlass(Capsule())
                 .foregroundStyle(.white)
-
-                Picker("模式", selection: $controller.mode) {
-                    ForEach(ScanMode.allCases) { m in
-                        Text(m.label).tag(m)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 180)
             }
 
             switch controller.phase {
@@ -395,14 +407,14 @@ struct HUDOverlay: View {
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        .hudGlass(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     } else {
                         // 收合態：只留「有 N 項要注意」＋最嚴重那項的顏色
                         Label("\(rows.count) 項掃描提醒", systemImage: "exclamationmark.circle")
                             .font(.caption.weight(.medium))
                             .foregroundStyle(rows.first?.tint ?? .secondary)
                             .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background(.ultraThinMaterial, in: Capsule())
+                            .hudGlass(Capsule())
                     }
                 }
             }
@@ -432,6 +444,24 @@ struct HUDOverlay: View {
             rows.append((String(format: "世界地圖已存 %.1f MB —— 下次可延續同一座標系", mb),
                          "point.3.filled.connected.trianglepath.dotted", .secondary))
         }
+        // BA 的判定。**用保留集，不用 BA 自己的殘差** —— 後者下降是必然的（那是它在
+        // 最小化的量），拿它報告「精度改善了幾 %」等於自我認證。
+        // 這一行的存在理由：BA 該不該開，唯一的證據來源是實機掃描；
+        // 要它每次掃完都被看到，就不能只印在 Xcode console 裡。
+        if let d = s.baHoldoutDelta {
+            let pct = String(format: "%+.0f%%", d * 100)
+            if s.baApplied {
+                rows.append(("BA 已套用位姿（保留集 \(pct)）", "checkmark.circle", .secondary))
+            } else if d < BundleAdjuster.kHoldoutGate {
+                // 閘門過了卻沒套用 ⇒ 硬總開關被關著。這是非預期狀態，要看得見
+                rows.append(("BA 保留集 \(pct) 通過，但總開關關著 ⇒ 位姿未修正",
+                             "exclamationmark.triangle", .orange))
+            } else {
+                // 這是正常結果，不是問題：房間尺度下位姿誤差本來就低於觀測雜訊
+                rows.append(("BA 未套用（保留集 \(pct)，此距離下位姿誤差低於觀測雜訊）",
+                             "pause.circle", .secondary))
+            }
+        }
         return rows.map { (text: $0.0, symbol: $0.1, tint: $0.2) }
     }
 
@@ -452,7 +482,7 @@ struct HUDOverlay: View {
                           systemImage: controller.showFloorPlan ? "cube" : "map")
                         .font(.caption.weight(.medium))
                         .padding(.horizontal, 14).padding(.vertical, 7)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .hudGlass(Capsule())
                         .foregroundStyle(.white)
                 }
             }
@@ -464,7 +494,7 @@ struct HUDOverlay: View {
             .tint(.green)
             .padding(.horizontal, 14).padding(.vertical, 6)
             .frame(width: 220)
-            .background(.ultraThinMaterial, in: Capsule())
+            .hudGlass(Capsule())
             .foregroundStyle(.white)
 
             // 主要行動：直接在手機上訓練成 3DGS
@@ -483,18 +513,18 @@ struct HUDOverlay: View {
                     controller.exportAndShare()
                 } label: {
                     Label("匯出", systemImage: "square.and.arrow.up")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .hudGlass(Capsule())
                         .foregroundStyle(.white)
                 }
                 Button {
                     controller.resumeScan()
                 } label: {
                     Label("續掃", systemImage: "plus.viewfinder")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 16).padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .hudGlass(Capsule())
                         .foregroundStyle(.white)
                 }
                 Button(role: .destructive) {
@@ -503,7 +533,7 @@ struct HUDOverlay: View {
                     Image(systemName: "trash")
                         .font(.subheadline)
                         .padding(11)
-                        .background(.ultraThinMaterial, in: Circle())
+                        .hudGlass(Circle())
                         .foregroundStyle(.red)
                 }
             }
@@ -533,18 +563,18 @@ struct HUDOverlay: View {
                     controller.startTraining()
                 } label: {
                     Label("重訓", systemImage: "arrow.clockwise")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 14).padding(.vertical, 11)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .hudGlass(Capsule())
                         .foregroundStyle(.white)
                 }
                 Button {
                     controller.backToReviewFromTraining()
                 } label: {
                     Image(systemName: "cube.transparent")
-                        .font(.headline)
+                        .font(.system(size: 17, weight: .regular))
                         .padding(11)
-                        .background(.ultraThinMaterial, in: Circle())
+                        .hudGlass(Circle())
                         .foregroundStyle(.white)
                 }
             }
@@ -558,9 +588,9 @@ struct HUDOverlay: View {
                     controller.cancelTraining()
                 } label: {
                     Label("停止", systemImage: "stop.fill")
-                        .font(.subheadline.weight(.semibold))
+                        .font(.subheadline.weight(.medium))
                         .padding(.horizontal, 18).padding(.vertical, 10)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        .hudGlass(Capsule())
                         .foregroundStyle(.white)
                 }
             }
@@ -619,7 +649,7 @@ struct HUDOverlay: View {
                     .font(.headline)
                     .padding(.horizontal, 18)
                     .padding(.vertical, 12)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .hudGlass(Capsule())
                     .foregroundStyle(.white)
             }
         }

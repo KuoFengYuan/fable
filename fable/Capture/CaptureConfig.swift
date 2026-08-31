@@ -6,15 +6,6 @@
 import Foundation
 import CoreGraphics
 
-/// 掃描模式：物件環繞（顯示涵蓋率圓頂）或場景漫遊（顯示軌跡緞帶）
-nonisolated enum ScanMode: String, CaseIterable, Identifiable, Sendable {
-    case object
-    case scene
-
-    var id: String { rawValue }
-    var label: String { self == .object ? "物件" : "場景" }
-}
-
 /// 所有可調參數集中於此。門檻值以 iPhone Pro（LiDAR）室內拍攝為基準。
 nonisolated struct CaptureConfig: Sendable {
 
@@ -138,38 +129,6 @@ nonisolated struct CaptureConfig: Sendable {
     /// 重融合 voxel 尺寸：比即時預覽（1cm）略粗，把遠距深度雜訊造成的「厚牆」塌成薄面。
     /// 想要最高細節設 0.01；房間尺度 3DGS 初始化 2cm 已足夠且更乾淨。
     var refuseVoxelSizeM: Float = 0.02
-    /// 用單目深度（Depth Anything V2 Small, Core ML）補上 LiDAR 沒有回波的區域。
-    ///
-    /// **預設關閉 —— 實測會產生殘影，而且是精度層級的問題，不是調參能解決的。**
-    /// 多幀 voxel 融合要不殘影，每幀深度誤差須遠小於 voxel(2cm)：3m 處的 2cm ＝ 0.67% 相對誤差。
-    /// MDE 經仿射對齊後的典型相對誤差是 5~10%（室內未見場景），樂觀取 2% 也有 6cm ＝ 3 個 voxel。
-    /// 差一個數量級，且誤差隨視角改變 —— 沒有機制讓不同幀對同一表面達成 2cm 內的共識，
-    /// 於是同一表面被各幀放到不同深度、疊成多層殼。LiDAR 則是 σ≈1cm@2m、多幀平均後 sub-cm，
-    /// 剛好在門檻內。
-    ///
-    /// 另一個結構性問題：能可靠填的洞沒價值，有價值的洞填不了 ——
-    ///   小洞（被 LiDAR 包圍）可靠，但相鄰高斯本來就會蓋過去；
-    ///   大洞（窗戶/鏡面/>5m）才是真正缺的，卻正是沒有 LiDAR 錨定、最不可靠的地方。
-    ///
-    /// 程式碼與守衛都保留（見 RefusionEngine.mdeHoleFill、DepthScaleFit），要實驗可打開。
-    /// 若要讓它真的可用，正解是「以洞的邊界 LiDAR 做局部仿射錨定」而非全幀單一 (a,b)，
-    /// 但那只改善小洞——即上表中沒價值的那一類。
-    var useMDEHoleFill = false
-    /// 仿射對齊（1/z ≈ a·d + b）所需的最少 LiDAR 監督樣本數；不足則該幀不用 MDE
-    var mdeMinSamples = 200
-    /// 對齊殘差上限（逆深度空間，1/m）。超過代表該幀 MDE 與 LiDAR 不一致（反光/透明面誤導），
-    /// 寧可放棄該幀也不要注入錯誤幾何
-    var mdeMaxRMSE: Float = 0.08
-    /// MDE 補洞點的分數倍率（LiDAR = 1.0、mesh = 0.25）。推論值，故低於量測值
-    var mdeScore: Float = 0.4
-    /// 每幀補洞點數上限（ROI-aware 取樣後）。避免大片無回波區灌爆點數預算
-    var mdeMaxPointsPerFrame = 8000
-    /// 鄰域支撐半徑（深度圖像素）：補洞像素附近須有 LiDAR 回波才採用。
-    /// 這道守衛把 MDE 限制成「內插」——只補被已知深度包圍的小洞，不碰整片無回波區。
-    /// 沒有它的話，窗戶/鏡面那種大片無回波區會由每幀各自的仿射擬合給出彼此不一致的深度
-    /// （沒有 LiDAR 錨定），同一表面在不同幀落到不同 voxel → 疊成多層殼＝殘影。
-    /// 3 個深度像素在 256×192 下約對應 2° 視角；調大會補更多但殘影風險上升。
-    var mdeSupportRadiusPx = 3
     /// 併入 ARKit 場景重建網格（ARMeshAnchor）的頂點作為補充幾何。
     /// 價值不在「更準」，而在**覆蓋率**：ARKit 的 mesh 融合的是每一幀（60fps）的深度，
     /// 而重融合只用 ~120 個關鍵幀 → mesh 會涵蓋關鍵幀沒拍到的表面（天花板/角落黑塊的主因）。
@@ -183,8 +142,17 @@ nonisolated struct CaptureConfig: Sendable {
     /// 一路自動粗化（2→4→8→16cm）而且完全靜默 —— 初始點距被放大數倍，
     /// 而 msplat 的初始高斯尺寸就等於 3-NN 點距，從 15cm 起跳時 24 次 refine 的 LAS 分裂
     /// （實測每顆平均只切 ~1.2 次、縮小約 2 倍）根本追不回細節。
-    /// Cell 約 40B + Dictionary 開銷 ≈ 70B/格；2M 格 ≈ 140MB，post-scan 尖峰可接受。
-    var refuseMaxCells = 2_000_000
+    /// Cell 約 40B + Dictionary 開銷 ≈ 70B/格。
+    ///
+    /// **2M → 4M，因為整層掃描會剛好踩線。** 100m² 住家（樓高 2.6m）的表面積
+    /// ≈ 384m²（地板 100 + 天花 100 + 牆 104 + 家具 80）；LiDAR 深度雜訊讓表面
+    /// 不只一格厚，融合後仍約 2 層 ⇒ 2cm 格下約 1.9M 格。
+    /// 也就是說舊的 2M 上限對「整層」剛好會觸頂，然後靜默粗化成 4cm ——
+    /// 而初始點距直接決定 msplat 的初始高斯大小（初始 scale = 3-NN 距離），
+    /// 粗一倍就是初始高斯大一倍，密集化未必追得回來。
+    /// 4M 格 ≈ 280MB，只在 post-scan 尖峰存在（refuse() 回傳後就釋放，訓練尚未配置），
+    /// 而觸頂粗化仍然保底：真的超過就加粗，記憶體有界。
+    var refuseMaxCells = 4_000_000
     /// 孤立點移除：占據 voxel 的 26 鄰域中占據數少於此值 → 視為飄浮雜點剔除（0 = 關閉）。
     /// 專清空間中不貼表面的白霧；過大會咬掉細線/薄物，3 為保守值。
     var refuseMinNeighbors = 3
@@ -208,6 +176,18 @@ nonisolated struct CaptureConfig: Sendable {
     var pointMaxDepthM: Float = 5.0
     /// 飛點過濾：與相鄰像素深度差超過 depth×此比例 → 視為物體邊緣拖影，剔除
     var depthEdgeRejectRatio: Float = 0.05
+    /// 入射角上限（度）。超過就不收這個深度樣本。
+    ///
+    /// **這是牆面疊影的主要對策。** 掠射時一個深度像素涵蓋牆面上一大片，
+    /// 深度沿光線的誤差被 1/cosθ 放大，點會落在真實表面前後好幾公分；
+    /// 每一趟掃描各偏一點，就在 voxel 格上排成一片片平行的殼
+    /// —— 那就是畫面上的垂直條紋與「掃多次疊在一起」。
+    ///
+    /// 80° 刻意留得寬：硬拒絕會在只能斜看到的牆面上開洞。
+    /// 真正在做事的是 cos²θ 的權重（80° → 3%）—— 之後有正面觀測進來時，
+    /// 加權平均會被拉回正確的表面，而不是留著兩層殼。
+    /// 想更乾淨可以收到 70~75°，代價是斜面覆蓋率下降。
+    var depthMaxIncidenceDeg: Float = 80
 
     // MARK: - 即時點雲預覽（AR 疊加，Scaniverse 式）
     /// 每 N 個 ARFrame 融合一次（60fps → 每 0.1s），與智慧快門解耦，點雲連續長出
@@ -217,14 +197,21 @@ nonisolated struct CaptureConfig: Sendable {
     var previewTileSizeM: Float = 1.2
     /// 點雲融合的模糊閘門（比抓幀遮斷更嚴）：模糊幀的姿態-深度錯位是殘影另一來源。
     /// 與 maxBlurPixels/blockBlurPixels 同步隨捲簾項重新校準（18 ≈ 0.68 rad/s）
-    var previewMaxBlurPixels: Float = 18
-    /// 融合的「相機穩定度」閘門：只在相機夠穩時才把深度融進點雲。
-    /// 模糊值受曝光時間影響（亮處曝光短→快速移動仍判定為低模糊），無法反映「姿態延遲/誤差」；
-    /// 移動過快時姿態不準 → 同一表面被投影到不同世界座標 → 殘影＋點不貼合。故另設速度硬閘門。
-    /// 角速度上限（rad/s）：~0.6 允許正常掃描平移、擋掉甩動。
-    var previewMaxAngularSpeedRadS: Float = 0.6
-    /// 線速度上限（m/s）：~0.5 允許走動掃描、擋掉「來回快步」造成的殘影。想更乾淨可調小（但覆蓋變慢）。
-    var previewMaxLinearSpeedMS: Float = 0.5
+    /// 預覽的三個閘門**直接沿用關鍵幀的門檻**，不再各自設一套。
+    ///
+    /// 先前預覽比關鍵幀嚴（模糊 18 vs 24px、角速度 0.6 vs 1.0、線速度 0.5 vs 0.8），
+    /// 理由是「移動快 → 姿態延遲 → 殘影」。但後果是一個幀好到足以被存成關鍵幀、
+    /// 進到匯出的點雲，卻不夠格顯示在預覽上 ——
+    /// 使用者看到「我明明掃過這裡但沒有點」，而掃完之後那裡是有點的。
+    ///
+    /// 預覽的**唯一用途就是回報覆蓋率**。顯示得比實際收到的少是直接的誤導：
+    /// 熱圖會把其實已經夠的區域標成缺點，害使用者回去重掃不需要重掃的地方。
+    /// 殘影本來就另有機制在防（點雲磚掛 ARAnchor，漂移修正時整磚跟著移動）。
+    ///
+    /// 寫成衍生值而不是複製常數 —— 兩份各自維護的門檻遲早會再漂開。
+    var previewMaxBlurPixels: Float { blockBlurPixels }
+    var previewMaxAngularSpeedRadS: Float { keyframeMaxAngularSpeedRadS }
+    var previewMaxLinearSpeedMS: Float { keyframeMaxLinearSpeedMS }
 
     // MARK: - 手機端 3DGS 訓練（msplat，on-device）
     /// 訓練迭代數（手機縮規模；桌機版通常 30000）。3–7k 在物件尺度已可觀。
@@ -263,38 +250,52 @@ nonisolated struct CaptureConfig: Sendable {
     /// 本專案已經對散熱敏感（thermalState 到 .critical 會自動停拍），
     /// 長時間整屋掃描若發現提早過熱，這是第一個該關掉的開關。
     /// 只在支援 RoomPlan 的機型生效（見 FloorPlanCapture.isSupported）。
-    var captureFloorPlan = true
+    ///
+    /// **預設關閉。** 實機在辦公室隔間／貨架／桌面的場景下，RoomPlan 反覆給出
+    /// 「2 面牆、樓高 0.80m」與方向亂掉的假牆 —— 它需要場景「是個房間」
+    /// （有地板、成面的牆、牆與天花板的交界），而那個前提在這裡不成立。
+    /// 平面圖改走 pointCloudFloorPlan：點雲只需要表面被掃到。
+    ///
+    /// 關掉會一併失去的東西（都是 RoomPlan 餵的，不是 bug）：
+    ///   · 掃描時的即時發光線框與 dollhouse 縮圖
+    ///   · 牆高不足 / 靠太近 / 光線不足的即時引導
+    ///   · floorplan.usdz（帶門窗語意的 3D 幾何）
+    ///   · 門窗與家具的語意分類
+    /// 場景換成一般住宅／有完整牆面的房間時，把它設回 true 會明顯更好用。
+    var captureFloorPlan = false
 
-    // MARK: - 位姿微調（以 LiDAR 共識點雲為固定結構，非完整 BA）
-    /// 局部 BA 的輪數（0 = 關閉）。以 ARKit＋錨點修正為初值，用掃描時同步建立的
-    /// 跨幀特徵對應做微調。殘差 = 重投影 ＋ 深度（後者擋住沿光軸的退化）。
-    /// 每輪自我驗證：RMS 沒下降就回退並停止。
-    /// 10 輪。實機資料跑完全部 3 輪仍持續改善（改善率 10%、從未觸發自我驗證的回退）
-    /// —— 也就是**迭代次數不足**而非收斂。離線測試在 8 輪達到 96% 改善。
-    /// 每輪只是對 ~3000 個觀測各做一次 6×6 求解，微秒級，輪數幾乎免費；
-    /// 而自我驗證會在真正收斂時自動停止，設大不會有壞處。
-    var baRounds = 10
+    /// 由 LiDAR 點雲直接產生平面圖（不經過 RoomPlan）。
+    ///
+    /// **與 captureFloorPlan 互相獨立，兩者可以同時開。** 它們的失效模式完全不同：
+    ///   · RoomPlan 需要場景「是個房間」——有地板、成面的牆、牆與天花板的交界。
+    ///     辦公室隔間、貨架、桌面前它會把螢幕邊桌緣硬判成牆，
+    ///     而且第一片判錯之後後續的面會跟著它對齊。回報過 2 面牆、樓高 0.80m。
+    ///   · 點雲只需要表面被掃到，但分不出門窗與家具語意（那要靠 RoomPlan）。
+    ///
+    /// 幾乎不花錢：重融合已經算好點雲了，這一步只是再掃一遍那些點
+    /// （10 萬點約數十毫秒），而且只在匯出時做，不影響掃描。
+    var pointCloudFloorPlan = true
 
-    /// （已停用的舊路徑）幾何式位姿微調的輪數。**目前為 0（關閉）** —— 求解器的對應方式被離線測試否決了。
+    // MARK: - 局部 BA（**目前整條關閉**）
+    /// 局部 BA 的輪數。**0 = 整條路徑關閉，掃描時的特徵抽取與匹配也一起不做。**
     ///
-    /// 原設計用「點落在哪個 voxel」建立對應。離線測試（tools/test_pose_refine.swift）
-    /// 拿單一平面做對照，結果決定性地否定了它：
+    /// 這一個 0 同時關掉兩處成本，這是它現在為 0 的主要理由：
+    ///   · 掃描中：每個關鍵幀抽 2400 個角點 + 對最近 4 幀做引導匹配
+    ///   · 停止後：observations() 建表 ＋ 兩次求解（閘門解 + 全量解）各 10 輪
+    /// 而使用者要的是「掃完就看到結果」。位姿改用 ARKit ＋ 錨點修正，那是免費的。
     ///
-    ///   沿平面切向偏 3cm → 只呈現 0.95cm 的表觀誤差（點落進同平面的鄰格）
-    ///   沿平面法向偏 3cm → **0/40000 點有對應**（全部落進空格）
+    /// **關掉不是因為它做錯了。** 保留集交叉驗證（BundleAdjuster.kHoldoutGate）在
+    /// 近距離掃描量到 −21%，也就是位姿真的變好；房間尺度則持平（位姿誤差已低於
+    /// 觀測雜訊，1cm 誤差的重投影量 @0.5m 是 29px、@2m 只有 7px）。
+    /// 也就是說它在一半的情況下有效 —— 只是那個效益換不到後處理的等待時間。
     ///
-    /// 也就是在最該修正的方向完全收不到訊號、在不該動的方向給誤導訊號。
-    /// 這不是調參問題，是對應方式錯了 —— 正解是鄰域最近點搜尋 ＋ 點到面殘差
-    /// （standard ICP），而不是 voxel containment。
-    ///
-    /// 程式碼保留（PoseRefiner 的 6×6 線性化求解、阻尼、夾住、去全域漂移都已驗證正確：
-    /// 無擾動時修正量 0mm、去漂移後平均為 0），等對應方式改對再打開。
-    /// 每輪的自我驗證機制也還在，所以就算誤開也只是白花時間、不會改壞資料。
-    var poseRefineRounds = 0
-    /// 微調時的深度取樣步長。3 在 256×192 下每幀約 5400 點 ——
-    /// 遠超求解 6 個未知數所需，而粗取樣讓每輪的重建成本降到 1/9。
-    /// 最終的高品質融合仍用 refuseSampleStride（全像素）。
-    var poseRefineStride = 3
+    /// 要重新評估：設成 10，log 會印出保留集判定（那是唯一不在 BA 目標函數裡的數字），
+    /// 以及新的分段耗時。程式碼與 tools/test_bundle_adjust.swift（8 項）都留著。
+    var baRounds = 0
+
+    /// 允許 BA 改動位姿。決定權不在這裡，在保留集（BundleAdjuster.kHoldoutGate）——
+    /// 每次掃描各自判定，過門檻才套用。baRounds = 0 時本欄無作用。
+    var baApplyPoses = true
 
     // MARK: - 迴環閉合（降低累積漂移，投報率最高的一項）
     /// 走多遠之後開始提示「回起點閉環」（公尺）。
@@ -308,10 +309,4 @@ nonisolated struct CaptureConfig: Sendable {
     /// 1.5m 內大致就會觸發；太小會讓提示永遠不消失。
     var loopClosedRadiusM: Float = 1.5
 
-    // MARK: - 涵蓋率圓頂（物件模式）
-    var domeAzimuthBins = 24
-    var domeElevationBins = 5
-    var domeElevationMaxDeg: Float = 75
-    /// 相機視線需與「相機→物件中心」夾角小於此值，該視角格才算已涵蓋
-    var domeViewAngleDeg: Float = 35
 }

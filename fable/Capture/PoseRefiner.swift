@@ -1,28 +1,26 @@
 //
 //  PoseRefiner.swift
-//  fable — 以 LiDAR 共識點雲為固定結構的位姿微調（不是完整 BA）
+//  fable — BundleAdjuster 共用的 6×6 位姿求解工具
 //
-//  為什麼這件事對 3DGS 最關鍵：位姿誤差直接變成 3DGS 的解析度天花板。
+//  為什麼位姿這件事對 3DGS 最關鍵：位姿誤差直接變成 3DGS 的解析度天花板。
 //
 //      δ = 1cm 的橫向位姿誤差 @ z=2m, fx=1450  →  δ·fx/z = 7.25 px 重投影誤差
 //
 //  高斯若縮得比這 7px 更小，各視角就會互相矛盾、光度損失反而上升 ——
 //  所以優化器會主動把高斯維持在「剛好模糊到能兼容所有視角」的大小。
-//  調再多密集化參數都突破不了這條線；只有把位姿修準才能提高天花板。
+//  調再多密集化參數都突破不了這條線。
 //
-//  ── 為什麼不做完整 BA ────────────────────────────────────────────
-//  完整 SfM/BA 是為「只有照片」設計的：沒有深度、沒有初始位姿，
-//  所以必須靠特徵三角化出結構。我們兩個都有 —— LiDAR 給了度量深度、
-//  ARKit 給了位姿、而且已經融合出共識點雲。於是：
-//    · 不需要特徵提取（那才是 BA 的主要成本，不是解方程）
-//    · 不需要三角化（結構就是 LiDAR）
-//    · 不需要處理 7-DoF gauge freedom（深度是度量的，尺度天生固定）
-//  剩下的問題只是「每一幀相對共識點雲差了一個剛體變換多少」——
-//  每幀 6 個未知數，線性化後是一個 6×6 正規方程，微秒級。
+//  ── 這個檔案剩下什麼 ──────────────────────────────────────────────
+//  只有數值工具：小角度增量的參數化（deltaTransform）、6×6 Cholesky、
+//  以及去除全域剛體自由度（removeGlobalDrift）。使用者是 BundleAdjuster。
 //
-//  ── 自我驗證 ───────────────────────────────────────────────────
-//  每一輪都量修正前後的殘差；**沒有下降就回退並停止**。
-//  所以即使預設開啟也不會把資料改壞：最壞情況等於沒做。
+//  原本還有一條「以融合點雲為固定結構、用 voxel 佔用建立對應」的幾何式精修
+//  （solveRigid），**已刪除**。離線測試決定性地否決了它：
+//    沿平面切向偏 3cm → 只呈現 0.95cm 表觀誤差（落進同平面鄰格）
+//    沿平面法向偏 3cm → 0/40000 點有對應（全部落進空格）
+//  在最該修正的方向收不到訊號、在不該動的方向給誤導訊號。
+//  重投影誤差沒有這個盲點（表面往鏡頭方向移動，投影位置就是實實在在地位移了），
+//  所以那條路改走 BundleAdjuster。要復原請查 git 歷史。
 //
 
 import Foundation
@@ -31,9 +29,7 @@ import simd
 nonisolated struct PoseRefineResult: Sendable {
     /// 逐幀修正後的 c2w（未列出者維持原樣）
     var poses: [Int: simd_float4x4] = [:]
-    /// 每一輪的殘差（公尺，RMS）。第 0 個是修正前。幾何式精修（PoseRefiner）填這個
-    var residualsM: [Double] = []
-    /// 每一輪的重投影殘差（像素，RMS）。第 0 個是修正前。BundleAdjuster 填這個 ——
+    /// 每一輪的重投影殘差（像素，RMS）。第 0 個是修正前 ——
     /// 它才是決定 3DGS 解析度天花板的量（1cm 位姿誤差 @2m ≈ 7px）
     var residualsPx: [Float] = []
     var roundsApplied = 0
@@ -49,21 +45,10 @@ nonisolated struct PoseRefineResult: Sendable {
         return Double(h.after / h.before) - 1
     }
 
-    var improvedPercent: Double {
-        guard let first = residualsM.first, let last = residualsM.last, first > 1e-9 else { return 0 }
-        return (1 - last / first) * 100
-    }
-
-    /// 殘差換算成 2m 處的重投影像素（fx≈1450）——「這是 3DGS 的解析度天花板」的直觀值
-    static func pixelsAt2m(_ residualM: Double, fx: Double = 1450) -> Double {
-        residualM * fx / 2.0
-    }
 }
 
 nonisolated enum PoseRefiner {
 
-    /// 對應點最大容許距離（voxel 的倍數）。超過視為不同表面／離群，不參與求解
-    static let kMaxCorrespVoxels: Float = 2.5
     /// 每輪只套用求得修正量的這個比例。這就是「只做微調」的實作 ——
     /// 等效於一個把位姿拉回 ARKit 原值的軟先驗，避免在退化幾何
     /// （例如走廊直線前進、只看到一面白牆）上把位姿推壞。
@@ -72,83 +57,6 @@ nonisolated enum PoseRefiner {
     /// 而不是真的差這麼多 —— 夾住比信任它安全。
     static let kMaxTransM: Float = 0.05
     static let kMaxRotRad: Float = 0.02        // ≈1.15°
-    /// 每幀至少要這麼多有效對應才求解。太少的話 6 個未知數是欠定的
-    static let kMinCorrespondences = 200
-
-    /// 量一幀的深度與共識點雲之間的剛體錯位，並回傳修正後的 c2w。
-    ///
-    /// - worldPoints: 該幀深度反投影出的世界座標點（已用當前位姿）
-    /// - camPos: 該幀相機位置。旋轉繞相機中心參數化 —— 直接用世界原點會讓
-    ///   [p]× 變得很大、旋轉與平移嚴重耦合，條件數爆掉。
-    /// 回傳 nil 表示對應不足或求解失敗（該幀維持原位姿）。
-    static func solveRigid(worldPoints: [SIMD3<Float>], camPos: SIMD3<Float>,
-                           grid: FusedVoxelGrid) -> (delta: simd_float4x4, rms: Double)? {
-        let vs = grid.voxelSize
-        let maxD = vs * kMaxCorrespVoxels
-        let maxD2 = maxD * maxD
-
-        // 線性化的點對點剛體對齊：ω×(p−c) + t = q − p
-        // Jacobian 每列 = [ -[p−c]× | I ]（3×6），累加 6×6 正規方程
-        var ata = [Float](repeating: 0, count: 36)
-        var atb = [Float](repeating: 0, count: 6)
-        var sumSq: Double = 0
-        var n = 0
-
-        for p in worldPoints {
-            guard let key = PointCloudMath.voxelKey(p, size: vs),
-                  let cell = grid.cells[key] else { continue }
-            let e = cell.mean - p
-            let d2 = simd_length_squared(e)
-            if d2 > maxD2 { continue }                 // 離群／不同表面
-            sumSq += Double(d2)
-            n += 1
-
-            let r = p - camPos
-            // J = [ -[r]× | I ]，逐列展開（避免建矩陣物件）
-            //   row0: ( 0,  r.z, -r.y, 1, 0, 0 )
-            //   row1: (-r.z, 0,   r.x, 0, 1, 0 )
-            //   row2: ( r.y, -r.x, 0,  0, 0, 1 )
-            let rows: [[Float]] = [[0, r.z, -r.y, 1, 0, 0],
-                                   [-r.z, 0, r.x, 0, 1, 0],
-                                   [r.y, -r.x, 0, 0, 0, 1]]
-            let ev = [e.x, e.y, e.z]
-            for k in 0..<3 {
-                let row = rows[k]
-                let b = ev[k]
-                for i in 0..<6 {
-                    let ri = row[i]
-                    if ri == 0 { continue }
-                    atb[i] += ri * b
-                    for j in i..<6 where row[j] != 0 {
-                        ata[i * 6 + j] += ri * row[j]
-                    }
-                }
-            }
-        }
-        guard n >= kMinCorrespondences else { return nil }
-        // 補齊對稱下三角
-        for i in 0..<6 { for j in 0..<i { ata[i * 6 + j] = ata[j * 6 + i] } }
-        // Levenberg 阻尼：低紋理/退化幾何下正規方程接近奇異，加一點對角保證可解
-        let trace = (0..<6).reduce(Float(0)) { $0 + ata[$1 * 6 + $1] }
-        let lambda = max(1e-9, trace / 6 * 1e-4)
-        for i in 0..<6 { ata[i * 6 + i] += lambda }
-
-        guard let x = choleskySolve6(ata, atb) else { return nil }
-        var omega = SIMD3<Float>(x[0], x[1], x[2])
-        var trans = SIMD3<Float>(x[3], x[4], x[5])
-
-        // 夾住 + 阻尼（軟先驗：只走一部分，讓位姿不會離 ARKit 太遠）
-        let rotN = simd_length(omega)
-        if rotN > kMaxRotRad { omega *= kMaxRotRad / rotN }
-        let trN = simd_length(trans)
-        if trN > kMaxTransM { trans *= kMaxTransM / trN }
-        omega *= kDamping
-        trans *= kDamping
-
-        let rms = (sumSq / Double(n)).squareRoot()
-        return (deltaTransform(omega: omega, trans: trans, about: camPos), rms)
-    }
-
     /// 小角度旋轉（繞 about 點）＋平移 → 4×4 世界變換。
     /// 用 Rodrigues 的一階近似即可 —— 這裡的角度上限是 1.15°，二階項可忽略。
     static func deltaTransform(omega: SIMD3<Float>, trans: SIMD3<Float>,

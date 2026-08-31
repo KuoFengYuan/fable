@@ -83,6 +83,32 @@ nonisolated enum BundleAdjuster {
     /// 觀測。留著 20% 不用是暫時的代價（每幀仍有 ~84 個觀測解 6 個未知數，遠超需求）。
     static let kHoldoutEvery = 5
 
+    /// 保留集要進步多少，BA 的位姿才會被套用（負值＝進步）。
+    ///
+    /// **這是每次掃描各自判定的，不是一個我猜的全域預設值。** 兩份實機 log 給出相反
+    /// 的結論，而它們並不矛盾 —— 差別是工作距離。1cm 位姿誤差造成的重投影誤差
+    /// @0.5m 是 29px，@2m 只有 7px：
+    ///
+    ///   · 近距離（小物件、牆角）：位姿誤差 ≫ 觀測雜訊 → BA 有充足訊號（實測 -21%）
+    ///   · 房間尺度 2~3m：與深度取樣雜訊同量級 → BA 只是把雜訊擬合得更好
+    ///
+    /// 這是幾何決定的、不是可調參數。而保留集每次掃描都算得出來，就讓它自己決定；
+    /// 我挑任何一個固定預設值，都會在另一半的情況下挑錯。
+    ///
+    /// 3% 的來源：離線測試「位姿已是真值、只有雜訊」那一案量到 +11%（往壞的方向），
+    /// 而「真有位姿誤差」那一案是 -96%。兩者相距極遠，門檻設在哪都不敏感 ——
+    /// 取 3% 是為了擋住量測本身的抖動，不是為了切在兩群之間。
+    static let kHoldoutGate: Double = -0.03
+
+    /// 觀測深度的中位數 —— 像素 ↔ 公分的換算尺度。用中位數而非平均，
+    /// 因為深度分佈長尾（遠處的牆會把平均拉走）。
+    static func medianDepth(_ obs: [FeatureObservation]) -> Float {
+        guard !obs.isEmpty else { return 2 }
+        var d = obs.map(\.depth)
+        d.sort()
+        return d[d.count / 2]
+    }
+
     /// 執行局部 BA。回傳修正後的位姿與每輪的重投影 RMS（像素）。
     ///
     /// - records: 關鍵幀（transform 為初值，來自 ARKit＋錨點修正）
@@ -124,12 +150,6 @@ nonisolated enum BundleAdjuster {
             return result
         }
 
-        /// track 的 3D 位置＝所有觀測到它的幀給出的 LiDAR 世界座標平均。
-        /// 每輪重算一次：位姿改了，同一個 track 的各幀反投影也跟著改。
-        func trackPoints() -> [Int: SIMD3<Float>] {
-            trackPointsFor(poses, order: order, intr: intr, obsByFrame: obsByFrame)
-        }
-
         /// 保留集的重投影殘差。只看重投影、不含深度項 —— 深度殘差被 LiDAR 雜訊主導，
         /// 混進來會蓋掉我們要偵測的那個訊號（位姿有沒有真的變好）。
         func heldOutReproj(_ p: [Int: simd_float4x4]) -> (rms: Float, median: Float)? {
@@ -139,82 +159,128 @@ nonisolated enum BundleAdjuster {
                               obsByFrame: heldByFrame, points: pts)
             return r.reproj.isFinite ? (r.reproj, r.medianReproj) : nil
         }
-        let heldBefore = heldOutReproj(poses)      // 以 ARKit 原始位姿量
 
-        var bestPoses = poses
-        for round in 0..<rounds {
-            let pts = trackPoints()
-            let rBefore = residuals(order: order, poses: poses, intr: intr,
-                                    obsByFrame: obsByFrame, points: pts)
-            if result.residualsPx.isEmpty { result.residualsPx.append(rBefore.total) }
+        /// 跑迭代迴圈。**抽成函式是為了讓「量測解」與「上線解」走完全同一條路徑** ——
+        /// 兩份實作一定會分岔，而這個檔案已經有四個概念錯誤的前例，
+        /// 而且那些錯誤的症狀全是「沒效果」而不是「壞掉」。
+        func runRounds(fit: [Int: [FeatureObservation]], from start: [Int: simd_float4x4])
+            -> (poses: [Int: simd_float4x4], residuals: [Float], rounds: Int) {
+            var poses = start
+            var best = start
+            var res: [Float] = []
+            var applied = 0
+            for _ in 0..<rounds {
+                let pts = trackPointsFor(poses, order: order, intr: intr, obsByFrame: fit)
+                let rBefore = residuals(order: order, poses: poses, intr: intr,
+                                        obsByFrame: fit, points: pts)
+                if res.isEmpty { res.append(rBefore.total) }
 
-            // 逐幀獨立求解（結構固定 ⇒ 相機之間解耦）
-            var deltas: [Int: simd_float4x4] = [:]
-            for id in order {
-                guard let c2w = poses[id], let K = intr[id], let obs = obsByFrame[id] else { continue }
-                if let d = solveFrame(c2w: c2w, K: K, obs: obs, points: pts) {
-                    deltas[id] = d
+                // 逐幀獨立求解（結構固定 ⇒ 相機之間解耦）
+                var deltas: [Int: simd_float4x4] = [:]
+                for id in order {
+                    guard let c2w = poses[id], let K = intr[id], let obs = fit[id] else { continue }
+                    if let d = solveFrame(c2w: c2w, K: K, obs: obs, points: pts) {
+                        deltas[id] = d
+                    }
                 }
+                guard !deltas.isEmpty else { break }
+
+                // 全域剛體自由度：所有相機一起平移不改變任何重投影殘差 ——
+                // 不扣掉平均修正量的話整組位姿會慢慢漂走，
+                // 而點雲/ARWorldMap/上一次掃描的座標系就對不上了。
+                PoseRefiner.removeGlobalDrift(&deltas)
+
+                var candidate = poses
+                for (id, d) in deltas { if let c = candidate[id] { candidate[id] = d * c } }
+                let rAfter = residuals(order: order, poses: candidate, intr: intr,
+                                       obsByFrame: fit,
+                                       points: trackPointsFor(candidate, order: order,
+                                                              intr: intr, obsByFrame: fit))
+                // 自我驗證用 **robust 成本**（＝求解實際最小化的量），不用原始 RMS。
+                // 原始 RMS 被少數誤匹配主導：一輪可能把 inlier 改善很多、RMS 卻沒降，
+                // 於是被誤判為「沒變好」而提早停止（實機 BA 卡在 8% 改善的成因）。
+                guard rAfter.robust < rBefore.robust else { break }
+
+                poses = candidate
+                best = candidate
+                res.append(rAfter.total)
+                applied += 1
             }
-            guard !deltas.isEmpty else { break }
-
-            // 全域剛體自由度：所有相機一起平移不改變任何重投影殘差 ——
-            // 不扣掉平均修正量的話整組位姿會慢慢漂走，
-            // 而點雲/ARWorldMap/上一次掃描的座標系就對不上了。
-            PoseRefiner.removeGlobalDrift(&deltas)
-
-            var candidate = poses
-            for (id, d) in deltas { if let c = candidate[id] { candidate[id] = d * c } }
-            let rAfter = residuals(order: order, poses: candidate, intr: intr,
-                                   obsByFrame: obsByFrame,
-                                   points: trackPointsFor(candidate, order: order,
-                                                          intr: intr, obsByFrame: obsByFrame))
-            // 自我驗證用 **robust 成本**（＝求解實際最小化的量），不用原始 RMS。
-            // 原始 RMS 被少數誤匹配主導：一輪可能把 inlier 改善很多、RMS 卻沒降，
-            // 於是被誤判為「沒變好」而提早停止（實機 BA 卡在 8% 改善的成因）。
-            guard rAfter.robust < rBefore.robust else { break }
-
-            poses = candidate
-            bestPoses = candidate
-            result.residualsPx.append(rAfter.total)
-            result.roundsApplied = round + 1
+            return (best, res, applied)
         }
 
-        guard result.roundsApplied > 0 else { return result }
-        result.poses = bestPoses
-        if let hb = heldBefore, let ha = heldOutReproj(bestPoses) {
+        // ── 第一階段：只用 80% 求解，量保留集。這是閘門，不是最終解 ──
+        let heldBefore = heldOutReproj(poses)      // 以 ARKit 原始位姿量
+        let gate = runRounds(fit: obsByFrame, from: poses)
+        result.roundsApplied = gate.rounds
+        result.residualsPx = gate.residuals
+        guard gate.rounds > 0 else { return result }
+        if let hb = heldBefore, let ha = heldOutReproj(gate.poses) {
             result.holdoutMedianPx = (hb.median, ha.median)
         }
+
+        // ── 閘門：保留集有進步才交出位姿 ──
+        //
+        // **為什麼是每次掃描各自判定，而不是一個全域預設值。** 兩份實機 log 給出
+        // 相反的結論，而它們並不矛盾 —— 差別是工作距離：
+        //   1cm 位姿誤差造成的重投影誤差 @0.5m 是 29px、@2m 只有 7px。
+        // 近距離掃描（小物件、牆角）位姿誤差遠大於觀測雜訊 → BA 有充足訊號（實測 -21%）；
+        // 房間尺度 2~3m 則與深度取樣雜訊同量級 → BA 只是把雜訊擬合得更好。
+        // 這是幾何決定的，不是可以調的參數；而保留集每次掃描都算得出來，
+        // 就讓它自己決定。我猜一個預設值只會在另一半的情況下猜錯。
+        let pass = (result.holdoutDelta ?? 0) < kHoldoutGate
+        if pass {
+            // 閘門過了 → 用**全部**觀測重解一次才是上線的解。
+            // 同一個 runRounds、同一組初值，只是資料多 20%（保留集只為判定而存在，
+            // 判定完就不該再扣著五分之一的約束不用）。
+            let full = runRounds(fit: observations.reduce(into: [Int: [FeatureObservation]]()) {
+                if poses[$1.frameID] != nil { $0[$1.frameID, default: []].append($1) }
+            }, from: poses)
+            result.poses = full.rounds > 0 ? full.poses : gate.poses
+        }
+
         if let a = result.residualsPx.first, let b = result.residualsPx.last {
             // 位姿解讀只能用**重投影項**：深度項被 LiDAR 雜訊主導，
             // 把它算進去會把量測雜訊當成位姿誤差
-            let rEnd = residuals(order: order, poses: poses, intr: intr,
-                                 obsByFrame: obsByFrame, points: trackPoints())
+            let rEnd = residuals(order: order, poses: gate.poses, intr: intr,
+                                 obsByFrame: obsByFrame,
+                                 points: trackPointsFor(gate.poses, order: order,
+                                                        intr: intr, obsByFrame: obsByFrame))
+            // **像素 → 公分要用這次掃描的實際工作距離。**
+            //
+            // 先前硬寫 d=2m。那在房間尺度還算合理，但這個專案也會拿來掃小物件 ——
+            // 實機出現過外接盒只有 0.42×0.78m 的掃描，硬寫 2m 讓每個 cm 數字
+            // 膨脹約 4 倍（重投影 5.54px 報成 0.76cm，實際約 0.19cm）。
+            // 我已經被誤導的診斷數字坑過三次，而每一次都是因為「換算用了假設值」。
+            let dMed = medianDepth(observations)
+            let toCm = { (px: Float) in Double(px) * Double(dMed) / 1450 * 100 }
             print(String(format: "BA: %d 幀 / %d 觀測 / %d tracks × %d 輪 → "
-                         + "總 RMS %.2f → %.2f px（改善 %.0f%%）",
+                         + "總 RMS %.2f → %.2f px（改善 %.0f%%），工作距離中位數 %.2f m",
                          order.count, observations.count,
                          Set(observations.map(\.trackID)).count, result.roundsApplied,
-                         a, b, (1 - b / a) * 100))
+                         a, b, (1 - b / a) * 100, dMed))
             // 中位數才是「典型」誤差：RMS 只擋 40px 硬上限，少數 30px 的誤匹配就能主導它。
             // 位姿解讀要看中位數；RMS 與中位數的差距則代表誤匹配的比重。
             print(String(format: "  重投影 RMS %.2f px / 中位數 %.2f px"
-                         + "（⇒ 典型位姿誤差 %.2f cm @2m；RMS 高於中位數的部分是誤匹配）",
-                         rEnd.reproj, rEnd.medianReproj,
-                         Double(rEnd.medianReproj) * 2 / 1450 * 100))
-            print(String(format: "  深度殘差 %.2f px（≈ %.1f cm，屬 LiDAR 量測雜訊，非位姿誤差）"
+                         + "（⇒ 典型位姿誤差 %.2f cm；RMS 高於中位數的部分是誤匹配）",
+                         rEnd.reproj, rEnd.medianReproj, toCm(rEnd.medianReproj)))
+            print(String(format: "  深度殘差 %.2f px（≈ %.2f cm，屬 LiDAR 量測雜訊，非位姿誤差）"
                          + "，佔目標函數平方成本 %.0f%%",
-                         rEnd.depth, Double(rEnd.depth) * 2 / 1450 * 100,
+                         rEnd.depth, toCm(rEnd.depth),
                          Double(rEnd.depth * rEnd.depth)
                              / Double(rEnd.total * rEnd.total) * 100))
             // 目標函數外的證人。上面每一個數字都是 BA 自己在最小化的量，下降是必然的；
-            // 只有這一行能分辨「位姿真的變好」與「把雜訊吸進位姿」。
+            // 只有這一行能分辨「位姿真的變好」與「把雜訊吸進位姿」——
+            // 而它同時就是「這次掃描的位姿要不要換成 BA 解」的閘門。
             if let d = result.holdoutDelta, let h = result.holdoutMedianPx {
-                let verdict = d < -0.03 ? "位姿真的變好"
-                    : d > 0.03 ? "⚠️ 變差 —— BA 在擬合觀測雜訊，建議 baRounds 設 0"
-                    : "持平 —— 修正量已低於觀測雜訊，BA 無淨效益，建議 baRounds 設 0"
                 print(String(format: "  保留集（%d 條 track 未參與求解）重投影中位數 "
                              + "%.2f → %.2f px（%+.0f%%）：%@",
-                             heldTracks.count, h.before, h.after, d * 100, verdict))
+                             heldTracks.count, h.before, h.after, d * 100,
+                             pass ? "位姿真的變好 → 用全部觀測重解後套用"
+                                  : "未達 \(Int(-kHoldoutGate * 100))% 門檻 ⇒ "
+                                    + "在擬合觀測雜訊，本次不套用 BA 位姿"))
+            } else {
+                print("  ⚠️ 保留集不足（\(heldTracks.count) 條 track）無法判定 → 本次不套用 BA 位姿")
             }
         }
         return result

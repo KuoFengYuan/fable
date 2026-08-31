@@ -9,11 +9,11 @@
 //  → 把位姿加上已知擾動 → 跑 BA → 檢查它把位姿收回去多少。
 //  真值已知，所以可以直接量「位姿誤差」，不只是看目標函數下降。
 //
-//  編譯（ba_test_stubs.swift 提供最小型別定義，不必把整個 app module 拉進來）：
+//  編譯（test_stubs_*.swift 提供最小型別定義，不必把整個 app module 拉進來）：
 //
 //    swiftc -O -o /tmp/batest fable/Capture/PoseRefiner.swift \
 //           fable/Capture/BundleAdjuster.swift tools/test_bundle_adjust.swift \
-//           tools/ba_test_stubs.swift && /tmp/batest
+//           tools/test_stubs_core.swift tools/test_stubs_ba.swift && /tmp/batest
 //
 //  這支測試抓到的兩個 bug（都不是打錯字，是概念錯）：
 //    1. ΔT 是套在**相機**上（c2w_new = ΔT·c2w_old），所以作用在世界點上的是

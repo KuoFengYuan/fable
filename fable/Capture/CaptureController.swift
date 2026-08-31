@@ -31,20 +31,21 @@ final class CaptureController: NSObject, ObservableObject {
 
     // MARK: - UI 狀態
     @Published var phase: Phase = .idle
-    @Published var mode: ScanMode = .object
     @Published var assessment = QualityAssessment()
     @Published var keyframeCount = 0
     @Published var pointCount = 0
     /// 融合完成度：已被足夠多幀觀測的表面占比。場景模式沒有涵蓋率圓頂，
     /// 這是唯一能回答「掃夠了沒」的訊號；也比幀數有意義（站原地拍 100 幀是沒用的）。
     @Published var fusionCompleteness: Double = 0
-    @Published var coverage: Double = 0
-    @Published var coverageHint: String?   // 缺角提醒：往哪補掃（物件模式圓頂）
     @Published var exportedZip: URL?
     @Published var statusText: String?
-    @Published var domePlaced = false
     @Published var trackingReady = false
+    /// 即時點雲疊加。**預設顯示** —— RoomPlan 的即時線框已經關掉了，
+    /// 少了它，點雲就是掃描當下唯一能回答「這裡掃到了沒」的東西。
     @Published var showPointCloud = true
+    /// RoomPlan 即時結構疊加（牆／門／窗的發光邊框）。預設開啟：
+    /// 它直接回答「掃到哪了」，而且面積小、不擋畫面。
+    @Published var showRoomPlan = true
     /// 預覽點雲上色模式。掃描當下使用者最需要知道的不是顏色對不對，
     /// 而是「這塊融合夠了沒、要不要再繞一次」——熱圖直接把觀測不足的表面標紅。
     @Published var colorMode: PointColorMode = .rgb
@@ -94,6 +95,11 @@ final class CaptureController: NSObject, ObservableObject {
     @Published private(set) var relocalizing = false
     /// 迴環閉合提示：走遠之後提醒回起點，讓 ARKit 修正整條軌跡的累積漂移
     @Published private(set) var loopHint: String?
+    /// RoomPlan 的即時引導 ＋ 牆高不足提示（見 FloorPlanCapture.coachingHint）。
+    /// **這是平面圖品質最重要的一條回饋**：每一份實機 log 都是
+    /// 「2 牆、樓高 0.80m ⚠️ 掃描不完整」，而那行警告先前只在 review 才印 ——
+    /// 大範圍場景到那時已經不可能重走一遍。
+    @Published private(set) var floorPlanHint: String?
     /// 近 4 秒因清晰度不足而放棄的抓幀數（0 = 沒在掉幀）
     @Published private(set) var recentRejectCount = 0
     /// 掃描品質摘要，review 階段顯示（原本只印在 log 裡，使用者看不到）
@@ -123,8 +129,10 @@ final class CaptureController: NSObject, ObservableObject {
     private var lastTravelPosition: SIMD3<Float>?
     private var loopClosed = false
     private var lastWorldMapMB: Double?
-    /// BA 的每輪重投影 RMS（像素）。第 0 個是修正前 —— review 的摘要卡會顯示
-    private var baResidualsPx: [Float] = []
+    /// BA 的結果。**注意位姿不一定被套用**（config.baApplyPoses），
+    /// 所以摘要要一併記下「有沒有套用」與保留集判定，否則 baAfterPx 會被誤讀成
+    /// 「輸出的解析度天花板」，而實際輸出用的是 ARKit 位姿。
+    private var baResult: PoseRefineResult?
     /// 因清晰度不足而放棄抓幀的次數（診斷用：拿來判斷門檻是否過嚴）
     private var sharpnessRejects = 0
     /// 近幾秒被放棄的時間戳。用來即時告訴使用者「你正在掉幀」——
@@ -160,8 +168,17 @@ final class CaptureController: NSObject, ObservableObject {
 
         let viz = CoverageVisualizer(config: config)
         viz.attach(to: arView.scene)
-        viz.onCoverageChanged = { [weak self] c in self?.coverage = c }
-        viz.onGuidanceChanged = { [weak self] hint in self?.coverageHint = hint }
+        // 初始狀態必須在這裡套用一次 —— 先前只有 toggle 時才呼叫 setPointCloudHidden，
+        // 所以預設值改成 false 之後，第一次進畫面仍然會看到點雲。
+        viz.setPointCloudHidden(!showPointCloud)
+        viz.setRoomHidden(!showRoomPlan)
+        // RoomPlan 的即時面直接進渲染層，不繞 SwiftUI（每 0.4s 一組陣列，
+        // 走 @Published 等於每次都讓整個 HUD 重新求值）
+        floorPlan.onRoomUpdated = { [weak viz] surfaces in
+            viz?.updateRoomSurfaces(surfaces)
+            viz?.updateDollhouse(surfaces)
+        }
+        viz.setDollhouseHidden(!showRoomPlan)
         visualizer = viz
 
         runSession()
@@ -244,27 +261,6 @@ final class CaptureController: NSObject, ObservableObject {
         cameraControls.capExposureDuration()
     }
 
-    // MARK: - 物件模式：點擊放置涵蓋圓頂
-
-    func placeObjectAnchor(at point: CGPoint) {
-        guard phase == .idle, mode == .object, let arView else { return }
-        guard let query = arView.raycastQuery(from: point, allowing: .estimatedPlane, alignment: .any),
-              let hit = arView.session.raycast(query).first else {
-            statusText = "找不到表面，請將準心對準物件再點一次"
-            return
-        }
-        let p = hit.worldTransform.columns.3
-        // 圓頂中心略高於命中表面，較貼近物件幾何中心
-        let center = SIMD3<Float>(p.x, p.y, p.z) + SIMD3<Float>(0, 0.15, 0)
-        let camPos = arView.session.currentFrame.map { MatrixUtil.position($0.camera.transform) }
-            ?? (center + SIMD3<Float>(1, 0, 0))
-        // 把「使用者目前站位」當作標準拍攝半徑
-        let radius = max(0.4, simd_distance(camPos, center) * 0.9)
-        visualizer?.setObjectCenter(center, radius: radius)
-        domePlaced = true
-        statusText = "圓頂已放置，按快門開始掃描；繞行讓灰格全部變綠"
-    }
-
     // MARK: - 開始 / 停止
 
     func startScan() {
@@ -293,8 +289,9 @@ final class CaptureController: NSObject, ObservableObject {
         traveledM = 0
         loopClosed = false
         loopHint = nil
+        floorPlanHint = nil
         lastWorldMapMB = nil
-        baResidualsPx = []
+        baResult = nil
         scanSummary = nil
         phase = .scanning
         statusText = nil
@@ -312,25 +309,69 @@ final class CaptureController: NSObject, ObservableObject {
         let refined = snapshotRefinedTransforms()   // 必須在 pause 前讀 anchors
         let meshVerts = snapshotMeshVertices()      // 同上：pause 後 anchors 就讀不到了
         floorPlan.stopCapture()                     // 只是 stop()，最終資料由 delegate 稍後送達
+        let tStop = Date()
         Task {
-            // pause 必須等 RoomPlan 交回 CapturedRoomData 之後 —— session 一 pause
-            // 它就收不完那一段了。waitForSegment 自帶逾時，不會卡住匯出流程。
-            // 不在這裡等 RoomPlan（它要 8 秒以上）—— 那 8 秒使用者是乾等的。
-            // build() 自己會等（逾時 20s），而它現在跑在背景、不擋 review。
-            // 唯一的取捨是 ARSession 會早一點 pause；實測 RoomPlan 的最終優化
-            // 不需要新的幀，資料照樣送達。
-            await saveWorldMap()                    // 必須在 pause 之前：地圖要從活著的 session 取
-            arView?.session.pause()                 // review 期間停止追蹤，省電省熱
-            monitor.stop()
-            await processScan(refinedTransforms: refined, meshVertices: meshVerts)
+            // 世界地圖：只有「取圖」需要活著的 session，序列化不需要。
+            // 所以取完就把序列化丟到背景並與 processScan 並行 ——
+            // 先前是 await 整個存檔完成才開始後處理，那一整段是使用者的乾等，
+            // 而且序列化跑在 main actor 上，連進度條都動不了。
+            let box = await captureWorldMap()
+            let mapTask = Task { @MainActor [weak self] in
+                if let box { await self?.persistWorldMap(box) }
+            }
+
+            // **pause 必須等 RoomPlan 交回 CapturedRoomData** —— session 一停它就收不完。
+            //
+            // 這裡踩過一次坑：先前是「取完地圖立刻 pause」，而註解寫「實測資料照樣送達」。
+            // 那個實測成立是因為當時 pause 之前還夾著 saveWorldMap（序列化 10~40MB
+            // ＋ 兩次寫檔，1~3 秒），剛好給了 RoomPlan 送資料的時間。
+            // 把序列化搬到背景之後那段緩衝消失，平面圖就出不來了 ——
+            // 一個「加速」改動意外拿掉了另一件事賴以成立的前提。
+            //
+            // 正解是不要靠巧合：pause **不在使用者的等待路徑上**（使用者等的是
+            // processScan），所以讓它明確地等 RoomPlan，與後處理並行。
+            // 代價只是 ARSession 多活幾秒，而幀處理本來就被 phase != .scanning 擋掉了。
+            let roomTask = Task { @MainActor [weak self] in
+                await self?.floorPlan.waitForSegment(timeout: 12)
+                self?.arView?.session.pause()       // review 期間停止追蹤，省電省熱
+                self?.monitor.stop()
+            }
+
+            await processScan(refinedTransforms: refined, meshVertices: meshVerts, since: tStop)
+            // 兩者通常早就完成了；等一下只是確保摘要拿得到地圖大小、
+            // 以及 session 一定有被 pause 掉（不然 review 期間會一直吃電）
+            await mapTask.value
+            await roomTask.value
+            if scanSummary != nil { scanSummary?.worldMapMB = lastWorldMapMB }
         }
     }
 
-    private func processScan(refinedTransforms: [Int: [Double]], meshVertices: [SIMD3<Float>]) async {
+    private func processScan(refinedTransforms: [Int: [Double]], meshVertices: [SIMD3<Float>],
+                             since tStop: Date) async {
         guard let writer, let accumulator, let dir = sessionDir else {
             phase = .idle
             return
         }
+        // 分段計時從**按下停止**起算。先前 t0 設在重融合前面，於是「總計 1.81s」
+        // 完全不含世界地圖、BA、模糊複核 —— 一個叫「總計」卻不是總計的數字，
+        // 正是我在這個專案被誤導過三次的同一類錯誤。
+        var seg: [(String, Double)] = []
+        var tMark = tStop
+        func mark(_ name: String) {
+            seg.append((name, Date().timeIntervalSince(tMark)))
+            tMark = Date()
+        }
+        // 每一段都講出來，並且讓進度條涵蓋整條流程。
+        //
+        // 先前進度條只由重融合的回呼驅動，而重融合是**最後**一段 ——
+        // 前面三段使用者看到的是一條靜止在 0% 的進度條，那比沒有進度條更像卡住。
+        // 權重是暫定的：真實比例要等新的分段計時（見下方 mark）跑過實機才知道。
+        func stage(_ text: String, _ base: Double) {
+            statusText = text
+            exportProgress = base
+        }
+
+        stage("讀取關鍵幀…", 0)
         let raw = await writer.snapshotRecords()
         if !raw.isEmpty {
             let sharp = raw.map(\.sharpnessRatio).sorted()
@@ -360,25 +401,36 @@ final class CaptureController: NSObject, ObservableObject {
         // 位置在這裡的理由：
         //   · 必須在錨點修正**之後** —— 那是初值，BA 只做微調
         //   · 必須在 BlurFilter 與重融合**之前** —— 它們都吃姿態，晚了就白做
+        mark("讀取關鍵幀")
         if config.baRounds > 0 {
+            stage("校正相機位姿…", 0.10)
             let obs = await featureTracker.observations()
             print(await featureTracker.stats())
             let ba = BundleAdjuster.refine(records: refinedRecords, observations: obs,
                                            rounds: config.baRounds)
-            if ba.roundsApplied > 0 {
+            // ba.poses 只在保留集通過閘門時才非空（見 BundleAdjuster.kHoldoutGate）——
+            // 也就是「這次掃描的 BA 確實讓沒參與求解的 track 也變準了」。
+            if !ba.poses.isEmpty && config.baApplyPoses {
                 refinedRecords = refinedRecords.map { r in
                     guard let m = ba.poses[r.id] else { return r }
                     var out = r
                     out.transform = RefusionEngine.rowMajor(m)
                     return out
                 }
+            } else if !ba.poses.isEmpty {
+                // 一定要講出來。BA 的那幾行 log 照樣印，若不說「沒套用」，
+                // 看 log 的人（包括我自己）會以為輸出用的是修正後的位姿。
+                print("  ⚠️ 保留集通過但 config.baApplyPoses = false（硬總開關）"
+                      + " → 輸出仍用 ARKit＋錨點修正的位姿")
             }
-            baResidualsPx = ba.residualsPx
+            baResult = ba
         }
 
         // 模糊幀全域複核。必須在姿態修正**之後**：BlurFilter 靠位置/朝向找「看同一片表面」
         // 的鄰居，用未修正的姿態會找錯鄰居。判定寫回紀錄而非直接刪除，
         // poses_refined.jsonl 與 images/ 都保留完整，可回頭檢查判定對不對。
+        mark("位姿校正")
+        stage("複核模糊幀…", 0.35)
         refinedRecords = BlurFilter.annotate(refinedRecords)
         let dropped = refinedRecords.filter { $0.blurVerdict == .drop }.count
         let demoted = refinedRecords.filter { $0.blurVerdict == .demote }.count
@@ -395,40 +447,56 @@ final class CaptureController: NSObject, ObservableObject {
         // 「review 按平面圖」和「匯出」兩個時機才需要。
         // 改成背景建，好了再更新 @Published；review 的平面圖按鈕本來就綁 floorPlanData != nil，
         // 所以它會自己出現。
-        let t0 = Date()
+        mark("模糊複核")
         if config.captureFloorPlan, FloorPlanCapture.isSupported {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let fp = await self.floorPlan.build()
-                self.floorPlanData = fp
-                if let fp { self.logFloorPlan(fp) }
+                if let fp, !fp.walls.isEmpty {
+                    self.floorPlanData = fp
+                    self.logFloorPlan(fp)
+                } else {
+                    // RoomPlan 建不出東西（場景不是房間、或牆沒掃到）→ 退回點雲版。
+                    // 這比留一個空的平面圖有用：review 的按鈕綁 floorPlanData，
+                    // 沒有它使用者連「有沒有平面圖」都看不到。
+                    print("[FloorPlan] RoomPlan 沒有產出可用結構 → 改用點雲平面圖")
+                    self.usePointCloudPlan()
+                }
             }
         }
 
         var points: [CloudPoint] = []
-        var refuseSec: Double = 0
         if hasLiDAR && config.saveDepth && !refinedRecords.isEmpty {
+            stage("融合點雲…", 0.45)
             let records = refinedRecords
             let cfg = config
+            // 重融合佔進度條的後 55%（前面三段各自佔一段，見 stage）
             let onProg: @Sendable (Double) -> Void = { p in
-                Task { @MainActor [weak self] in self?.exportProgress = p }
+                Task { @MainActor [weak self] in self?.exportProgress = 0.45 + p * 0.55 }
             }
             let mesh = meshVertices
-            let tR = Date()
             points = await Task.detached(priority: .userInitiated) {
                 RefusionEngine.refuse(records: records, sessionDir: dir, config: cfg,
                                       meshVertices: mesh, progress: onProg)
             }.value
-            refuseSec = Date().timeIntervalSince(tR)
         }
         if points.isEmpty {                          // 無 LiDAR / 無深度時退回即時累積雲
             points = await accumulator.bestPoints(target: config.exportMaxPoints)
         }
+        mark("重融合")
 
-        print(String(format: "處理耗時: 總計 %.2fs（其中重融合 %.2fs；平面圖在背景建，不擋 review）",
-                     Date().timeIntervalSince(t0), refuseSec))
+        // 逐段列出，而且總計就是「按下停止到看到 review」的牆鐘時間 ——
+        // 這樣下次要優化才知道該動哪一段，不必再猜。
+        let total = seg.reduce(0) { $0 + $1.1 }
+        print(String(format: "處理耗時: 總計 %.2fs（按下停止 → review）= ", total)
+              + seg.map { String(format: "%@ %.2fs", $0.0, $0.1) }.joined(separator: " + ")
+              + "（世界地圖與平面圖在背景，不計入）")
 
         reviewPoints = points
+        // RoomPlan 沒開（或機型不支援）→ 平面圖直接用點雲版。
+        // 不這樣做的話 floorPlanData 永遠是 nil，review 的平面圖按鈕不會出現，
+        // 使用者要等到匯出才知道有沒有平面圖。
+        if !config.captureFloorPlan || !FloorPlanCapture.isSupported { usePointCloudPlan() }
         reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
         pointCount = points.count
         statusText = corrected > 0 ? "姿態已修正 \(corrected) 幀（ARKit 地圖優化）" : nil
@@ -677,6 +745,12 @@ final class CaptureController: NSObject, ObservableObject {
         visualizer?.setPointCloudHidden(!showPointCloud)
     }
 
+    func toggleRoomPlan() {
+        showRoomPlan.toggle()
+        visualizer?.setRoomHidden(!showRoomPlan)
+        visualizer?.setDollhouseHidden(!showRoomPlan)
+    }
+
     /// 切換「真實顏色 / 融合品質熱圖」。切換後必須把所有磚標記重畫，
     /// 否則只有之後才變動的磚會換色、畫面兩種配色混在一起。
     func toggleColorMode() {
@@ -694,10 +768,7 @@ final class CaptureController: NSObject, ObservableObject {
         statusText = nil
         keyframeCount = 0
         pointCount = 0
-        coverage = 0
-        coverageHint = nil
         exportProgress = 0
-        domePlaced = false
         reviewPoints = []
         reviewTrajectory = []
         refinedRecords = []
@@ -772,7 +843,7 @@ final class CaptureController: NSObject, ObservableObject {
         let meta = SessionMeta(device: Self.deviceModel(),
                                osVersion: UIDevice.current.systemVersion,
                                startedAt: ISO8601DateFormatter().string(from: Date()),
-                               mode: mode.rawValue,
+                               mode: "scene",   // 物件模式已移除；欄位保留給既有資料集相容
                                lidarAvailable: hasLiDAR)
         try ExportManager.writeMeta(meta, to: dir.appendingPathComponent("meta.json"))
     }
@@ -817,42 +888,96 @@ final class CaptureController: NSObject, ObservableObject {
     /// 座標維持 ARKit 原生（+Y up、公尺），與 points.ply / poses.jsonl 一致；
     /// 匯出 COLMAP 用的世界翻轉**不**套用在這裡 —— 那是 3DGS 生態的慣例，平面圖不需要。
     private func writeFloorPlan(to dir: URL) async {
-        guard config.captureFloorPlan, FloorPlanCapture.isSupported else { return }
-        // 平面圖是背景建的（見 processScan），匯出時若還沒好就在這裡等 ——
-        // 匯出是使用者明確要求的動作，少一個檔比多等幾秒糟。
-        if floorPlanData == nil { floorPlanData = await floorPlan.build() }
-        await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
+        // ── 點雲平面圖：不需要 RoomPlan，只要有掃到表面 ──
+        //
+        // 為什麼要有兩套：RoomPlan 是**房間**掃描器，它要有地板、成面的牆、
+        // 牆與天花板的交界才給得出正確結構；在辦公室隔間、貨架、桌面前它會把
+        // 螢幕邊桌緣硬判成牆，而且第一片判錯之後後續會跟著它對齊。
+        // 點雲沒有這個前提。所以兩者各自輸出、互不覆蓋，
+        // 使用者拿哪一份由現場決定，而不是由我事先猜。
+        // RoomPlan 關掉時 floorPlanData 已經是點雲版（見 processScan / usePointCloudPlan），
+        // 這裡不重算；只有它還空著（例如匯出比 review 早）才補一次。
+        if floorPlanData == nil { usePointCloudPlan() }
+
+        if config.captureFloorPlan, FloorPlanCapture.isSupported {
+            // 平面圖是背景建的（見 processScan），匯出時若還沒好就在這裡等 ——
+            // 匯出是使用者明確要求的動作，少一個檔比多等幾秒糟。
+            if floorPlanData == nil { floorPlanData = await floorPlan.build() }
+            await floorPlan.exportUSDZ(to: dir.appendingPathComponent("floorplan.usdz"))
+        }
         guard let fp = floorPlanData else { return }
+        writePlan(fp, to: dir, prefix: "floorplan")
+    }
+
+    /// 由已融合的點雲算出平面圖並填進 floorPlanData。
+    ///
+    /// 算一次就存著：review 的預覽、房間命名、匯出都吃同一份，
+    /// 不然使用者看到的圖和匯出的圖可能不是同一張（點雲不會變，但重算沒有意義）。
+    private func usePointCloudPlan() {
+        guard config.pointCloudFloorPlan, !reviewPoints.isEmpty else { return }
+        let pts = reviewPoints.map { SIMD3<Float>($0.x, $0.y, $0.z) }
+        guard let r = PointCloudFloorPlan.extract(points: pts) else {
+            print("點雲平面圖: 抽不出牆（點太少、或沒有垂直跨度足夠的表面）")
+            return
+        }
+        print(r.summary)
+        floorPlanData = r.plan
+    }
+
+    /// 一份平面圖的三種格式。
+    ///   .json — 參數化資料 ＋ 已投影到水平面的 2D 線段，給程式化後處理用
+    ///   .svg  — 直接看得到的俯視平面圖（含 1m 網格、牆長標註、比例尺）
+    ///   .dxf  — 帶圖層的 CAD 圖元，AutoCAD / QCAD / Rhino 直接開，可量可續繪
+    private func writePlan(_ fp: FloorPlanData, to dir: URL, prefix: String) {
         do {
             let enc = JSONEncoder()
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try enc.encode(fp).write(to: dir.appendingPathComponent("floorplan.json"),
+            try enc.encode(fp).write(to: dir.appendingPathComponent("\(prefix).json"),
                                      options: [.atomic])
             let svg = fp.svg(showAllFurniture: showPlanFurniture)
-            try Data(svg.utf8).write(to: dir.appendingPathComponent("floorplan.svg"),
+            try Data(svg.utf8).write(to: dir.appendingPathComponent("\(prefix).svg"),
                                      options: [.atomic])
+            try Data(FloorPlanDXF.make(fp).utf8)
+                .write(to: dir.appendingPathComponent("\(prefix).dxf"), options: [.atomic])
         } catch {
-            print("[FloorPlan] 寫檔失敗: \(error)")
+            print("[FloorPlan] 寫檔失敗（\(prefix)）: \(error)")
         }
     }
 
     /// 取出 ARKit 當下的地圖並存檔。必須在 session 還活著時呼叫。
     /// 追蹤狀態不佳時 ARKit 會拒絕給地圖（回 error）—— 那種地圖本來就不該留，
     /// 帶著它下次會一直重定位失敗。
-    private func saveWorldMap() async {
-        guard let session = arView?.session else { return }
-        let map: ARWorldMap? = await withCheckedContinuation { c in
+    /// 非 Sendable 的 ARKit 物件單向交給背景。交出後 main 這邊不再碰它，
+    /// 所以沒有共享可變狀態（與 Keyframe 的 pixelBuffer 同一個理由）。
+    private struct MapBox: @unchecked Sendable { let map: ARWorldMap }
+
+    /// 從**活著的** session 取出當下地圖。只有這一步需要 session，所以取完就能 pause。
+    private func captureWorldMap() async -> MapBox? {
+        guard let session = arView?.session else { return nil }
+        return await withCheckedContinuation { c in
             session.getCurrentWorldMap { m, error in
                 if let error { print("[WorldMap] 取得失敗（追蹤品質不足？）: \(error)") }
-                c.resume(returning: m)
+                c.resume(returning: m.map(MapBox.init))
             }
         }
-        guard let map else { return }
-        lastWorldMapMB = nil
-        if let bytes = WorldMapStore.save(map, sessionDir: sessionDir) {
-            lastWorldMapMB = Double(bytes) / 1_048_576
+    }
+
+    /// 序列化並寫檔。**必須離開 main actor。**
+    ///
+    /// 這是「按下停止之後的第一段乾等」的真正來源：ARWorldMap 動輒 10~40MB，
+    /// NSKeyedArchiver 是 CPU 密集的同步呼叫，先前直接跑在 main actor 上 ——
+    /// 不只擋住畫面，連重融合的進度條都動不了，於是使用者看到的是一段完全靜止的等待。
+    /// 而它跟後處理沒有任何依賴關係，本來就該平行。
+    private func persistWorldMap(_ box: MapBox) async {
+        let dir = sessionDir
+        let anchors = box.map.anchors.count
+        let bytes = await Task.detached(priority: .utility) {
+            WorldMapStore.save(box.map, sessionDir: dir)
+        }.value
+        lastWorldMapMB = bytes.map { Double($0) / 1_048_576 }
+        if let bytes {
             print(String(format: "世界地圖已保存 %.1f MB（%d 個錨點）—— 下次可選「延續上次座標系」",
-                         Double(bytes) / 1_048_576, map.anchors.count))
+                         Double(bytes) / 1_048_576, anchors))
         }
     }
 
@@ -882,6 +1007,15 @@ final class CaptureController: NSObject, ObservableObject {
             loopHint = String(format: "已走 %.0f m —— 走回起點閉環，讓 ARKit 修正累積漂移",
                               traveledM)
         }
+        // RoomPlan 的引導與牆高檢查。
+        //
+        // **為什麼在這裡同步而不是讓 HUD 直接讀 floorPlan**：SwiftUI 的
+        // @ObservedObject 不會觀察巢狀的 ObservableObject，所以 controller.floorPlan
+        // 改變時畫面不會更新。而這個專案沒有其他 Combine 訂閱，為了一個字串
+        // 引入一套 publisher 管線不划算 —— 照 loopHint 既有的做法逐幀同步即可。
+        // 只在值真的改變時寫入，否則每幀都會觸發一次 SwiftUI 更新。
+        let fpHint = floorPlan.coachingHint
+        if fpHint != floorPlanHint { floorPlanHint = fpHint }
     }
 
     /// 量化 ARKit 實際修正了多少漂移。
@@ -895,8 +1029,12 @@ final class CaptureController: NSObject, ObservableObject {
         s.blurDropped = refined.filter { $0.blurVerdict == .drop }.count
         s.blurDemoted = refined.filter { $0.blurVerdict == .demote }.count
         s.worldMapMB = lastWorldMapMB
-        s.baBeforePx = baResidualsPx.first
-        s.baAfterPx = baResidualsPx.last
+        s.baBeforePx = baResult?.residualsPx.first
+        s.baAfterPx = baResult?.residualsPx.last
+        // 這兩欄是為了讓摘要無法被誤讀：只有 baApplied 為真時，baAfterPx 才描述
+        // 實際輸出；否則輸出的天花板是 baBeforePx，而 baHoldoutDelta 是「若套用會怎樣」。
+        s.baApplied = config.baApplyPoses && !(baResult?.poses.isEmpty ?? true)
+        s.baHoldoutDelta = baResult?.holdoutDelta
         defer { scanSummary = s }
         let byID = Dictionary(uniqueKeysWithValues: raw.map { ($0.id, $0.transform) })
         var deltas: [Double] = []
@@ -1012,7 +1150,11 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         // 點雲連續融合（~10Hz，與快門解耦）：只收「姿態可靠 + 清晰 + 相機夠穩」的幀。
         // 追蹤丟失/模糊（captureBlocked, blurPixels）+ 相機速度閘門（angular/linear）三管齊下：
         // 移動過快時姿態延遲/誤差大 → 深度投影到錯位的世界座標 → 點不貼合表面且出殘影，故直接跳過。
-        if frameCounter % config.previewFrameInterval == 0,
+        // 取樣用「距上次融合隔了幾幀」而不是 frameCounter % N：
+        // 取模的話，被抽中的那一幀只要剛好稍微糊一點或轉快一點，
+        // **整個 0.1 秒的窗就整個丟掉**，要再等下一個倍數。
+        // 改成隔夠久就試，沒過就下一幀再試 —— 一有合格的幀立刻補上。
+        if frameCounter - lastPreviewFrame >= config.previewFrameInterval,
            !a.captureBlocked, a.blurPixels <= config.previewMaxBlurPixels,
            a.angularSpeedRadS <= config.previewMaxAngularSpeedRadS,
            a.linearSpeedMS <= config.previewMaxLinearSpeedMS {
@@ -1020,9 +1162,15 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
             integratePreview(frame, blurPixels: a.blurPixels)
         }
 
-        // 缺角提醒（物件模式圓頂）：每 ~12 幀（~5Hz）更新「離你最近的缺角在哪、往哪補」
-        if let viz = visualizer, viz.hasDome, frameCounter % 12 == 0 {
-            viz.updateGuidance(pose: frame.camera.transform)
+        // Dollhouse 擺位：**每幀**都要更新，不能像上面那樣抽幀 ——
+        // 它跟著視線走，抽幀會看起來一頓一頓的。內容只是一次 transform 賦值，
+        // 真正的重建是在 onRoomUpdated 那裡（節流 0.2s）。
+        //
+        // 用 pointOfView 而不是 frame.camera.transform：後者的座標系與介面方向無關
+        // （X 軸沿裝置長軸、Y 軸是 landscapeRight 的「上」），直向 App 拿它當
+        // 「下方」會偏到螢幕左邊。pointOfView 已經套過介面方向。
+        if showRoomPlan, let pov = arView?.pointOfView {
+            visualizer?.placeDollhouse(pov: pov.simdWorldTransform)
         }
 
         guard a.allowCapture else { return }
@@ -1042,11 +1190,12 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         guard shutter.shouldCapture(pose: frame.camera.transform,
                                     time: frame.timestamp,
                                     config: config) else { return }
-        // 關鍵幀一律也進預覽融合。預覽的閘門比關鍵幀嚴很多
-        // （10Hz 取樣 + 角速度 0.6 vs 1.0、線速度 0.5 vs 0.8、模糊 12 vs 16），
-        // 所以會出現「掃了、關鍵幀也存了，但預覽沒點」——停止後重融合才冒出來。
-        // 這會讓融合熱圖說謊：把其實會有點的區域標成缺點，害使用者去重掃已經夠的地方。
-        // 讓預覽的覆蓋 ⊇ 重融合會用到的，熱圖才有參考價值。
+        // 關鍵幀一律也進預覽融合 —— 保證「預覽的覆蓋 ⊇ 重融合會用到的」。
+        //
+        // 門檻本身已經對齊了（見 CaptureConfig.previewMax*，現在是關鍵幀門檻的衍生值），
+        // 但取樣仍是 10Hz，兩個關鍵幀之間可能都沒輪到融合。
+        // 這一行補上那個縫：只要成為關鍵幀就一定也融進預覽，
+        // 否則熱圖會把其實會有點的區域標成缺點，害使用者回去重掃不需要重掃的地方。
         if frameCounter != lastPreviewFrame {
             lastPreviewFrame = frameCounter
             integratePreview(frame, blurPixels: a.blurPixels)

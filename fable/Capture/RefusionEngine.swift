@@ -13,6 +13,7 @@
 import Foundation
 import CoreGraphics
 import ImageIO
+import os
 import simd
 
 // MARK: - 共用幾何工具
@@ -85,7 +86,7 @@ nonisolated struct FusedVoxelGrid {
         var color: SIMD3<Float>     // 加權平均顏色（0-255）
         var weight: Float           // 累積權重（封頂 → 指數移動平均，晚到的好觀測仍能修正）
         var bestScore: Float
-        /// 是否曾收到「量測」點（LiDAR 直接反投影）。false ＝ 這格只有推論來源（mesh/MDE）撐著。
+        /// 是否曾收到「量測」點（LiDAR 直接反投影）。false ＝ 這格只有推論來源（ARKit mesh）撐著。
         /// 用來量化補充來源的實際貢獻：只有 measured==false 的格子才是真的補到新覆蓋。
         /// 預設 true —— 即時預覽的 TiledFusedGrid 共用本型別但不追蹤來源。
         var measured: Bool = true
@@ -97,63 +98,124 @@ nonisolated struct FusedVoxelGrid {
         var dirMask: UInt16 = 0
     }
 
-    private(set) var cells: [Int64: Cell] = [:]
+    /// 分片字典。
+    ///
+    /// **插入是重融合唯一不能平行的一段。** 逐幀的檔案讀取／JPEG 解碼／反投影／
+    /// mesh 投影都是純函式（見 RefusionEngine.refuse 的 produce，已經平行化），
+    /// 但它們最後都要寫進同一張表。而這一段是隨幀數線性成長的 ——
+    /// 實測 54 幀 1.81s，走 60m 的整層掃描約 600 幀，線性外推就是 20 秒。
+    ///
+    /// 以 voxel key 分片後，每片是獨立字典 → N 條 lane 可以同時寫。
+    ///
+    /// **輸出與單片版逐位元相同。** cell → 分片是確定性的，而同一分片內的點仍照
+    /// 原順序處理，所以每個 cell 收到的觀測序列一模一樣。這一點必須守住：
+    /// 加權平均在權重封頂（weightCap）之後是順序相依的，
+    /// 若順序隨執行緒排程而變，同一份掃描資料會融出不同的點雲。
+    private var shards: [[Int64: Cell]]
+    private let shardMask: Int64
     private(set) var voxelSize: Float
     private let maxCells: Int
     private let weightCap: Float = 8
 
+    /// 分片數取 2 的冪且明顯多於核心數 —— 分堆才平均，lane 之間也不必等最慢的一片
+    private static let shardCount = 16
+
     init(voxelSize: Float, maxCells: Int) {
         self.voxelSize = voxelSize
         self.maxCells = maxCells
+        self.shards = Array(repeating: [:], count: Self.shardCount)
+        self.shardMask = Int64(Self.shardCount - 1)
     }
 
-    var count: Int { cells.count }
-    /// 只有推論來源（mesh/MDE）覆蓋、LiDAR 完全沒打到的格子數 ＝ 補充來源的實際新增覆蓋
-    var inferredOnlyCount: Int { cells.values.reduce(0) { $1.measured ? $0 : $0 + 1 } }
+    /// voxel key 是 `(ix << 42) | (iy << 21) | iz`，空間上高度結構化 ——
+    /// 直接取低位等於只用 z 分片，掃描面若接近水平就會全擠在同一片。
+    /// 三軸互斥或之後再取低位，任何掃描姿態都散得開。
+    @inline(__always)
+    private func shardIndex(_ key: Int64) -> Int {
+        Int((key ^ (key >> 21) ^ (key >> 42)) & shardMask)
+    }
 
-    /// - measured: true ＝ LiDAR 直接反投影（量測）；false ＝ mesh / MDE（推論）
+    var count: Int { shards.reduce(0) { $0 + $1.count } }
+    /// 各分片的格數。分片若散不開，平行化就沒有意義（例如只用低位＝只用 z 軸分片時，
+    /// 水平面會全擠在同一片）—— tools/test_voxel_shard.swift 用它驗證分佈。
+    func shardOccupancy() -> [Int] { shards.map(\.count) }
+    /// 只有推論來源（ARKit mesh）覆蓋、LiDAR 完全沒打到的格子數 ＝ 補充來源的實際新增覆蓋
+    var inferredOnlyCount: Int {
+        shards.reduce(0) { acc, s in acc + s.values.reduce(0) { $1.measured ? $0 : $0 + 1 } }
+    }
+
+    /// - measured: true ＝ LiDAR 直接反投影（量測）；false ＝ ARKit 場景網格（推論）
     mutating func insert(_ candidates: [CloudPoint], measured: Bool = true) {
+        guard !candidates.isEmpty else { return }
+        // 先分堆（保序），再各片平行寫入
+        let n = shards.count
+        var byShard = [[(key: Int64, pt: CloudPoint)]](repeating: [], count: n)
+        let guess = candidates.count / n + 8
+        for i in 0..<n { byShard[i].reserveCapacity(guess) }
         for pt in candidates {
-            let pos = SIMD3<Float>(pt.x, pt.y, pt.z)
-            guard let key = PointCloudMath.voxelKey(pos, size: voxelSize) else { continue }
-            let rgb = SIMD3<Float>(Float(pt.r), Float(pt.g), Float(pt.b))
-            if var cell = cells[key] {
-                let w = max(0.01, pt.score)
-                let total = cell.weight + w
-                cell.mean += (pos - cell.mean) * (w / total)
-                cell.color += (rgb - cell.color) * (w / total)
-                cell.weight = min(total, weightCap)
-                cell.bestScore = max(cell.bestScore, pt.score)
-                cell.measured = cell.measured || measured
-                cells[key] = cell
-            } else {
-                cells[key] = Cell(mean: pos, color: rgb,
-                                  weight: max(0.01, pt.score), bestScore: pt.score,
-                                  measured: measured)
-                if cells.count >= maxCells { coarsen() }
+            guard let key = PointCloudMath.voxelKey(SIMD3<Float>(pt.x, pt.y, pt.z),
+                                                    size: voxelSize) else { continue }
+            byShard[shardIndex(key)].append((key, pt))
+        }
+        let cap = weightCap
+        shards.withUnsafeMutableBufferPointer { buf in
+            DispatchQueue.concurrentPerform(iterations: n) { s in
+                for (key, pt) in byShard[s] {
+                    let pos = SIMD3<Float>(pt.x, pt.y, pt.z)
+                    let rgb = SIMD3<Float>(Float(pt.r), Float(pt.g), Float(pt.b))
+                    if var cell = buf[s][key] {
+                        let w = max(0.01, pt.score)
+                        let total = cell.weight + w
+                        cell.mean += (pos - cell.mean) * (w / total)
+                        cell.color += (rgb - cell.color) * (w / total)
+                        cell.weight = min(total, cap)
+                        cell.bestScore = max(cell.bestScore, pt.score)
+                        cell.measured = cell.measured || measured
+                        buf[s][key] = cell
+                    } else {
+                        buf[s][key] = Cell(mean: pos, color: rgb,
+                                           weight: max(0.01, pt.score), bestScore: pt.score,
+                                           measured: measured)
+                    }
+                }
             }
         }
+        // 觸頂檢查移到批次之後：原本每插入一個新格就查一次全域數量，
+        // 分片之後那會變成每點一次跨片加總。代價是可能短暫超出上限一個批次的量，
+        // 而一個批次只有一幀的點（~49k），相對 2M 的上限可以忽略。
+        if count >= maxCells { coarsen() }
     }
 
-    /// 觸頂自動粗化：voxel ×2、加權合併 —— 長掃描記憶體有界且不停止收點
+    /// 觸頂自動粗化：voxel ×2、加權合併 —— 長掃描記憶體有界且不停止收點。
+    ///
+    /// **逐片搬移並即時釋放，不要先建好整份新表再換掉。**
+    /// 那樣峰值是兩份完整的表（4M 格 × ~75B ≈ 300MB，兩份就 600MB），
+    /// 而觸頂粗化正好發生在記憶體已經最吃緊的時候 —— 大場景、關鍵幀與點雲都還在。
+    /// 實機大場景「融合點雲時閃退」就是在這裡被系統砍掉的。
+    /// 逐片釋放之後峰值降到「舊表剩下的部分 ＋ 新表」，
+    /// 而粗化本來就會把格數砍成約 1/4，所以實際峰值接近 1.25 份而不是 2 份。
     private mutating func coarsen() {
         voxelSize *= 2
-        var merged: [Int64: Cell] = Dictionary(minimumCapacity: cells.count / 4)
-        for cell in cells.values {
-            guard let key = PointCloudMath.voxelKey(cell.mean, size: voxelSize) else { continue }
-            if var m = merged[key] {
-                let total = m.weight + cell.weight
-                m.mean += (cell.mean - m.mean) * (cell.weight / total)
-                m.color += (cell.color - m.color) * (cell.weight / total)
-                m.weight = min(total, weightCap)
-                m.bestScore = max(m.bestScore, cell.bestScore)
-                m.measured = m.measured || cell.measured
-                merged[key] = m
-            } else {
-                merged[key] = cell
+        var merged = [[Int64: Cell]](repeating: [:], count: shards.count)
+        for si in shards.indices {
+            for cell in shards[si].values {
+                guard let key = PointCloudMath.voxelKey(cell.mean, size: voxelSize) else { continue }
+                let s = shardIndex(key)
+                if var m = merged[s][key] {
+                    let total = m.weight + cell.weight
+                    m.mean += (cell.mean - m.mean) * (cell.weight / total)
+                    m.color += (cell.color - m.color) * (cell.weight / total)
+                    m.weight = min(total, weightCap)
+                    m.bestScore = max(m.bestScore, cell.bestScore)
+                    m.measured = m.measured || cell.measured
+                    merged[s][key] = m
+                } else {
+                    merged[s][key] = cell
+                }
             }
+            shards[si] = [:]        // 這一片搬完就放掉，不要等到全部搬完
         }
-        cells = merged
+        shards = merged
     }
 
     /// 26 鄰域方向（單位格offset）
@@ -171,22 +233,27 @@ nonisolated struct FusedVoxelGrid {
         func c8(_ f: Float) -> UInt8 { UInt8(min(255, max(0, f))) }
         let vs = voxelSize
         var points: [CloudPoint] = []
-        points.reserveCapacity(cells.count)
-        for cell in cells.values {
-            if minNeighbors > 0 {
-                var n = 0
-                for o in Self.neighborOffsets {
-                    let np = cell.mean + o * vs
-                    if let k = PointCloudMath.voxelKey(np, size: vs), cells[k] != nil {
-                        n += 1
-                        if n >= minNeighbors { break }
+        points.reserveCapacity(count)
+        for shard in shards {
+            for cell in shard.values {
+                if minNeighbors > 0 {
+                    var n = 0
+                    for o in Self.neighborOffsets {
+                        let np = cell.mean + o * vs
+                        // 鄰格可能落在別的分片 —— 查詢必須先算分片，不能只查自己這片
+                        if let k = PointCloudMath.voxelKey(np, size: vs),
+                           shards[shardIndex(k)][k] != nil {
+                            n += 1
+                            if n >= minNeighbors { break }
+                        }
                     }
+                    if n < minNeighbors { continue }   // 孤立 → 飄浮雜點，丟棄
                 }
-                if n < minNeighbors { continue }   // 孤立 → 飄浮雜點，丟棄
+                points.append(CloudPoint(x: cell.mean.x, y: cell.mean.y, z: cell.mean.z,
+                                         r: c8(cell.color.x), g: c8(cell.color.y),
+                                         b: c8(cell.color.z),
+                                         score: cell.bestScore * min(1, cell.weight / 1.5)))
             }
-            points.append(CloudPoint(x: cell.mean.x, y: cell.mean.y, z: cell.mean.z,
-                                     r: c8(cell.color.x), g: c8(cell.color.y), b: c8(cell.color.z),
-                                     score: cell.bestScore * min(1, cell.weight / 1.5)))
         }
         // 起始格距用原生 voxelSize：加粗多少交給解析步長決定。
         // 先前預設 ×2 等於還沒開始就先砍掉 4 倍的點。
@@ -205,37 +272,45 @@ nonisolated enum RefusionEngine {
     static func refuse(records: [FrameRecord], sessionDir: URL, config: CaptureConfig,
                        meshVertices: [SIMD3<Float>] = [],
                        progress: @Sendable (Double) -> Void) -> [CloudPoint] {
-        // 先做位姿微調：位姿誤差是 3DGS 的解析度天花板（1cm @2m ≈ 7px 重投影），
-        // 修位姿之前先做高品質融合是本末倒置 —— 融出來的共識會帶著同樣的誤差。
-        var records = records
-        if config.poseRefineRounds > 0 {
-            let refined = refinePoses(records: records, sessionDir: sessionDir, config: config)
-            if refined.roundsApplied > 0 {
-                records = records.map { r in
-                    guard let m = refined.poses[r.id] else { return r }
-                    var out = r
-                    out.transform = rowMajor(m)
-                    return out
-                }
-            }
-        }
+        // 位姿在進來之前就已經定案（ARKit ＋ 錨點修正，必要時再加 BA ——
+        // 見 CaptureController.processScan）。這裡只負責融合。
+        //
+        // 先前這裡還有一條「以融合點雲為固定結構做幾何對齊」的路徑，已刪除：
+        // 它用 voxel 佔用建立對應，而離線測試證明那在最該修正的方向（平面法向）
+        // 完全收不到訊號 —— 沿法向偏 3cm 時 0/40000 點有對應。留著只是死碼。
+        // 重投影誤差沒有這個盲點，那條路走 BundleAdjuster。
 
-        var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM, maxCells: config.refuseMaxCells)
+        var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM,
+                                  maxCells: safeMaxCells(config.refuseMaxCells))
         let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
         let imagesDir = sessionDir.appendingPathComponent("images", isDirectory: true)
         let total = max(1, records.count)
-        // 模型不在 bundle 裡就是 nil → 整條 MDE 路徑靜默略過，行為與改動前相同
-        let mde: DepthDensifier? = config.useMDEHoleFill ? DepthDensifier() : nil
-        var mdeAccepted = 0, mdePoints = 0
-        // 分段計時：先前只能靠估算猜哪一段慢，實際數字才有依據
-        var tUnproject: Double = 0, tMesh: Double = 0, tDecode: Double = 0
+        // 分段計時：先前只能靠估算猜哪一段慢，實際數字才有依據。
+        // tProduce 與 tInsert 一定要分開 —— 前者可以平行、後者不行（共享 grid），
+        // 先前兩者混在同一個 tUnproject 裡，等於看不出並行化的上限在哪。
+        var tProduce: Double = 0, tInsert: Double = 0, tMesh: Double = 0, tDecode: Double = 0
 
-        for (i, r) in records.enumerated() {
-            defer { progress(Double(i + 1) / Double(total)) }
+        /// 一幀的產出。純函式、不碰共享狀態 —— 所以可以平行跑。
+        struct FrameYield {
+            var measured: [CloudPoint] = []
+            var mesh: [CloudPoint] = []
+            var decodeSec: Double = 0
+            var meshSec: Double = 0
+        }
+
+        func produce(_ r: FrameRecord) -> FrameYield {
+            var y = FrameYield()
+            // 幾何不可信的幀直接跳過：它的深度會被反投影到錯的世界座標，疊出殘影／雙層殼。
+            // 殘影比破洞更糟 —— 破洞看得出來，殘影會被當成真的幾何。
+            // 注意這裡**不**跳過 .demote：那些只是顏色糊，幾何來自 LiDAR、照樣可信，
+            // 丟了只會白白開洞。它們改以降權併入（見下）。
+            //
+            // 這個檢查先前排在 JPEG 解碼**之後** —— 被排除的幀白白付了一次解碼。
+            if r.blurVerdict == .drop { return y }
             guard let depthFile = r.depthFile,
                   let dw = r.depthWidth, let dh = r.depthHeight, dw > 0, dh > 0,
                   let depth = try? Data(contentsOf: depthDir.appendingPathComponent(depthFile)),
-                  depth.count == dw * dh * 4 else { continue }
+                  depth.count == dw * dh * 4 else { return y }
 
             var conf: [UInt8]?
             if let confFile = r.confidenceFile,
@@ -245,14 +320,8 @@ nonisolated enum RefusionEngine {
             }
             let tD = Date()
             guard let rgba = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
-                                        width: dw, height: dh) else { continue }
-            tDecode += Date().timeIntervalSince(tD)
-
-            // 幾何不可信的幀直接跳過：它的深度會被反投影到錯的世界座標，疊出殘影／雙層殼。
-            // 殘影比破洞更糟 —— 破洞看得出來，殘影會被當成真的幾何。
-            // 注意這裡**不**跳過 .demote：那些只是顏色糊，幾何來自 LiDAR、照樣可信，
-            // 丟了只會白白開洞。它們改以降權併入（見下）。
-            if r.blurVerdict == .drop { continue }
+                                        width: dw, height: dh) else { return y }
+            y.decodeSec = Date().timeIntervalSince(tD)
 
             let K = r.intrinsics.scaled(toWidth: dw, height: dh)
             let c2w = float4x4(rowMajor: r.transform)
@@ -260,50 +329,74 @@ nonisolated enum RefusionEngine {
             // 原本只看 estimatedBlurPx，於是「相機拿得很穩但失焦」的幀拿到滿分權重，
             // 它糊掉的顏色會主導那格的加權平均 —— 這是實測清晰度才看得到的破口。
             let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
-            let tU = Date()
-            grid.insert(unprojectStored(depth: depth, conf: conf, rgba: rgba,
-                                        dw: dw, dh: dh, K: K, c2w: c2w,
-                                        config: config, sharpness: sharpness))
-            tUnproject += Date().timeIntervalSince(tU)
+            y.measured = unprojectStored(depth: depth, conf: conf, rgba: rgba,
+                                         dw: dw, dh: dh, K: K, c2w: c2w,
+                                         config: config, sharpness: sharpness)
             // mesh 頂點：投影進本幀取色。同一頂點會被多幀命中 → 由 voxel 加權平均做多視角混色。
             if !meshVertices.isEmpty {
                 let tM = Date()
-                grid.insert(projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
-                                        K: K, c2w: c2w, config: config, sharpness: sharpness),
-                            measured: false)
-                tMesh += Date().timeIntervalSince(tM)
+                y.mesh = projectMesh(meshVertices, depth: depth, rgba: rgba, dw: dw, dh: dh,
+                                     K: K, c2w: c2w, config: config, sharpness: sharpness)
+                y.meshSec = Date().timeIntervalSince(tM)
             }
-            // MDE 補洞：只在 LiDAR 無回波處產生點
-            if let mde, config.useMDEHoleFill,
-               let hiRGBA = decodeRGBA(url: imagesDir.appendingPathComponent(r.imageFile),
-                                       width: mde.width, height: mde.height),
-               let disp = mde.inferDisparity(rgba: hiRGBA) {
-                let hiK = r.intrinsics.scaled(toWidth: mde.width, height: mde.height)
-                let pts = mdeHoleFill(disp: disp, hiRGBA: hiRGBA, mw: mde.width, mh: mde.height,
-                                      hiK: hiK, depth: depth, conf: conf, dw: dw, dh: dh,
-                                      c2w: c2w, config: config, sharpness: sharpness)
-                mdeAccepted += pts.isEmpty ? 0 : 1
-                mdePoints += pts.count
-                grid.insert(pts, measured: false)
+            return y
+        }
+
+        // 分批：批內平行產出、批間序列插入。
+        //
+        // **為什麼分批而不是一次全平行。** 一次全平行要同時持有所有幀的點：
+        // 54 幀 × 49152 點 × 20B ≈ 53MB，而整屋掃描的 200 幀會到 220MB ——
+        // 這個 App 已經對記憶體敏感（點雲＋訓練都在同一台手機上）。
+        // 分批把峰值壓在「批大小 × 每幀點數」，同時仍然吃滿核心。
+        let lanes = max(1, min(8, ProcessInfo.processInfo.activeProcessorCount - 1))
+        var done = 0
+        var i = 0
+        while i < records.count {
+            let n = min(lanes, records.count - i)
+            var batch = [FrameYield](repeating: FrameYield(), count: n)
+            let tP = Date()
+            if n == 1 {
+                batch[0] = produce(records[i])
+            } else {
+                // 每條 lane 只寫自己那一格 → 沒有交疊，不需要鎖
+                batch.withUnsafeMutableBufferPointer { buf in
+                    DispatchQueue.concurrentPerform(iterations: n) { k in
+                        buf[k] = produce(records[i + k])
+                    }
+                }
             }
+            tProduce += Date().timeIntervalSince(tP)
+
+            let tI = Date()
+            for y in batch {
+                grid.insert(y.measured)
+                if !y.mesh.isEmpty { grid.insert(y.mesh, measured: false) }
+                tDecode += y.decodeSec
+                tMesh += y.meshSec
+                done += 1
+                progress(Double(done) / Double(total))
+            }
+            tInsert += Date().timeIntervalSince(tI)
+            i += n
         }
         // 診斷：這條鏈上有三處會悄悄粗化解析度（融合格觸頂、匯出擇優下採樣、訓練高斯預算），
         // 而初始點距直接決定初始高斯大小（msplat 的初始 scale = 3-NN 距離）。
         // 過去完全沒有數字，訓練端看到 15cm 的初始高斯卻無從得知是哪一段造成的。
-        print(String(format: "  重融合分段: 反投影+插入 %.2fs、mesh 投影 %.2fs、"
-                     + "JPEG 解碼 %.2fs（%d 幀）",
-                     tUnproject, tMesh, tDecode, records.count))
+        // 產出（可平行，牆鐘時間已除以 lanes）與插入（不可平行，共享 grid）分開報。
+        // 解碼/mesh 是各 lane 的 CPU 時間總和，會大於牆鐘 —— 那正是被並行吃掉的部分。
+        print(String(format: "  重融合分段: 產出 %.2fs（%d 路平行；其中 CPU 時間 "
+                     + "JPEG 解碼 %.2fs、mesh 投影 %.2fs）、插入 grid %.2fs（序列）、%d 幀",
+                     tProduce, lanes, tDecode, tMesh, tInsert, records.count))
         let rawCells = grid.count
         let inferredOnly = grid.inferredOnlyCount
         let gridVoxel = grid.voxelSize
+        let tE = Date()
         let out = grid.exportPoints(target: config.exportMaxPoints,
                                     minNeighbors: config.refuseMinNeighbors)
+        print(String(format: "  匯出擇優 %.2fs（%d 格 → %d 點）",
+                     Date().timeIntervalSince(tE), rawCells, out.count))
         var msg = "Refusion: \(records.count) frames"
         if !meshVertices.isEmpty { msg += " + \(meshVertices.count) mesh verts" }
-        if config.useMDEHoleFill {
-            msg += mde == nil ? " (MDE: 模型未載入)"
-                              : " + MDE \(mdePoints) 點/\(mdeAccepted) 幀"
-        }
         msg += " -> \(rawCells) cells @ "
         msg += String(format: "%.3f", gridVoxel) + "m"
         if gridVoxel > config.refuseVoxelSizeM {
@@ -313,7 +406,7 @@ nonisolated enum RefusionEngine {
         msg += " -> 匯出 \(out.count) 點（上限 \(config.exportMaxPoints)）"
         if inferredOnly > 0 {
             let pct = Double(inferredOnly) * 100 / Double(max(1, rawCells))
-            msg += String(format: "；其中 %d 格(%.1f%%) 是 LiDAR 沒覆蓋、只靠 mesh/MDE 撐著",
+            msg += String(format: "；其中 %d 格(%.1f%%) 是 LiDAR 沒覆蓋、只靠 ARKit mesh 撐著",
                           inferredOnly, pct)
         }
         if out.count < rawCells {
@@ -329,143 +422,6 @@ nonisolated enum RefusionEngine {
         (0..<4).flatMap { r in (0..<4).map { c in Double(m[c][r]) } }
     }
 
-    /// 位姿微調：以「所有幀共同融出的點雲」為固定結構，逐幀求剛體修正量。
-    ///
-    /// 為什麼先做這一步：位姿誤差是 3DGS 的解析度天花板（1cm @2m ≈ 7px 重投影誤差，
-    /// 高斯縮得比它小就會被各視角的矛盾懲罰）。在修位姿之前先做高品質融合是本末倒置 ——
-    /// 融出來的共識會帶著同樣的誤差。
-    ///
-    /// 用粗取樣（poseRefineStride）跑，因為 6 個未知數不需要全像素：
-    /// 256×192 在 stride 3 下每幀約 5400 點，遠超所需，而每輪重建成本降到 1/9。
-    ///
-    /// **自我驗證**：每輪比對殘差，沒下降就回退並停止。所以預設開啟不會把資料改壞 ——
-    /// 最壞情況等於沒做。
-    static func refinePoses(records: [FrameRecord], sessionDir: URL,
-                            config: CaptureConfig) -> PoseRefineResult {
-        let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
-        let stride = max(1, config.poseRefineStride)
-
-        // 相機座標的點只讀一次；每輪用當下的位姿轉到世界，避免重複 IO 與反投影
-        struct Frame {
-            let id: Int
-            var c2w: simd_float4x4
-            let camLocal: [SIMD3<Float>]
-        }
-        var frames: [Frame] = []
-        for r in records where r.blurVerdict != .drop {
-            guard let depthFile = r.depthFile, let dw = r.depthWidth, let dh = r.depthHeight,
-                  dw > 0, dh > 0,
-                  let depth = try? Data(contentsOf: depthDir.appendingPathComponent(depthFile)),
-                  depth.count == dw * dh * 4 else { continue }
-            var conf: [UInt8]?
-            if let cf = r.confidenceFile,
-               let cd = try? Data(contentsOf: depthDir.appendingPathComponent(cf)),
-               cd.count == dw * dh { conf = [UInt8](cd) }
-
-            let K = r.intrinsics.scaled(toWidth: dw, height: dh)
-            let fx = Float(K.fx), fy = Float(K.fy), cx = Float(K.cx), cy = Float(K.cy)
-            let minD = config.pointMinDepthM, maxD = config.pointMaxDepthM
-            var local: [SIMD3<Float>] = []
-            local.reserveCapacity((dw / stride) * (dh / stride))
-            depth.withUnsafeBytes { raw in
-                let d = raw.bindMemory(to: Float32.self)
-                var v = 0
-                while v < dh {
-                    var u = 0
-                    while u < dw {
-                        let i = v * dw + u
-                        let z = d[i]
-                        // 微調只用 high confidence：這一步求的是位姿，寧可少也要準
-                        if z.isFinite, z > minD, z < maxD, (conf?[i] ?? 2) >= 2 {
-                            local.append(SIMD3<Float>((Float(u) - cx) / fx * z,
-                                                      -((Float(v) - cy) / fy * z), -z))
-                        }
-                        u += stride
-                    }
-                    v += stride
-                }
-            }
-            guard local.count >= PoseRefiner.kMinCorrespondences else { continue }
-            frames.append(Frame(id: r.id, c2w: float4x4(rowMajor: r.transform), camLocal: local))
-        }
-        var result = PoseRefineResult()
-        guard frames.count >= 3 else { return result }
-
-        @inline(__always) func world(_ f: Frame) -> [SIMD3<Float>] {
-            f.camLocal.map { p in
-                let w = f.c2w * SIMD4<Float>(p, 1)
-                return SIMD3<Float>(w.x, w.y, w.z)
-            }
-        }
-        func buildGrid() -> FusedVoxelGrid {
-            var g = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM,
-                                   maxCells: config.refuseMaxCells)
-            for f in frames {
-                g.insert(world(f).map { CloudPoint(x: $0.x, y: $0.y, z: $0.z,
-                                                   r: 0, g: 0, b: 0, score: 1) })
-            }
-            return g
-        }
-
-        var best = frames.map(\.c2w)
-        for round in 0..<config.poseRefineRounds {
-            let grid = buildGrid()
-            var deltas: [Int: simd_float4x4] = [:]
-            var sumSq: Double = 0
-            var counted = 0
-            for (idx, f) in frames.enumerated() {
-                let wp = world(f)
-                let camPos = SIMD3<Float>(f.c2w.columns.3.x, f.c2w.columns.3.y, f.c2w.columns.3.z)
-                guard let (delta, rms) = PoseRefiner.solveRigid(worldPoints: wp, camPos: camPos,
-                                                               grid: grid) else { continue }
-                deltas[idx] = delta
-                sumSq += rms * rms
-                counted += 1
-            }
-            guard counted > 0 else { break }
-            let residual = (sumSq / Double(counted)).squareRoot()
-
-            // 第一輪的殘差就是「修正前」的基準
-            if result.residualsM.isEmpty { result.residualsM.append(residual) }
-            else if residual >= result.residualsM.last! {
-                // 沒有變好 → 回退到上一輪並停止（自我驗證）
-                for (i, m) in best.enumerated() { frames[i].c2w = m }
-                break
-            } else {
-                result.residualsM.append(residual)
-            }
-
-            PoseRefiner.removeGlobalDrift(&deltas)
-            best = frames.map(\.c2w)
-            for (idx, d) in deltas { frames[idx].c2w = d * frames[idx].c2w }
-            result.roundsApplied = round + 1
-        }
-
-        // 最後一輪套用後還要再量一次，否則 residualsM 少了最終值
-        if result.roundsApplied > 0 {
-            let grid = buildGrid()
-            var sumSq: Double = 0, counted = 0
-            for f in frames {
-                let camPos = SIMD3<Float>(f.c2w.columns.3.x, f.c2w.columns.3.y, f.c2w.columns.3.z)
-                if let (_, rms) = PoseRefiner.solveRigid(worldPoints: world(f), camPos: camPos,
-                                                        grid: grid) {
-                    sumSq += rms * rms; counted += 1
-                }
-            }
-            if counted > 0 { result.residualsM.append((sumSq / Double(counted)).squareRoot()) }
-            for f in frames { result.poses[f.id] = f.c2w }
-        }
-
-        if let a = result.residualsM.first, let b = result.residualsM.last {
-            print(String(format: "位姿微調: %d 幀 × %d 輪 → 殘差 %.2f → %.2f cm"
-                         + "（等效 2m 處重投影 %.1f → %.1f px，改善 %.0f%%）",
-                         frames.count, result.roundsApplied, a * 100, b * 100,
-                         PoseRefineResult.pixelsAt2m(a), PoseRefineResult.pixelsAt2m(b),
-                         result.improvedPercent))
-        }
-        return result
-    }
-
     static func float4x4(rowMajor m: [Double]) -> simd_float4x4 {
         simd_float4x4(columns: (
             SIMD4<Float>(Float(m[0]), Float(m[4]), Float(m[8]), Float(m[12])),
@@ -474,131 +430,16 @@ nonisolated enum RefusionEngine {
             SIMD4<Float>(Float(m[3]), Float(m[7]), Float(m[11]), Float(m[15]))))
     }
 
-    /// 與 PointExtractor 相同的過濾/評分（信心、範圍、飛點、中心/距離/清晰分數），
-    /// 來源改為緊湊 Data（無 stride padding）
-    /// MDE 補洞：用同幀 LiDAR 擬合仿射還原（1/z ≈ a·d + b），只在 LiDAR 無回波處產生點。
-    ///
-    /// ROI-aware 取樣（論文用語意分割，我們用更便宜的等價物）：補洞點的取樣密度 ∝ 局部
-    /// RGB 梯度能量 —— 平坦牆面補稀、紋理複雜處補密。同一個訊號也用在 MRNF 的細節引導上。
-    private static func mdeHoleFill(disp: [Float], hiRGBA: [UInt8], mw: Int, mh: Int,
-                                    hiK: CameraIntrinsics,
-                                    depth: Data, conf: [UInt8]?, dw: Int, dh: Int,
-                                    c2w: simd_float4x4, config: CaptureConfig,
-                                    sharpness: Float) -> [CloudPoint] {
-        let minD = config.pointMinDepthM, maxD = config.pointMaxDepthM
-        let minConf = config.minDepthConfidence
-
-        return depth.withUnsafeBytes { raw -> [CloudPoint] in
-            let d = raw.bindMemory(to: Float32.self)
-
-            // ── 1) 收集監督配對：LiDAR 有效的像素 → (相對逆深度, 度量深度) ──
-            @inline(__always) func lidarAt(_ mu: Int, _ mv: Int) -> Float {
-                let u = mu * dw / mw, v = mv * dh / mh
-                guard u >= 0, v >= 0, u < dw, v < dh else { return .nan }
-                let i = v * dw + u
-                let z = d[i]
-                guard z.isFinite, z > minD, z < maxD, (conf?[i] ?? 2) >= minConf else { return .nan }
-                return z
-            }
-            var pairs: [(d: Float, z: Float)] = []
-            pairs.reserveCapacity(4096)
-            var mv = 0
-            while mv < mh {                     // 取樣擬合即可，不需全像素
-                var mu = 0
-                while mu < mw {
-                    let z = lidarAt(mu, mv)
-                    if z.isFinite { pairs.append((disp[mv * mw + mu], z)) }
-                    mu += 4
-                }
-                mv += 4
-            }
-            guard let fit = DepthScaleFit.fit(pairs: pairs, minSamples: config.mdeMinSamples),
-                  fit.rmse <= config.mdeMaxRMSE else { return [] }
-
-            // ── 只做「內插」，不做「外插」──
-            // 每幀各自擬合 (a,b)。有 LiDAR 的地方擬合被錨定 → 各幀一致；但在整片沒有回波的
-            // 區域（窗戶/鏡面/>maxD）沒有任何約束讓不同幀一致 → 同一表面被各幀放到不同深度
-            // → 落進不同 voxel → 疊成多層殼，也就是殘影。兩道局部守衛：
-            //   (1) 深度必須落在本幀 LiDAR 實際觀測到的範圍內（外插到窗外就擋掉）
-            //   (2) 該像素附近必須有 LiDAR 回波（＝這是被已知深度包圍的小洞，不是大片未知區）
-            var zLo = Float.greatestFiniteMagnitude, zHi: Float = 0
-            for p in pairs { zLo = min(zLo, p.z); zHi = max(zHi, p.z) }
-            guard zHi > zLo else { return [] }
-            zLo *= 0.8; zHi *= 1.2                      // 留一點外插餘裕，但不放行到無限遠
-
-            // LiDAR 有效遮罩（深度解析度），供鄰域支撐檢核
-            var valid = [Bool](repeating: false, count: dw * dh)
-            for i in 0..<(dw * dh) {
-                let z = d[i]
-                valid[i] = z.isFinite && z > minD && z < maxD && (conf?[i] ?? 2) >= minConf
-            }
-            let r = config.mdeSupportRadiusPx
-            @inline(__always) func hasNearbyLiDAR(_ mu: Int, _ mv: Int) -> Bool {
-                let du = mu * dw / mw, dv = mv * dh / mh
-                var y = max(0, dv - r)
-                let yEnd = min(dh - 1, dv + r), xEnd = min(dw - 1, du + r)
-                while y <= yEnd {
-                    var x = max(0, du - r)
-                    while x <= xEnd {
-                        if valid[y * dw + x] { return true }
-                        x += 1
-                    }
-                    y += 1
-                }
-                return false
-            }
-
-            // ── 2) 只在 LiDAR 無效處補點，密度依局部梯度能量 ──
-            let fx = Float(hiK.fx), fy = Float(hiK.fy), cx = Float(hiK.cx), cy = Float(hiK.cy)
-            @inline(__always) func luma(_ i: Int) -> Float {
-                let p = i * 4
-                return 0.299 * Float(hiRGBA[p]) + 0.587 * Float(hiRGBA[p + 1]) + 0.114 * Float(hiRGBA[p + 2])
-            }
-            var out: [CloudPoint] = []
-            out.reserveCapacity(config.mdeMaxPointsPerFrame)
-            // 基礎步長：讓「整幀都是洞」的最壞情況剛好落在每幀上限內
-            let base = max(2, Int((Float(mw * mh) / Float(max(1, config.mdeMaxPointsPerFrame))).squareRoot()))
-            var v = 1
-            while v < mh - 1 && out.count < config.mdeMaxPointsPerFrame {
-                var u = 1
-                while u < mw - 1 && out.count < config.mdeMaxPointsPerFrame {
-                    let i = v * mw + u
-                    if lidarAt(u, v).isFinite { u += base; continue }   // 有 LiDAR → 不碰
-                    guard let z = fit.depth(disp[i]), z > minD, z < maxD,
-                          z >= zLo, z <= zHi,            // (1) 不外插到本幀沒量到的深度
-                          hasNearbyLiDAR(u, v)           // (2) 必須是被已知深度包圍的小洞
-                    else { u += base; continue }
-                    // CV 反投影 → 翻 Y/Z 回 GL 相機系 → 世界（與 unprojectStored 同慣例）
-                    let xc = (Float(u) - cx) / fx * z
-                    let yc = (Float(v) - cy) / fy * z
-                    let w4 = c2w * SIMD4<Float>(xc, -yc, -z, 1)
-                    let px = i * 4
-                    let ru = (Float(u) - cx) / Float(mw), rv = (Float(v) - cy) / Float(mh)
-                    let central = 1 - min(1, (ru * ru + rv * rv).squareRoot() * 1.4) * 0.5
-                    let near = 1 / (0.2 + z * z)
-                    out.append(CloudPoint(x: w4.x, y: w4.y, z: w4.z,
-                                          r: hiRGBA[px], g: hiRGBA[px + 1], b: hiRGBA[px + 2],
-                                          score: central * near * sharpness * config.mdeScore))
-                    // ROI-aware：梯度能量高 → 步長縮到一半（補密）；平坦區維持基礎步長
-                    let e = abs(luma(i + 1) - luma(i)) + abs(luma(i + mw) - luma(i))
-                    u += e > 12 ? max(1, base / 2) : base
-                }
-                v += base
-            }
-            return out
-        }
-    }
-
-    /// 把 mesh 頂點投影進一個關鍵幀取色，並用該幀的深度圖做可見性檢核。
-    /// 分數刻意壓低（×kMeshScore）：同格若有 LiDAR 直接觀測，加權平均由 LiDAR 主導；
-    /// mesh 只在「關鍵幀沒拍到」的空格補洞，不會稀釋既有的良好觀測。
-    private static let kMeshScore: Float = 0.25
-
     // 註：先前這裡有一個 kDemotedColorWeight = 0.2，註解寫「只降顏色權重」——
     // 但 score 是**單一權重**，同時決定位置與顏色的加權平均，所以它其實也把幾何
     // 一起壓到 1/5。在覆蓋率吃緊（實機 26.4% 的格子沒有 LiDAR）的情況下這是反效果，
     // 故移除。運動模糊本來就有物理權重 1/(1+blur/4) 壓著；
     // 失焦則完全不影響幾何，本來就不該罰。
+    /// 把 mesh 頂點投影進一個關鍵幀取色，並用該幀的深度圖做可見性檢核。
+    /// 分數刻意壓低（×kMeshScore）：同格若有 LiDAR 直接觀測，加權平均由 LiDAR 主導；
+    /// mesh 只在「關鍵幀沒拍到」的空格補洞，不會稀釋既有的良好觀測。
+    private static let kMeshScore: Float = 0.25
+
     private static func projectMesh(_ verts: [SIMD3<Float>], depth: Data, rgba: [UInt8],
                                     dw: Int, dh: Int, K: CameraIntrinsics,
                                     c2w: simd_float4x4, config: CaptureConfig,
@@ -646,6 +487,7 @@ nonisolated enum RefusionEngine {
         let minConf = config.minDepthConfidence
         let edgeRatio = config.depthEdgeRejectRatio
         let stride = max(1, config.refuseSampleStride)
+        let minCosInc = cos(config.depthMaxIncidenceDeg * .pi / 180)
 
         return depth.withUnsafeBytes { raw -> [CloudPoint] in
             let d = raw.bindMemory(to: Float32.self)
@@ -660,14 +502,35 @@ nonisolated enum RefusionEngine {
                     let cv = conf?[i] ?? 2
                     if z.isFinite, z > minD, z < maxD, cv >= minConf {
                         var ok = true
+                        // 入射角：由相鄰像素的深度梯度算出來。
+                        //
+                        // **這是牆面疊影的主因。** 一個深度像素在 z 處的橫向足跡是 z/fx，
+                        // 而相鄰像素的深度差 Δz 與入射角的關係是 tanθ = Δz·fx/z。
+                        // 掠射（θ→90°）時，同一個像素涵蓋牆面上一大片，深度沿光線的
+                        // 誤差被 1/cosθ 放大 —— 那些點會落在真實表面前後好幾公分處，
+                        // 每一趟掃描各偏一點，於是在 voxel 格上排成一片片平行的殼，
+                        // 就是畫面上看到的垂直條紋與「掃多次疊在一起」。
+                        //
+                        // 原本的 depthEdgeRejectRatio 是深度比例（5%），換算下來
+                        // 不論遠近都相當於放行到 84° —— 幾乎什麼掠射樣本都收。
+                        // 改成直接用角度，物理意義明確且與距離無關。
+                        var tanU: Float = 0, tanV: Float = 0
                         if u + 1 < dw {
                             let dr = d[i + 1]
                             if !dr.isFinite || abs(dr - z) > z * edgeRatio { ok = false }
+                            else { tanU = abs(dr - z) * fx / z }
                         }
                         if ok, v + 1 < dh {
                             let db = d[i + dw]
                             if !db.isFinite || abs(db - z) > z * edgeRatio { ok = false }
+                            else { tanV = abs(db - z) * fy / z }
                         }
+                        // cosθ = 1/√(1+tan²θ)。用它同時做硬拒絕與權重：
+                        // 硬拒絕留得寬（只擋掉幾乎與視線平行的），主要靠權重 ——
+                        // 直接刪會在只能斜看到的牆面上開洞，而降權不會：
+                        // 之後有正面觀測進來時，加權平均自然被拉回正確的表面。
+                        let cosInc = 1 / (1 + tanU * tanU + tanV * tanV).squareRoot()
+                        if cosInc < minCosInc { ok = false }
                         if ok {
                             let xc = (Float(u) - cx) / fx * z
                             let yc = (Float(v) - cy) / fy * z
@@ -680,7 +543,11 @@ nonisolated enum RefusionEngine {
                             let confW: Float = cv >= 2 ? 1 : config.mediumConfidenceWeight
                             out.append(CloudPoint(x: w4.x, y: w4.y, z: w4.z,
                                                   r: rgba[px], g: rgba[px + 1], b: rgba[px + 2],
-                                                  score: central * near * sharpness * confW))
+                                                  // cos²θ：掠射樣本降到 3% 左右
+                                                  // （80° → cos²=0.03），正面觀測因此
+                                                  // 一進來就主導這一格的加權平均
+                                                  score: central * near * sharpness
+                                                         * confW * cosInc * cosInc))
                         }
                     }
                     u += stride
@@ -689,6 +556,35 @@ nonisolated enum RefusionEngine {
             }
             return out
         }
+    }
+
+    /// 每格的實際記憶體成本（位元組）。
+    /// Cell ≈ 48B，字典 entry = key 8 + value 48 = 56B，載入因子 0.75 → 約 75B。
+    /// 取 80 留一點餘裕。
+    private static let kBytesPerCell = 80
+
+    /// 依「現在**還能**用多少記憶體」夾住格數上限。
+    ///
+    /// **固定常數猜不準。** 同一個 4M 在剛開 App 時很安全，
+    /// 而在掃完大場景、記憶體已經被關鍵幀與點雲吃掉之後，它就是被系統砍掉的原因 ——
+    /// 實機回報的「融合點雲時閃退」。
+    /// os_proc_available_memory() 回報的正是「距離 jetsam 還剩多少位元組」，
+    /// 那才是該拿來決定上限的東西。
+    ///
+    /// 只用其中一半：另一半要留給匯出階段（點陣列 ＋ 分層下採樣的字典），
+    /// 那兩個的尖峰跟融合格是**重疊**的。
+    /// 觸頂粗化仍然保底 —— 真的到上限就加粗格距，是降級不是失敗。
+    static func safeMaxCells(_ configured: Int) -> Int {
+        let avail = os_proc_available_memory()
+        guard avail > 0 else { return configured }
+        let budget = Int(Double(avail) * 0.5) / kBytesPerCell
+        let capped = max(200_000, min(configured, budget))
+        if capped < configured {
+            print(String(format: "重融合: 可用記憶體 %.0f MB → 格數上限由 %d 收到 %d"
+                         + "（避免融合中被系統回收）",
+                         Double(avail) / 1e6, configured, capped))
+        }
+        return capped
     }
 
     /// JPEG →（縮圖解碼）→ 深度解析度的緊湊 RGBA buffer。

@@ -105,8 +105,12 @@ struct FloorPlanView: View {
 
     private var summary: some View {
         VStack(spacing: 6) {
-            Text("\(data.roomCount) 房 · \(data.walls.count) 牆 · "
-                 + "\(data.doors.count) 門 · \(data.windows.count) 窗")
+            // 點雲版不列門窗：它是**刻意**不推論門窗的（牆上的缺口跟「沒掃到」
+            // 在點雲裡長得一樣），列一個永遠是 0 的欄位只會讓人以為掃壞了。
+            Text(data.isFromPointCloud
+                 ? "\(data.walls.count) 牆 · 由點雲抽出"
+                 : "\(data.roomCount) 房 · \(data.walls.count) 牆 · "
+                   + "\(data.doors.count) 門 · \(data.windows.count) 窗")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.white)
             // 拿雷射測距儀對照時看的就是這三個數
@@ -123,10 +127,16 @@ struct FloorPlanView: View {
                 .foregroundStyle(.white.opacity(0.6))
             // 資料本身不完整時直接說明原因與該怎麼補救 ——
             // 這不是 UI 問題也不是 bug，是掃描路徑沒有沿牆走：
-            // RoomPlan 要沿牆掃一圈，3DGS 要繞著物件多視角拍，兩者不是同一條路徑。
+            // 平面圖要沿牆掃，3DGS 要繞著物件多視角拍，兩者不是同一條路徑。
+            //
+            // 尾註要跟著來源走。這裡原本寫死「RoomPlan 需要…」，
+            // 而平面圖現在也可能是點雲抽出來的 —— 對點雲版講 RoomPlan 的注意事項
+            // 是保證誤導的建議，使用者照著做也不會變好。
             if let reason = data.incompleteReason {
-                warn(reason + "（RoomPlan 需要沿牆掃一圈，"
-                     + "3DGS 那種繞著物件拍的路徑產生不出完整的牆）")
+                warn(reason + (data.isFromPointCloud
+                     ? "（3DGS 那種繞著物件拍的路徑產生不出完整的牆）"
+                     : "（RoomPlan 需要沿牆掃一圈，"
+                       + "3DGS 那種繞著物件拍的路徑產生不出完整的牆）"))
             }
         }
         .padding(.horizontal, 16)

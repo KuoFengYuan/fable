@@ -86,9 +86,17 @@ nonisolated struct ScanSummary: Sendable {
     /// 世界地圖大小（MB）；nil = 沒存成（追蹤品質不足或超過上限）
     var worldMapMB: Double?
     /// BA 前後的重投影 RMS（像素）。這是 3DGS 解析度天花板的直接量測 ——
-    /// 1cm 位姿誤差 @2m ≈ 7px，所以這個數字就是「高斯最細能到多細」
+    /// 1cm 位姿誤差 @2m ≈ 7px，所以這個數字就是「高斯最細能到多細」。
+    ///
+    /// **baAfterPx 只在 baApplied 為真時描述實際輸出。** 否則 BA 只是量測、
+    /// 位姿沒被改動，輸出的天花板是 baBeforePx。
     var baBeforePx: Float?
     var baAfterPx: Float?
+    /// BA 的位姿有沒有真的套用（見 CaptureConfig.baApplyPoses，預設不套用）
+    var baApplied = false
+    /// 保留集（未參與求解的 track）重投影中位數的變化率。負值＝位姿真的變好。
+    /// 這是唯一一個不在 BA 目標函數裡的數字 —— 也是決定要不要打開 baApplyPoses 的依據。
+    var baHoldoutDelta: Double?
 }
 
 /// 世界座標彩色點。score 為採集品質分數（距離近、靠畫面中心、低模糊 → 高分），

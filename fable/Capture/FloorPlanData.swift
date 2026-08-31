@@ -133,28 +133,45 @@ extension FloorPlanData {
     ///   樓高 < 2.0m       牆沒被掃到頂（RoomPlan 只報告實際觀測到的高度）
     ///   最長牆 < 半個外接邊  牆被切成碎片、房間沒閉合
     ///   完全沒有門窗       沿牆掃過的話至少會抓到門
-    var scanLooksIncomplete: Bool {
-        guard !walls.isEmpty else { return false }
-        if medianWallHeightM < 2.0 { return true }
-        if longestWallM < sizeM.max() * 0.5 { return true }
-        if doors.isEmpty && windows.isEmpty { return true }
-        return false
-    }
+    /// 這份平面圖是點雲抽出來的（而不是 RoomPlan）。
+    /// 兩者的失效模式與可行動的建議完全不同，所以警告文字必須分開 ——
+    /// 對點雲版講「RoomPlan 需要沿牆掃一圈」是**保證會誤導**的建議。
+    var isFromPointCloud: Bool { generator.contains("pointcloud") }
+
+    var scanLooksIncomplete: Bool { incompleteReason != nil }
 
     /// 不完整的具體原因，用來給使用者可行動的說明（無問題時回 nil）
     var incompleteReason: String? {
         guard !walls.isEmpty else { return nil }
         if medianWallHeightM < 2.0 {
-            return String(format: "牆只掃到 %.2fm 高：請把鏡頭往上帶到牆與天花板的交界",
-                          medianWallHeightM)
+            return isFromPointCloud
+                ? String(format: "牆只掃到 %.2fm 高（樓高看起來是 %.2fm）："
+                         + "請把鏡頭往上帶、沿牆面上下掃過去 —— "
+                         + "牆是靠「同一位置的垂直跨度」認出來的，掃得越高越完整",
+                         medianWallHeightM, sizeM.max() > 0 ? boundingHeightHint : 0)
+                : String(format: "牆只掃到 %.2fm 高：請把鏡頭往上帶到牆與天花板的交界",
+                         medianWallHeightM)
         }
         if longestWallM < sizeM.max() * 0.5 {
-            return "牆面破碎、房間未閉合：請沿著牆面走一圈並回到起點"
+            return isFromPointCloud
+                ? "牆面破碎：多半是家具擋住了牆的下半部，或只掃了房間的一角 —— "
+                  + "請沿著牆面走，讓每一面牆從地板到天花板都被掃過"
+                : "牆面破碎、房間未閉合：請沿著牆面走一圈並回到起點"
         }
-        if doors.isEmpty && windows.isEmpty {
+        // **門窗只對 RoomPlan 有意義。** 點雲版是刻意不推論門窗的 ——
+        // 牆上的缺口跟「那一段沒掃到」在點雲裡長得一模一樣，
+        // 判成門會憑空生出不存在的門。對它報「沒偵測到門窗」等於每次都跳一個
+        // 永遠無法滿足的警告，那比不報還糟。
+        if !isFromPointCloud, doors.isEmpty && windows.isEmpty {
             return "沒有偵測到任何門窗：沿牆掃過時請讓門窗完整入鏡"
         }
         return nil
+    }
+
+    /// 點雲版的樓高提示：牆的觀測跨度已經填進 dimensions[1]，
+    /// 所以另外用外接高度當「這個空間大概多高」的參考值
+    private var boundingHeightHint: Float {
+        walls.map { $0.dimensions.count > 1 ? $0.dimensions[1] : 0 }.max() ?? 0
     }
 
     /// 讓主要牆向對齊水平所需的旋轉角（弧度，逆時針為正）。
