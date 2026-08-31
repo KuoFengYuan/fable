@@ -201,18 +201,49 @@ final class CoverageVisualizer {
     /// 每次重建整組節點會讓 SceneKit 不斷重新上傳幾何 —— 掃描中最不能做的就是
     /// 在主執行緒上製造這種尖峰（會餓死 ARKit 的 VIO）。
     /// 面數變動時只增減差額，其餘就地改尺寸與變換。
+    /// 生長動畫的時間。**略長於 didUpdate 的節流間隔（0.4s）** ——
+    /// 這樣每一次更新的補間都還沒走完就接上下一次，看起來是連續長出來的；
+    /// 短於節流間隔的話會變成「動一下、停一下」，比直接跳還難看。
+    private static let kGrowDuration: CFTimeInterval = 0.45
+
     func updateRoomSurfaces(_ surfaces: [RoomSurface]) {
         while roomNodes.count > surfaces.count {
             roomNodes.removeLast().removeFromParentNode()
         }
+        // 新面：先以「長度趨近 0、全透明」就位，下面的補間才會是**從零長出來**，
+        // 而不是整個矩形憑空出現。
+        var fresh: [Int] = []
         while roomNodes.count < surfaces.count {
-            roomNodes.append(Self.makeFrameNode(parent: roomRoot))
+            let n = Self.makeFrameNode(parent: roomRoot)
+            n.opacity = 0
+            fresh.append(roomNodes.count)
+            roomNodes.append(n)
         }
+        if !fresh.isEmpty {
+            // 初始狀態要自己一個 duration 0 的交易 —— 否則它會跟目標狀態
+            // 在同一次提交裡被合併掉，等於沒有起點可以補間
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = 0
+            for i in fresh {
+                Self.layoutEdges(roomNodes[i], size: .zero, box: surfaces[i].isBox,
+                                 color: Self.roomColor(surfaces[i].kind))
+                roomNodes[i].simdTransform = surfaces[i].transform
+            }
+            SCNTransaction.commit()
+        }
+
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = Self.kGrowDuration
+        // easeOut：一偵測到就快速抽長、末段收慢，這是「線在畫出來」的手感；
+        // 線性會像機械滑動，easeInOut 起步太拖沓
+        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
         for (i, s) in surfaces.enumerated() {
             Self.layoutEdges(roomNodes[i], size: s.size, box: s.isBox,
                              color: Self.roomColor(s.kind))
             roomNodes[i].simdTransform = s.transform
+            roomNodes[i].opacity = 1
         }
+        SCNTransaction.commit()
     }
 
     /// 一個面的邊框 = 四條**圓管**（上下左右），每條再套一層外暈。
@@ -301,19 +332,29 @@ final class CoverageVisualizer {
         let center = (hi + lo) / 2
         let scale = Self.kDollSize / max(0.1, max(extent.x, max(extent.y, extent.z)))
 
-        // 內容節點：把世界座標的房間搬到原點並縮小；擺放由 dollRoot 負責
-        dollContent.simdScale = SIMD3<Float>(repeating: scale)
-        dollContent.simdPosition = -center * scale
-
-        // 地板板 + 每個元素一個方塊。第 0 個節點固定是地板板
+        // 節點增減必須在交易**之外**：新節點要以 opacity 0 起步，
+        // 若在動畫交易裡設 0 會先淡出再淡入，變成閃一下
         let need = surfaces.count + 1
         while dollNodes.count > need { dollNodes.removeLast().removeFromParentNode() }
         while dollNodes.count < need {
             let n = SCNNode()
             n.geometry = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0)
+            n.opacity = 0                 // 新元素淡入，與線框的生長動畫同一個節奏
             dollContent.addChildNode(n)
             dollNodes.append(n)
         }
+
+        // 以下全部走補間。**比例尺也要在裡面** —— 房間長大時 scale 每 0.4s 就換一次，
+        // 那是整個縮圖一跳一跳最主要的來源，比單一元素的尺寸變化明顯得多。
+        SCNTransaction.begin()
+        SCNTransaction.animationDuration = Self.kGrowDuration
+        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+        defer { SCNTransaction.commit() }
+
+        // 內容節點：把世界座標的房間搬到原點並縮小；擺放由 dollRoot 負責
+        dollContent.simdScale = SIMD3<Float>(repeating: scale)
+        dollContent.simdPosition = -center * scale
+        for n in dollNodes { n.opacity = 1 }
 
         // 地板：房間 XZ 範圍的一片薄板，落在最低點
         let plate = dollNodes[0]
