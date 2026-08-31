@@ -231,6 +231,35 @@ import simd
                      entY.min() ?? 0, entY.max() ?? 0, zLo, zHi))
         _ = ys
 
+        // ── 7. 大場景：必須在合理時間內跑完 ──
+        //
+        // **這一項存在的理由是一個真的爆炸。** 線段合併原本寫成「反覆全掃到收斂，
+        // 每成功合併一次就整個重來」——那是 O(G³)：30 個 run 沒感覺、
+        // 300 個要 14M 次比較、3000 個就是 135 億次。
+        // 上面那些測試房間只有十幾個 run，完全測不出來；
+        // 而 20×20m 的場景在 5cm 格下輕易有數千個 run，於是大場景直接卡死。
+        //
+        // 所以規模本身就是要測的東西 —— 小房間全過不代表演算法可用。
+        seed = 9
+        var big: [SIMD3<Float>] = []
+        // 5×4 的房間鋪成 4×4 格（20×16m），中間留走道 —— 隔間牆會產生大量 run
+        for gx in 0..<4 {
+            for gz in 0..<4 {
+                let off = SIMD2<Float>(Float(gx) * 5.5, Float(gz) * 4.5)
+                big += room(w: W, d: D, h: H, step: 0.06).map {
+                    SIMD3($0.x + off.x, $0.y, $0.z + off.y)
+                }
+            }
+        }
+        let t0 = Date()
+        let r7 = PointCloudFloorPlan.extract(points: big)
+        let secs = Date().timeIntervalSince(t0)
+        print(String(format: "   大場景 20×16m：%d 點、%.2fs", big.count, secs))
+        if let r7 { print("   \(r7.summary)") }
+        check(r7 != nil && secs < 8,
+              String(format: "大場景 %d 點在 %.2fs 內完成（上限 8s；先前的 O(G³) 合併會卡死）",
+                     big.count, secs))
+
         print()
         print(fails == 0 ? "全部通過 — 點雲平面圖驗證完成" : "\(fails) 項失敗")
         exit(fails == 0 ? 0 : 1)

@@ -344,23 +344,44 @@ nonisolated enum PointCloudFloorPlan {
             raw.append(Run(line: fixed, lo: start, hi: prev))
         }
 
-        // 2) 相鄰列且沿軸重疊者併為同一面牆（union-find 過頭，直接反覆掃到收斂即可 ——
-        //    一面牆最多跨幾列，迭代次數是個位數）
-        var groups = raw.map { [$0] }
-        var merged = true
-        while merged {
-            merged = false
-            outer: for i in 0..<groups.count {
-                for j in (i + 1)..<groups.count {
-                    if adjacent(groups[i], groups[j]) {
-                        groups[i] += groups[j]
-                        groups.remove(at: j)
-                        merged = true
-                        break outer
+        // 2) 相鄰列且沿軸重疊者併為同一面牆。
+        //
+        // **必須用 union-find ＋ 只比相鄰列。** 先前是「反覆全掃到收斂」，
+        // 而且每成功合併一次就整個重來 —— 那是 O(G³)：
+        //   30 個 run 沒感覺、300 個要 14M 次比較、3000 個就是 135 億次。
+        // 我的測試房間只有十幾個 run，完全測不出來；而 20×20m 的場景在 5cm 格下
+        // 輕易就有數千個 run，於是大場景直接卡死（看起來就是閃退）。
+        //
+        // 一個 run 只可能跟 line ±1 的 run 相鄰，所以先依 line 建索引，
+        // 比較量就從「全部 × 全部」降到「每個 run × 相鄰兩列的 run」。
+        var parent = Array(0..<raw.count)
+        func find(_ x: Int) -> Int {
+            var r = x
+            while parent[r] != r { parent[r] = parent[parent[r]]; r = parent[r] }
+            return r
+        }
+        func union(_ a: Int, _ b: Int) {
+            let ra = find(a), rb = find(b)
+            if ra != rb { parent[rb] = ra }
+        }
+        var byLine: [Int: [Int]] = [:]
+        for (i, r) in raw.enumerated() { byLine[r.line, default: []].append(i) }
+        for (line, idxs) in byLine {
+            for d in 0...1 {
+                guard let others = byLine[line + d] else { continue }
+                for i in idxs {
+                    for j in others where !(d == 0 && j <= i) {
+                        // 沿軸區間重疊（含 bridge 容忍）才是同一面牆
+                        if raw[i].lo <= raw[j].hi + bridge && raw[j].lo <= raw[i].hi + bridge {
+                            union(i, j)
+                        }
                     }
                 }
             }
         }
+        var byRoot: [Int: [Run]] = [:]
+        for i in raw.indices { byRoot[find(i), default: []].append(raw[i]) }
+        let groups = Array(byRoot.values)
 
         var out: [Seg] = []
         for g in groups {
@@ -391,16 +412,6 @@ nonisolated enum PointCloudFloorPlan {
             out.append(Seg(a: a, b: b, thickness: thickness, spanM: span))
         }
         return out
-
-        /// 兩群是否該合併：任一對 run 相鄰列（差 ≤1）且沿軸區間重疊
-        func adjacent(_ x: [Run], _ y: [Run]) -> Bool {
-            for p in x {
-                for q in y where abs(p.line - q.line) <= 1 {
-                    if p.lo <= q.hi + bridge && q.lo <= p.hi + bridge { return true }
-                }
-            }
-            return false
-        }
     }
 
     // MARK: - 小工具

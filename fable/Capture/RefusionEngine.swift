@@ -13,6 +13,7 @@
 import Foundation
 import CoreGraphics
 import ImageIO
+import os
 import simd
 
 // MARK: - 共用幾何工具
@@ -185,12 +186,19 @@ nonisolated struct FusedVoxelGrid {
         if count >= maxCells { coarsen() }
     }
 
-    /// 觸頂自動粗化：voxel ×2、加權合併 —— 長掃描記憶體有界且不停止收點
+    /// 觸頂自動粗化：voxel ×2、加權合併 —— 長掃描記憶體有界且不停止收點。
+    ///
+    /// **逐片搬移並即時釋放，不要先建好整份新表再換掉。**
+    /// 那樣峰值是兩份完整的表（4M 格 × ~75B ≈ 300MB，兩份就 600MB），
+    /// 而觸頂粗化正好發生在記憶體已經最吃緊的時候 —— 大場景、關鍵幀與點雲都還在。
+    /// 實機大場景「融合點雲時閃退」就是在這裡被系統砍掉的。
+    /// 逐片釋放之後峰值降到「舊表剩下的部分 ＋ 新表」，
+    /// 而粗化本來就會把格數砍成約 1/4，所以實際峰值接近 1.25 份而不是 2 份。
     private mutating func coarsen() {
         voxelSize *= 2
         var merged = [[Int64: Cell]](repeating: [:], count: shards.count)
-        for shard in shards {
-            for cell in shard.values {
+        for si in shards.indices {
+            for cell in shards[si].values {
                 guard let key = PointCloudMath.voxelKey(cell.mean, size: voxelSize) else { continue }
                 let s = shardIndex(key)
                 if var m = merged[s][key] {
@@ -205,6 +213,7 @@ nonisolated struct FusedVoxelGrid {
                     merged[s][key] = cell
                 }
             }
+            shards[si] = [:]        // 這一片搬完就放掉，不要等到全部搬完
         }
         shards = merged
     }
@@ -271,7 +280,8 @@ nonisolated enum RefusionEngine {
         // 完全收不到訊號 —— 沿法向偏 3cm 時 0/40000 點有對應。留著只是死碼。
         // 重投影誤差沒有這個盲點，那條路走 BundleAdjuster。
 
-        var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM, maxCells: config.refuseMaxCells)
+        var grid = FusedVoxelGrid(voxelSize: config.refuseVoxelSizeM,
+                                  maxCells: safeMaxCells(config.refuseMaxCells))
         let depthDir = sessionDir.appendingPathComponent("depth", isDirectory: true)
         let imagesDir = sessionDir.appendingPathComponent("images", isDirectory: true)
         let total = max(1, records.count)
@@ -546,6 +556,35 @@ nonisolated enum RefusionEngine {
             }
             return out
         }
+    }
+
+    /// 每格的實際記憶體成本（位元組）。
+    /// Cell ≈ 48B，字典 entry = key 8 + value 48 = 56B，載入因子 0.75 → 約 75B。
+    /// 取 80 留一點餘裕。
+    private static let kBytesPerCell = 80
+
+    /// 依「現在**還能**用多少記憶體」夾住格數上限。
+    ///
+    /// **固定常數猜不準。** 同一個 4M 在剛開 App 時很安全，
+    /// 而在掃完大場景、記憶體已經被關鍵幀與點雲吃掉之後，它就是被系統砍掉的原因 ——
+    /// 實機回報的「融合點雲時閃退」。
+    /// os_proc_available_memory() 回報的正是「距離 jetsam 還剩多少位元組」，
+    /// 那才是該拿來決定上限的東西。
+    ///
+    /// 只用其中一半：另一半要留給匯出階段（點陣列 ＋ 分層下採樣的字典），
+    /// 那兩個的尖峰跟融合格是**重疊**的。
+    /// 觸頂粗化仍然保底 —— 真的到上限就加粗格距，是降級不是失敗。
+    static func safeMaxCells(_ configured: Int) -> Int {
+        let avail = os_proc_available_memory()
+        guard avail > 0 else { return configured }
+        let budget = Int(Double(avail) * 0.5) / kBytesPerCell
+        let capped = max(200_000, min(configured, budget))
+        if capped < configured {
+            print(String(format: "重融合: 可用記憶體 %.0f MB → 格數上限由 %d 收到 %d"
+                         + "（避免融合中被系統回收）",
+                         Double(avail) / 1e6, configured, capped))
+        }
+        return capped
     }
 
     /// JPEG →（縮圖解碼）→ 深度解析度的緊湊 RGBA buffer。
