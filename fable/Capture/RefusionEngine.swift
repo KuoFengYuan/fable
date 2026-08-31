@@ -97,63 +97,116 @@ nonisolated struct FusedVoxelGrid {
         var dirMask: UInt16 = 0
     }
 
-    private(set) var cells: [Int64: Cell] = [:]
+    /// 分片字典。
+    ///
+    /// **插入是重融合唯一不能平行的一段。** 逐幀的檔案讀取／JPEG 解碼／反投影／
+    /// mesh 投影都是純函式（見 RefusionEngine.refuse 的 produce，已經平行化），
+    /// 但它們最後都要寫進同一張表。而這一段是隨幀數線性成長的 ——
+    /// 實測 54 幀 1.81s，走 60m 的整層掃描約 600 幀，線性外推就是 20 秒。
+    ///
+    /// 以 voxel key 分片後，每片是獨立字典 → N 條 lane 可以同時寫。
+    ///
+    /// **輸出與單片版逐位元相同。** cell → 分片是確定性的，而同一分片內的點仍照
+    /// 原順序處理，所以每個 cell 收到的觀測序列一模一樣。這一點必須守住：
+    /// 加權平均在權重封頂（weightCap）之後是順序相依的，
+    /// 若順序隨執行緒排程而變，同一份掃描資料會融出不同的點雲。
+    private var shards: [[Int64: Cell]]
+    private let shardMask: Int64
     private(set) var voxelSize: Float
     private let maxCells: Int
     private let weightCap: Float = 8
 
+    /// 分片數取 2 的冪且明顯多於核心數 —— 分堆才平均，lane 之間也不必等最慢的一片
+    private static let shardCount = 16
+
     init(voxelSize: Float, maxCells: Int) {
         self.voxelSize = voxelSize
         self.maxCells = maxCells
+        self.shards = Array(repeating: [:], count: Self.shardCount)
+        self.shardMask = Int64(Self.shardCount - 1)
     }
 
-    var count: Int { cells.count }
+    /// voxel key 是 `(ix << 42) | (iy << 21) | iz`，空間上高度結構化 ——
+    /// 直接取低位等於只用 z 分片，掃描面若接近水平就會全擠在同一片。
+    /// 三軸互斥或之後再取低位，任何掃描姿態都散得開。
+    @inline(__always)
+    private func shardIndex(_ key: Int64) -> Int {
+        Int((key ^ (key >> 21) ^ (key >> 42)) & shardMask)
+    }
+
+    var count: Int { shards.reduce(0) { $0 + $1.count } }
+    /// 各分片的格數。分片若散不開，平行化就沒有意義（例如只用低位＝只用 z 軸分片時，
+    /// 水平面會全擠在同一片）—— tools/test_voxel_shard.swift 用它驗證分佈。
+    func shardOccupancy() -> [Int] { shards.map(\.count) }
     /// 只有推論來源（ARKit mesh）覆蓋、LiDAR 完全沒打到的格子數 ＝ 補充來源的實際新增覆蓋
-    var inferredOnlyCount: Int { cells.values.reduce(0) { $1.measured ? $0 : $0 + 1 } }
+    var inferredOnlyCount: Int {
+        shards.reduce(0) { acc, s in acc + s.values.reduce(0) { $1.measured ? $0 : $0 + 1 } }
+    }
 
     /// - measured: true ＝ LiDAR 直接反投影（量測）；false ＝ ARKit 場景網格（推論）
     mutating func insert(_ candidates: [CloudPoint], measured: Bool = true) {
+        guard !candidates.isEmpty else { return }
+        // 先分堆（保序），再各片平行寫入
+        let n = shards.count
+        var byShard = [[(key: Int64, pt: CloudPoint)]](repeating: [], count: n)
+        let guess = candidates.count / n + 8
+        for i in 0..<n { byShard[i].reserveCapacity(guess) }
         for pt in candidates {
-            let pos = SIMD3<Float>(pt.x, pt.y, pt.z)
-            guard let key = PointCloudMath.voxelKey(pos, size: voxelSize) else { continue }
-            let rgb = SIMD3<Float>(Float(pt.r), Float(pt.g), Float(pt.b))
-            if var cell = cells[key] {
-                let w = max(0.01, pt.score)
-                let total = cell.weight + w
-                cell.mean += (pos - cell.mean) * (w / total)
-                cell.color += (rgb - cell.color) * (w / total)
-                cell.weight = min(total, weightCap)
-                cell.bestScore = max(cell.bestScore, pt.score)
-                cell.measured = cell.measured || measured
-                cells[key] = cell
-            } else {
-                cells[key] = Cell(mean: pos, color: rgb,
-                                  weight: max(0.01, pt.score), bestScore: pt.score,
-                                  measured: measured)
-                if cells.count >= maxCells { coarsen() }
+            guard let key = PointCloudMath.voxelKey(SIMD3<Float>(pt.x, pt.y, pt.z),
+                                                    size: voxelSize) else { continue }
+            byShard[shardIndex(key)].append((key, pt))
+        }
+        let cap = weightCap
+        shards.withUnsafeMutableBufferPointer { buf in
+            DispatchQueue.concurrentPerform(iterations: n) { s in
+                for (key, pt) in byShard[s] {
+                    let pos = SIMD3<Float>(pt.x, pt.y, pt.z)
+                    let rgb = SIMD3<Float>(Float(pt.r), Float(pt.g), Float(pt.b))
+                    if var cell = buf[s][key] {
+                        let w = max(0.01, pt.score)
+                        let total = cell.weight + w
+                        cell.mean += (pos - cell.mean) * (w / total)
+                        cell.color += (rgb - cell.color) * (w / total)
+                        cell.weight = min(total, cap)
+                        cell.bestScore = max(cell.bestScore, pt.score)
+                        cell.measured = cell.measured || measured
+                        buf[s][key] = cell
+                    } else {
+                        buf[s][key] = Cell(mean: pos, color: rgb,
+                                           weight: max(0.01, pt.score), bestScore: pt.score,
+                                           measured: measured)
+                    }
+                }
             }
         }
+        // 觸頂檢查移到批次之後：原本每插入一個新格就查一次全域數量，
+        // 分片之後那會變成每點一次跨片加總。代價是可能短暫超出上限一個批次的量，
+        // 而一個批次只有一幀的點（~49k），相對 2M 的上限可以忽略。
+        if count >= maxCells { coarsen() }
     }
 
     /// 觸頂自動粗化：voxel ×2、加權合併 —— 長掃描記憶體有界且不停止收點
     private mutating func coarsen() {
         voxelSize *= 2
-        var merged: [Int64: Cell] = Dictionary(minimumCapacity: cells.count / 4)
-        for cell in cells.values {
-            guard let key = PointCloudMath.voxelKey(cell.mean, size: voxelSize) else { continue }
-            if var m = merged[key] {
-                let total = m.weight + cell.weight
-                m.mean += (cell.mean - m.mean) * (cell.weight / total)
-                m.color += (cell.color - m.color) * (cell.weight / total)
-                m.weight = min(total, weightCap)
-                m.bestScore = max(m.bestScore, cell.bestScore)
-                m.measured = m.measured || cell.measured
-                merged[key] = m
-            } else {
-                merged[key] = cell
+        var merged = [[Int64: Cell]](repeating: [:], count: shards.count)
+        for shard in shards {
+            for cell in shard.values {
+                guard let key = PointCloudMath.voxelKey(cell.mean, size: voxelSize) else { continue }
+                let s = shardIndex(key)
+                if var m = merged[s][key] {
+                    let total = m.weight + cell.weight
+                    m.mean += (cell.mean - m.mean) * (cell.weight / total)
+                    m.color += (cell.color - m.color) * (cell.weight / total)
+                    m.weight = min(total, weightCap)
+                    m.bestScore = max(m.bestScore, cell.bestScore)
+                    m.measured = m.measured || cell.measured
+                    merged[s][key] = m
+                } else {
+                    merged[s][key] = cell
+                }
             }
         }
-        cells = merged
+        shards = merged
     }
 
     /// 26 鄰域方向（單位格offset）
@@ -171,22 +224,27 @@ nonisolated struct FusedVoxelGrid {
         func c8(_ f: Float) -> UInt8 { UInt8(min(255, max(0, f))) }
         let vs = voxelSize
         var points: [CloudPoint] = []
-        points.reserveCapacity(cells.count)
-        for cell in cells.values {
-            if minNeighbors > 0 {
-                var n = 0
-                for o in Self.neighborOffsets {
-                    let np = cell.mean + o * vs
-                    if let k = PointCloudMath.voxelKey(np, size: vs), cells[k] != nil {
-                        n += 1
-                        if n >= minNeighbors { break }
+        points.reserveCapacity(count)
+        for shard in shards {
+            for cell in shard.values {
+                if minNeighbors > 0 {
+                    var n = 0
+                    for o in Self.neighborOffsets {
+                        let np = cell.mean + o * vs
+                        // 鄰格可能落在別的分片 —— 查詢必須先算分片，不能只查自己這片
+                        if let k = PointCloudMath.voxelKey(np, size: vs),
+                           shards[shardIndex(k)][k] != nil {
+                            n += 1
+                            if n >= minNeighbors { break }
+                        }
                     }
+                    if n < minNeighbors { continue }   // 孤立 → 飄浮雜點，丟棄
                 }
-                if n < minNeighbors { continue }   // 孤立 → 飄浮雜點，丟棄
+                points.append(CloudPoint(x: cell.mean.x, y: cell.mean.y, z: cell.mean.z,
+                                         r: c8(cell.color.x), g: c8(cell.color.y),
+                                         b: c8(cell.color.z),
+                                         score: cell.bestScore * min(1, cell.weight / 1.5)))
             }
-            points.append(CloudPoint(x: cell.mean.x, y: cell.mean.y, z: cell.mean.z,
-                                     r: c8(cell.color.x), g: c8(cell.color.y), b: c8(cell.color.z),
-                                     score: cell.bestScore * min(1, cell.weight / 1.5)))
         }
         // 起始格距用原生 voxelSize：加粗多少交給解析步長決定。
         // 先前預設 ×2 等於還沒開始就先砍掉 4 倍的點。
