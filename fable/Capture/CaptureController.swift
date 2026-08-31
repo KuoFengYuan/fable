@@ -180,7 +180,11 @@ final class CaptureController: NSObject, ObservableObject {
         viz.setRoomHidden(!showRoomPlan)
         // RoomPlan 的即時面直接進渲染層，不繞 SwiftUI（每 0.4s 一組陣列，
         // 走 @Published 等於每次都讓整個 HUD 重新求值）
-        floorPlan.onRoomUpdated = { [weak viz] surfaces in viz?.updateRoomSurfaces(surfaces) }
+        floorPlan.onRoomUpdated = { [weak viz] surfaces in
+            viz?.updateRoomSurfaces(surfaces)
+            viz?.updateDollhouse(surfaces)
+        }
+        viz.setDollhouseHidden(!showRoomPlan)
         visualizer = viz
 
         runSession()
@@ -759,6 +763,7 @@ final class CaptureController: NSObject, ObservableObject {
     func toggleRoomPlan() {
         showRoomPlan.toggle()
         visualizer?.setRoomHidden(!showRoomPlan)
+        visualizer?.setDollhouseHidden(!showRoomPlan)
     }
 
     /// 切換「真實顏色 / 融合品質熱圖」。切換後必須把所有磚標記重畫，
@@ -1138,6 +1143,10 @@ extension CaptureController: @preconcurrency ARSessionDelegate {
         if let viz = visualizer, viz.hasDome, frameCounter % 12 == 0 {
             viz.updateGuidance(pose: frame.camera.transform)
         }
+        // Dollhouse 擺位：**每幀**都要更新，不能像上面那樣抽幀 ——
+        // 它跟著相機走，5Hz 會看起來一頓一頓的。內容只是一次 transform 賦值，
+        // 真正的重建是在 onRoomUpdated（節流 0.4s）那裡。
+        if showRoomPlan { visualizer?.placeDollhouse(camera: frame.camera.transform) }
 
         guard a.allowCapture else { return }
         // 速度閘門：blur 擋不住「亮處快速移動」（曝光短 → 模糊低，但 VIO 姿態仍有延遲誤差）。

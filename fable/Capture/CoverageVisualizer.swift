@@ -107,6 +107,10 @@ final class CoverageVisualizer {
     private let pointsRoot = SCNNode()             // 即時點雲（空間磚節點掛載處）
     private let roomRoot = SCNNode()               // RoomPlan 即時面（發光邊框）
     private var roomNodes: [SCNNode] = []          // 每個面一個節點，底下四條邊
+    private let dollRoot = SCNNode()               // Dollhouse：擺位（相機前下方）
+    private let dollContent = SCNNode()            // Dollhouse：內容（房間縮放到原點）
+    private var dollNodes: [SCNNode] = []          // [0] 地板板，其後每個元素一個方塊
+    private var dollPlaced = false
     private var tileNodes: [Int64: SCNNode] = [:]  // tileKey → 節點（幾何為錨點局部座標）
     private var pathPoints: [SCNVector3] = []
 
@@ -129,6 +133,8 @@ final class CoverageVisualizer {
         root.addChildNode(pathNode)
         root.addChildNode(pointsRoot)
         root.addChildNode(roomRoot)
+        dollRoot.addChildNode(dollContent)
+        root.addChildNode(dollRoot)
     }
 
     func attach(to scene: SCNScene) {
@@ -139,11 +145,16 @@ final class CoverageVisualizer {
         pathPoints.removeAll()
         pathNode.geometry = nil
         for child in root.childNodes
-        where child !== pathNode && child !== pointsRoot && child !== roomRoot {
+        where child !== pathNode && child !== pointsRoot && child !== roomRoot
+              && child !== dollRoot {
             child.removeFromParentNode()
         }
         for n in roomNodes { n.removeFromParentNode() }
         roomNodes.removeAll()
+        for n in dollNodes { n.removeFromParentNode() }
+        dollNodes.removeAll()
+        dollPlaced = false
+        dollContent.isHidden = true
         for tile in pointsRoot.childNodes {
             tile.removeFromParentNode()
         }
@@ -170,11 +181,15 @@ final class CoverageVisualizer {
         roomRoot.isHidden = hidden
     }
 
-    /// 發光核心的半徑（公尺）。2.4cm 直徑在 1~4m 的觀看距離下與 RoomPlan 原生接近
-    private static let kEdgeRadius: CGFloat = 0.012
-    /// 外暈半徑。約核心的 3 倍 —— 這一層才是「發光」的來源：
-    /// 加法混色下，外圈的低 alpha 會在核心周圍疊出柔和的光暈。
-    private static let kGlowRadius: CGFloat = 0.036
+    /// 發光核心的半徑（公尺）。
+    ///
+    /// 1cm 直徑。先前設 2.4cm，實機看起來明顯比 RoomPlan 原生粗 ——
+    /// **原生那個「粗度」其實幾乎都來自光暈，核心是很細的一條亮線。**
+    /// 核心負責「銳利」，光暈負責「存在感」，兩者的分工不能混。
+    private static let kEdgeRadius: CGFloat = 0.005
+    /// 外暈半徑。約核心的 4 倍、alpha 很低 —— 加法混色下在核心周圍疊出柔和的暈開，
+    /// 這才是那個發光感的來源。
+    private static let kGlowRadius: CGFloat = 0.020
 
     /// 用 RoomPlan 當下偵測到的面疊出**發光白色邊框**。
     ///
@@ -243,11 +258,123 @@ final class CoverageVisualizer {
         m.writesToDepthBuffer = false   // 不遮住點雲與真實畫面的深度關係
         m.blendMode = .add              // 加法混色 → 亮處發光，暗處不會變成灰塊
         m.diffuse.contents = color
-        m.transparency = glow ? 0.22 : 1.0
+        m.transparency = glow ? 0.16 : 1.0
         c.materials = [m]
         tubeCache[key] = c
         return c
     }
+
+    // MARK: - Dollhouse：掃到哪就長到哪的房間縮圖
+
+    /// 縮圖的邊長上限（公尺）。25cm 在手臂距離看起來與 RoomPlan 原生接近
+    private static let kDollSize: Float = 0.25
+    /// 擺放位置：相機前方 / 下方（公尺）。低一點才不會擋住正在掃的牆面
+    private static let kDollForward: Float = 0.55
+    private static let kDollDown: Float = 0.30
+
+    /// 用 RoomPlan 當下的房間長出白色實體縮圖：地板板 + 半透明牆 + 家具方塊。
+    ///
+    /// 為什麼要有它：線框告訴使用者「這個面被認出來了」，但看不出**整體**掃到多少。
+    /// 縮圖把已辨識的房間整個攤在眼前，缺一面牆、少一塊角落一眼就看得到 ——
+    /// 那正是大範圍掃描最需要、而掃完才發現就來不及的資訊。
+    func updateDollhouse(_ surfaces: [RoomSurface]) {
+        guard !surfaces.isEmpty else {
+            for n in dollNodes { n.removeFromParentNode() }
+            dollNodes.removeAll()
+            dollContent.isHidden = true
+            return
+        }
+        dollContent.isHidden = false
+
+        // 房間的世界包圍盒：逐元素轉換 8 個角點（元素不多，精確算比估算省事）
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for s in surfaces {
+            let h = s.size / 2
+            for sx in [-h.x, h.x] { for sy in [-h.y, h.y] { for sz in [-h.z, h.z] {
+                let p = s.transform * SIMD4<Float>(sx, sy, sz, 1)
+                lo = simd_min(lo, SIMD3(p.x, p.y, p.z))
+                hi = simd_max(hi, SIMD3(p.x, p.y, p.z))
+            } } }
+        }
+        let extent = hi - lo
+        let center = (hi + lo) / 2
+        let scale = Self.kDollSize / max(0.1, max(extent.x, max(extent.y, extent.z)))
+
+        // 內容節點：把世界座標的房間搬到原點並縮小；擺放由 dollRoot 負責
+        dollContent.simdScale = SIMD3<Float>(repeating: scale)
+        dollContent.simdPosition = -center * scale
+
+        // 地板板 + 每個元素一個方塊。第 0 個節點固定是地板板
+        let need = surfaces.count + 1
+        while dollNodes.count > need { dollNodes.removeLast().removeFromParentNode() }
+        while dollNodes.count < need {
+            let n = SCNNode()
+            n.geometry = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0)
+            dollContent.addChildNode(n)
+            dollNodes.append(n)
+        }
+
+        // 地板：房間 XZ 範圍的一片薄板，落在最低點
+        let plate = dollNodes[0]
+        if let b = plate.geometry as? SCNBox {
+            b.width = CGFloat(max(0.1, extent.x))
+            b.length = CGFloat(max(0.1, extent.z))
+            b.height = CGFloat(max(0.02, extent.y) * 0.02)
+            b.firstMaterial = Self.dollMaterial(.floor)
+        }
+        plate.simdPosition = SIMD3<Float>(center.x, lo.y, center.z)
+        plate.simdOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+
+        for (i, s) in surfaces.enumerated() {
+            let n = dollNodes[i + 1]
+            guard let b = n.geometry as? SCNBox else { continue }
+            b.width = CGFloat(max(0.01, s.size.x))
+            b.height = CGFloat(max(0.01, s.size.y))
+            // 牆的 depth 常常是 0 —— 給它一點厚度才看得出是一片牆而不是一條線
+            b.length = CGFloat(max(s.isBox ? 0.01 : 0.04, s.size.z))
+            b.firstMaterial = Self.dollMaterial(s.isBox ? .object : .wall)
+            n.simdTransform = s.transform
+        }
+    }
+
+    private enum DollPart { case floor, wall, object }
+
+    /// 材質共用（三種），理由同 tube()：這是每幀都要畫的疊加，不能一個節點一份材質。
+    private static var dollMaterials: [String: SCNMaterial] = [:]
+    private static func dollMaterial(_ part: DollPart) -> SCNMaterial {
+        let key = "\(part)"
+        if let m = dollMaterials[key] { return m }
+        let m = SCNMaterial()
+        m.lightingModel = .constant
+        switch part {
+        case .floor:  m.diffuse.contents = UIColor.white;                    m.transparency = 0.95
+        case .wall:   m.diffuse.contents = UIColor(white: 0.88, alpha: 1);   m.transparency = 0.55
+        case .object: m.diffuse.contents = UIColor(white: 0.97, alpha: 1);   m.transparency = 0.92
+        }
+        dollMaterials[key] = m
+        return m
+    }
+
+    /// 每幀擺位：相機前下方，但**維持世界朝向** —— 這樣它讀起來像一張攤在眼前的地圖，
+    /// 而不是跟著頭轉的貼紙。位置做指數平滑，否則手震會讓它抖。
+    func placeDollhouse(camera: simd_float4x4) {
+        guard !dollContent.isHidden else { return }
+        let pos = SIMD3<Float>(camera.columns.3.x, camera.columns.3.y, camera.columns.3.z)
+        let fwd = -SIMD3<Float>(camera.columns.2.x, camera.columns.2.y, camera.columns.2.z)
+        // 前方向投影到水平面：相機仰俯時縮圖不該跟著上下飄
+        var flat = SIMD3<Float>(fwd.x, 0, fwd.z)
+        flat = simd_length(flat) > 1e-4 ? simd_normalize(flat) : SIMD3<Float>(0, 0, -1)
+        let target = pos + flat * Self.kDollForward + SIMD3<Float>(0, -Self.kDollDown, 0)
+        if dollPlaced {
+            dollRoot.simdPosition += (target - dollRoot.simdPosition) * 0.12
+        } else {
+            dollRoot.simdPosition = target
+            dollPlaced = true
+        }
+    }
+
+    func setDollhouseHidden(_ hidden: Bool) { dollRoot.isHidden = hidden }
 
     /// 一條邊：長度、中心位置、沿哪個軸
     private enum EdgeAxis { case x, y, z }
