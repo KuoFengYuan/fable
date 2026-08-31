@@ -166,8 +166,10 @@ extension FloorPlanData {
         }
 
         // 5. 門窗符號
-        for d in doors { out += doorSymbol(d) }
-        for w in windows { out += Self.windowSymbol(w, thickness: cut) }
+        for d in doors { out += doorSymbol(d) + Self.openingLabel(d, "門") }
+        for w in windows {
+            out += Self.windowSymbol(w, thickness: cut) + Self.openingLabel(w, "窗")
+        }
         for o in openings {
             // 開口只畫兩側牆端的封口線，不畫符號
             guard let quad = Self.slab(o, thickness: cut) else { continue }
@@ -263,6 +265,25 @@ extension FloorPlanData {
     /// 該點是否落在任一房間多邊形內
     private func roomsContain(_ pt: SIMD2<Float>) -> Bool {
         rooms.contains { FloorPlanData.polygonContains($0.polygon2D, pt) }
+    }
+
+    /// 門窗標籤：「門 0.90」寫在開口中央、往牆的法向外側推開一點。
+    ///
+    /// 推開是必要的 —— 壓在門的開啟弧或窗的三道線上會兩個都看不清楚。
+    /// 只標寬度不標高度：平面圖上高度不可見，寫了也無從對照；
+    /// 而寬度就是圖上量得到的那一段，標了才有交叉驗證的價值。
+    private static func openingLabel(_ s: FloorPlanSurface, _ kind: String) -> [PlanPrimitive] {
+        guard s.segment2D.count == 4 else { return [] }
+        let p0 = SIMD2<Float>(s.segment2D[0], s.segment2D[1])
+        let p1 = SIMD2<Float>(s.segment2D[2], s.segment2D[3])
+        let d = p1 - p0
+        let len = simd_length(d)
+        guard len > 0.05 else { return [] }
+        let axis = d / len
+        let normal = SIMD2<Float>(-axis.y, axis.x)
+        let at = (p0 + p1) / 2 + normal * 0.28
+        return [.text(String(format: "%@ %.2f", kind, len), at: at, sizePx: 10,
+                      color: kind == "門" ? .door : .window, align: .center, bold: false)]
     }
 
     /// 窗：沿窗寬三道平行線（外框兩條 ＋ 中線一條），建築圖慣例畫法。

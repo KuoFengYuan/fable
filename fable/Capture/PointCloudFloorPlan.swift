@@ -107,7 +107,7 @@ nonisolated enum PointCloudFloorPlan {
         // 主方向本身不需要最佳格距 —— 它是直方圖平方和的極大值，對格距不敏感，
         // 用一個中庸的 8cm 探測格就夠。
         let probeCell: Float = 0.08
-        let probe = wallCells(points, bandLo: bandLo, bandHi: bandHi,
+        let probe = wallCells(points, bandLo: bandLo, bandHi: bandHi, floorY: floorY,
                               cell: probeCell, minPts: kMinPointsFloor)
         let probeNeed = spanThreshold(probe.cells, bandH: bandH)
         let probeCells = probe.cells.filter { $0.span >= probeNeed }
@@ -129,7 +129,7 @@ nonisolated enum PointCloudFloorPlan {
         // 格距與最少點數由**實測密度**決定，不是寫死（見 pickCell）
         let g = pickCell(rotated, bandLo: bandLo, bandHi: bandHi, bandH: bandH)
         let cell = g.cell, minPts = g.minPts
-        let pass2 = wallCells(rotated, bandLo: bandLo, bandHi: bandHi,
+        let pass2 = wallCells(rotated, bandLo: bandLo, bandHi: bandHi, floorY: floorY,
                               cell: cell, minPts: minPts)
         let needSpan = spanThreshold(pass2.cells, bandH: bandH)
         let cells2 = pass2.cells.filter { $0.span >= needSpan }
@@ -140,12 +140,38 @@ nonisolated enum PointCloudFloorPlan {
         let floorCells = pass2.floorCells
         // 線段是在轉正的座標系抽出來的，要轉回世界座標
         let bt = cos(theta), bst = sin(theta)
+        // 門窗判定要在**轉正後**的座標系做（線段是軸向的），最後才一起轉回世界座標
+        var byKey: [Int64: WallCell] = [:]
+        byKey.reserveCapacity(cells2.count)
+        for c in cells2 {
+            byKey[key(Int((c.at.x / cell).rounded()), Int((c.at.y / cell).rounded()))] = c
+        }
+        func toWorld(_ p: SIMD2<Float>) -> SIMD2<Float> {
+            SIMD2(p.x * bt - p.y * bst, p.x * bst + p.y * bt)
+        }
         var walls: [FloorPlanSurface] = []
+        var doors: [FloorPlanSurface] = []
+        var windows: [FloorPlanSurface] = []
         for s in segs {
             let a = SIMD2<Float>(s.a.x * bt - s.a.y * bst, s.a.x * bst + s.a.y * bt)
             let b = SIMD2<Float>(s.b.x * bt - s.b.y * bst, s.b.x * bst + s.b.y * bt)
             let len = simd_distance(a, b)
             guard len >= kMinWallLengthM else { continue }
+            // 沿這一段牆找門窗
+            let horiz = abs(s.b.x - s.a.x) >= abs(s.b.y - s.a.y)
+            let op = openings(along: s, cells: byKey, horizontal: horiz, cell: cell)
+            let lineC = horiz ? s.a.y : s.a.x
+            func emit(_ spans: [(Float, Float)], _ cat: String,
+                      into list: inout [FloorPlanSurface]) {
+                for (p0, p1) in spans {
+                    let q0 = toWorld(horiz ? SIMD2(p0, lineC) : SIMD2(lineC, p0))
+                    let q1 = toWorld(horiz ? SIMD2(p1, lineC) : SIMD2(lineC, p1))
+                    list.append(surface(a: q0, b: q1, thickness: s.thickness,
+                                        height: s.spanM, category: cat))
+                }
+            }
+            emit(op.doors, "door", into: &doors)
+            emit(op.windows, "window", into: &windows)
             // **牆高填實際觀測到的跨度，不是樓高。**
             // 填樓高的話 medianWallHeightM 永遠等於整個 Y 範圍，
             // 「牆只掃到多高」這個檢查就完全失效 —— 而那正是點雲版最常見的問題。
@@ -168,6 +194,8 @@ nonisolated enum PointCloudFloorPlan {
         var plan = FloorPlanData()
         plan.generator = "fable-pointcloud"
         plan.walls = walls
+        plan.doors = doors
+        plan.windows = windows
         plan.boundsM = [lo.x, lo.y, hi.x, hi.y]
         plan.boundingAreaM2 = (hi.x - lo.x) * (hi.y - lo.y)
         plan.floorAreaM2 = Float(floorCells) * cell * cell
@@ -181,13 +209,14 @@ nonisolated enum PointCloudFloorPlan {
             sp.isEmpty ? 0 : sp[min(sp.count - 1, Int(Double(sp.count - 1) * q))]
         }
         let summary = String(
-            format: "點雲平面圖: %d 點 → %d 佔用格 → %d 牆格（跨度 ≥%.2fm）→ %d 段牆；"
+            format: "點雲平面圖: %d 點 → %d 佔用格 → %d 牆格（跨度 ≥%.2fm）→ %d 段牆、"
+                    + "%d 門 %d 窗；"
                     + "樓高 %.2fm、主方向 %.1f°、地板 %.1f m²\n"
                     + "  %@\n"
                     + "  格跨度分佈 p50 %.2f / p75 %.2f / p90 %.2f / p99 %.2fm"
                     + "（門檻 %.2fm；牆掃到的高度中位數 %.2fm）",
             points.count, grid, cells2.count, needSpan, walls.count,
-            roomHeight, theta * 180 / .pi, plan.floorAreaM2, g.diag,
+            doors.count, windows.count, roomHeight, theta * 180 / .pi, plan.floorAreaM2, g.diag,
             pct(0.5), pct(0.75), pct(0.9), pct(0.99), needSpan, plan.medianWallHeightM)
         return Result(plan: plan, summary: summary)
     }
@@ -197,13 +226,39 @@ nonisolated enum PointCloudFloorPlan {
     /// **必須先排除地板與天花板帶。** 房間裡每一個水平格子都同時有地板點與天花板點，
     /// 垂直跨度就是整個樓高 —— 空曠的地板中央會跟牆一樣被判成「牆」。
     /// 只看中間那一段，空地就真的是空的，而牆仍然橫跨整段。
-    struct WallCell { var at: SIMD2<Float>; var span: Float }
+    struct WallCell {
+        var at: SIMD2<Float>
+        var span: Float
+        /// 這一格在三個高度帶各自有沒有點。**門窗判定完全靠這三個 bit。**
+        /// 把每格塌成單一個 span 數字會丟掉垂直剖面，而剖面正是門窗的簽名：
+        ///   門：中段空、上方有門楣
+        ///   窗：中段空、下方有窗台、上方有窗楣
+        ///   沒掃到：三個帶都空 —— 這一種**不可以**當成門，否則會憑空生出門
+        var sill = false      // 窗台高度以下（地板 +0.10 ~ +0.85m）
+        var mid = false       // 門會挖掉的那一段（地板 +0.30 ~ +1.90m）
+        var lintel = false    // 門高以上（地板 +2.15m ~ 天花板）
+    }
+
+    /// 門窗判定用的三個高度帶（相對地板，公尺）。
+    /// 一般門高 2.0~2.1m、窗台 0.85~1.0m —— 帶的邊界避開那些常見值，
+    /// 才不會因為差幾公分就整片誤判。
+    static let kSillBand: ClosedRange<Float> = 0.10...0.85
+    static let kMidBand: ClosedRange<Float> = 0.30...1.90
+    static let kLintelBandLo: Float = 2.15
+
+    /// 開口的合理寬度（公尺）。超出範圍的不當成門窗 ——
+    /// 太窄多半是掃描破洞，太寬是整面牆沒掃到。
+    static let kDoorWidth: ClosedRange<Float> = 0.55...1.60
+    static let kWindowWidth: ClosedRange<Float> = 0.40...3.50
 
     private static func wallCells(_ points: [SIMD3<Float>],
-                                  bandLo: Float, bandHi: Float,
+                                  bandLo: Float, bandHi: Float, floorY: Float,
                                   cell: Float, minPts: Int)
         -> (cells: [WallCell], occupied: Int, floorCells: Int) {
-        struct Column { var minY: Float; var maxY: Float; var count: Int }
+        struct Column {
+            var minY: Float; var maxY: Float; var count: Int
+            var sill = false; var mid = false; var lintel = false
+        }
         var grid: [Int64: Column] = [:]
         var floor = Set<Int64>()
         grid.reserveCapacity(points.count / 8)
@@ -211,17 +266,32 @@ nonisolated enum PointCloudFloorPlan {
         for p in points {
             let k = cellKey(p.x, p.z, cell)
             if p.y <= floorTop { floor.insert(k) }
-            guard p.y >= bandLo, p.y <= bandHi else { continue }
+            // 高度帶的判定要用**全部**的點，不能只看中段帶 ——
+            // 窗台在中段帶下緣以下，門楣在上緣以上，兩個都被 band 濾掉了
+            let h = p.y - floorY
+            let inSill = kSillBand.contains(h)
+            let inMid = kMidBand.contains(h)
+            let inLintel = h >= kLintelBandLo
             if var c = grid[k] {
-                c.minY = min(c.minY, p.y); c.maxY = max(c.maxY, p.y); c.count += 1
+                c.sill = c.sill || inSill
+                c.mid = c.mid || inMid
+                c.lintel = c.lintel || inLintel
+                if p.y >= bandLo, p.y <= bandHi {
+                    c.minY = min(c.minY, p.y); c.maxY = max(c.maxY, p.y); c.count += 1
+                }
                 grid[k] = c
+            } else if p.y >= bandLo, p.y <= bandHi {
+                grid[k] = Column(minY: p.y, maxY: p.y, count: 1,
+                                 sill: inSill, mid: inMid, lintel: inLintel)
             } else {
-                grid[k] = Column(minY: p.y, maxY: p.y, count: 1)
+                grid[k] = Column(minY: .greatestFiniteMagnitude, maxY: -.greatestFiniteMagnitude,
+                                 count: 0, sill: inSill, mid: inMid, lintel: inLintel)
             }
         }
         var out: [WallCell] = []
         for (k, c) in grid where c.count >= minPts {
-            out.append(WallCell(at: cellCenter(k, cell), span: c.maxY - c.minY))
+            out.append(WallCell(at: cellCenter(k, cell), span: c.maxY - c.minY,
+                                sill: c.sill, mid: c.mid, lintel: c.lintel))
         }
         return (out, grid.count, floor.count)
     }
@@ -244,6 +314,7 @@ nonisolated enum PointCloudFloorPlan {
     /// 而格距寫死 5cm —— 網格比資料還細，每格中位數 1 個點。
     static func pickCell(_ points: [SIMD3<Float>], bandLo: Float, bandHi: Float,
                          bandH: Float) -> (cell: Float, minPts: Int, diag: String) {
+        // 這裡只需要 span 來計分，門窗旗標用不到 —— 所以不重複那段判定
         var scored: [(cell: Float, minPts: Int, total: Float, segs: Int, median: Int)] = []
         for c in kCellCandidatesM {
             struct Col { var lo: Float; var hi: Float; var n: Int }
@@ -497,6 +568,77 @@ nonisolated enum PointCloudFloorPlan {
         return out
     }
 
+    // MARK: - 門窗
+
+    /// 沿著已抽出的牆，用每一格的垂直剖面找出門與窗。
+    ///
+    /// **判別式是剖面，不是缺口。** 我一開始拒絕做這件事，理由是「牆上的缺口跟
+    /// 那一段沒掃到長得一模一樣」—— 那個理由只有在把每格塌成一個 span 數字時才成立。
+    /// 保留三個高度帶的佔用狀態之後，三者是分得開的：
+    ///   實牆   中段有點
+    ///   門     中段空、**上方有門楣**
+    ///   窗     中段空、**下方有窗台且上方有窗楣**
+    ///   沒掃到 三個帶都空 → 回傳 nil，**絕不當成門**
+    /// 最後那一條是整段邏輯的重點：沒有證據時不猜，寧可少一個門。
+    ///
+    /// 前提是牆要掃得夠高（門楣在 2.15m 以上）。掃不到那個高度時
+    /// 所有開口都會落在「沒掃到」，也就是自動退化成沒有門窗 —— 那是正確的行為。
+    static func openings(along seg: Seg, cells: [Int64: WallCell],
+                         horizontal: Bool, cell: Float)
+        -> (doors: [(Float, Float)], windows: [(Float, Float)]) {
+        let lo = Int(((horizontal ? seg.a.x : seg.a.y) / cell).rounded())
+        let hi = Int(((horizontal ? seg.b.x : seg.b.y) / cell).rounded())
+        let line = Int(((horizontal ? seg.a.y : seg.a.x) / cell).rounded())
+        guard hi > lo else { return ([], []) }
+
+        enum Kind { case solid, door, window, unknown }
+        var kinds: [Kind] = []
+        for v in lo...hi {
+            // 牆有厚度，同一個位置可能落在相鄰幾列 —— 取這幾列的聯集，
+            // 否則牆的另一側那一列會被誤判成「沒掃到」
+            var sill = false, mid = false, lintel = false
+            for d in -2...2 {
+                let k = horizontal ? key(v, line + d) : key(line + d, v)
+                guard let c = cells[k] else { continue }
+                sill = sill || c.sill; mid = mid || c.mid; lintel = lintel || c.lintel
+            }
+            if mid { kinds.append(.solid) }
+            else if lintel { kinds.append(sill ? .window : .door) }
+            else { kinds.append(.unknown) }
+        }
+
+        // 把連續的「非實牆」聚成一段，再看整段的組成決定它是什麼。
+        //
+        // **不能讓破洞切斷 run。** 一個 0.9m 的門在 12cm 格下是 7~8 格，
+        // 中間只要夾一格沒掃到就斷成兩截，兩截都低於門寬下限 —— 於是永遠找不到門。
+        // 實機這份資料就是這樣：205 個候選開口，幾乎全是 0.12~0.24m 的「未掃」碎片。
+        //
+        // 但破洞也不能無條件併進來，否則整片沒掃到的牆會變成一扇巨大的門。
+        // 折衷：破洞可以被吸收，但整段必須有**過半**的格子帶正面證據（門楣／窗台）。
+        // 全是未掃的段落因此仍然是未掃 —— 沒有證據就不猜，這一條不能鬆。
+        var doorsOut: [(Float, Float)] = []
+        var windowsOut: [(Float, Float)] = []
+        var i = 0
+        while i < kinds.count {
+            guard kinds[i] != .solid else { i += 1; continue }
+            var j = i
+            while j + 1 < kinds.count && kinds[j + 1] != .solid { j += 1 }
+            let n = j - i + 1
+            let w = Float(n) * cell
+            let nDoor = kinds[i...j].filter { $0 == .door }.count
+            let nWin = kinds[i...j].filter { $0 == .window }.count
+            let span = (Float(lo + i) * cell, Float(lo + j) * cell)
+            // 窗優先於門：有窗台證據就是窗，門是「下方沒有東西」的那一種
+            if nWin * 2 >= n, kWindowWidth.contains(w) {
+                windowsOut.append(span)
+            } else if (nDoor + nWin) * 2 >= n, nDoor >= nWin, kDoorWidth.contains(w) {
+                doorsOut.append(span)
+            }
+            i = j + 1
+        }
+        return (doorsOut, windowsOut)
+    }
+
     // MARK: - 小工具
 
     @inline(__always)
@@ -521,7 +663,8 @@ nonisolated enum PointCloudFloorPlan {
     /// 由兩端點組出 FloorPlanSurface。製圖層只吃 segment2D 與 dimensions[2]，
     /// 但 transform 仍照著填 —— JSON 匯出的下游（以及 RoomPlan 版本的資料）都預期它存在。
     private static func surface(a: SIMD2<Float>, b: SIMD2<Float>,
-                                thickness: Float, height: Float) -> FloorPlanSurface {
+                                thickness: Float, height: Float,
+                                category: String = "wall") -> FloorPlanSurface {
         let d = b - a
         let len = simd_length(d)
         let ang = atan2(d.y, d.x)
@@ -532,7 +675,7 @@ nonisolated enum PointCloudFloorPlan {
                           0, 1, 0, height / 2,
                           -s, 0, c, mid.y,
                           0, 0, 0, 1]
-        return FloorPlanSurface(category: "wall", confidence: "high",
+        return FloorPlanSurface(category: category, confidence: "high",
                                 transform: m,
                                 dimensions: [len, height, thickness],
                                 segment2D: [a.x, a.y, b.x, b.y],
