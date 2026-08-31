@@ -254,9 +254,13 @@ extension FloorPlanCapture: @preconcurrency RoomCaptureSessionDelegate {
         maxWallHeightM = room.walls.reduce(Float(0)) { max($0, $1.dimensions.y) }
 
         // 節流：didUpdate 觸發得比畫面更新還密，每次都重建幾何會讓 SceneKit 一直重上傳。
-        // 0.4s 對「看得到掃描進度」已經很即時，而 RoomPlan 的牆本來也不會抖動。
+        //
+        // 0.4 → 0.2s：0.4s 的更新間隔即使補了動畫仍然看得出一段一段。
+        // 這一段的成本是「把 ~30 個元素的節點屬性重設一次」（約 360 次賦值）＋
+        // dollhouse 的包圍盒，量級是毫秒；提高到 5Hz 仍遠低於掃描時的預算，
+        // 而流暢度是使用者直接感受得到的。
         let now = CACurrentMediaTime()
-        guard now - lastSurfacePush > 0.4 else { return }
+        guard now - lastSurfacePush > 0.2 else { return }
         lastSurfacePush = now
 
         var out: [RoomSurface] = []

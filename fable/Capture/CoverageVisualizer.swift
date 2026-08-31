@@ -181,15 +181,16 @@ final class CoverageVisualizer {
         roomRoot.isHidden = hidden
     }
 
-    /// 發光核心的半徑（公尺）。
+    /// 發光核心的半徑（公尺）。6mm 直徑。
+    private static let kEdgeRadius: CGFloat = 0.003
+    /// 外暈半徑。1.8cm 直徑。
     ///
-    /// 1cm 直徑。先前設 2.4cm，實機看起來明顯比 RoomPlan 原生粗 ——
-    /// **原生那個「粗度」其實幾乎都來自光暈，核心是很細的一條亮線。**
-    /// 核心負責「銳利」，光暈負責「存在感」，兩者的分工不能混。
-    private static let kEdgeRadius: CGFloat = 0.005
-    /// 外暈半徑。約核心的 4 倍、alpha 很低 —— 加法混色下在核心周圍疊出柔和的暈開，
-    /// 這才是那個發光感的來源。
-    private static let kGlowRadius: CGFloat = 0.020
+    /// **視覺粗細是由這一層決定的，不是核心。** 外暈是等 alpha 的圓柱（不是真的
+    /// 有衰減的光暈），而且是加法混色 —— 在明亮的室內牆面上，0.16 的 alpha 疊上去
+    /// 就已經接近飽和，於是整條讀起來就是外暈的直徑。
+    /// 先前兩次調細都只動核心，所以看起來沒什麼變化；這次外暈一起收，
+    /// 並把 alpha 再降一階讓它真的只是暈。
+    private static let kGlowRadius: CGFloat = 0.009
 
     /// 用 RoomPlan 當下偵測到的面疊出**發光白色邊框**。
     ///
@@ -201,10 +202,10 @@ final class CoverageVisualizer {
     /// 每次重建整組節點會讓 SceneKit 不斷重新上傳幾何 —— 掃描中最不能做的就是
     /// 在主執行緒上製造這種尖峰（會餓死 ARKit 的 VIO）。
     /// 面數變動時只增減差額，其餘就地改尺寸與變換。
-    /// 生長動畫的時間。**略長於 didUpdate 的節流間隔（0.4s）** ——
+    /// 生長動畫的時間。**略長於 didUpdate 的節流間隔（0.2s）** ——
     /// 這樣每一次更新的補間都還沒走完就接上下一次，看起來是連續長出來的；
     /// 短於節流間隔的話會變成「動一下、停一下」，比直接跳還難看。
-    private static let kGrowDuration: CFTimeInterval = 0.45
+    private static let kGrowDuration: CFTimeInterval = 0.24
 
     func updateRoomSurfaces(_ surfaces: [RoomSurface]) {
         while roomNodes.count > surfaces.count {
@@ -232,18 +233,29 @@ final class CoverageVisualizer {
             SCNTransaction.commit()
         }
 
-        SCNTransaction.begin()
-        SCNTransaction.animationDuration = Self.kGrowDuration
-        // easeOut：一偵測到就快速抽長、末段收慢，這是「線在畫出來」的手感；
-        // 線性會像機械滑動，easeInOut 起步太拖沓
-        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
-        for (i, s) in surfaces.enumerated() {
-            Self.layoutEdges(roomNodes[i], size: s.size, box: s.isBox,
-                             color: Self.roomColor(s.kind))
-            roomNodes[i].simdTransform = s.transform
-            roomNodes[i].opacity = 1
+        // **新面與既有面用不同的緩動，而且必須分成兩個交易。**
+        //
+        // 新面要的是「畫出來」的手感 → easeOut，起步快、末段收慢。
+        // 既有面要的是連續延伸 → 必須線性：每 0.2s 就有一個新目標，
+        // 而 easeOut 每一段末尾都在減速、下一段開頭又衝出去 ——
+        // 疊起來就是規律的脈動，正是「不夠流暢」的來源。
+        // 線性讓速度跨段一致，看起來就是一條穩定往前長的線。
+        let existing = Set(0..<surfaces.count).subtracting(fresh)
+        func apply(_ indices: some Sequence<Int>, timing: CAMediaTimingFunctionName) {
+            SCNTransaction.begin()
+            SCNTransaction.animationDuration = Self.kGrowDuration
+            SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: timing)
+            for i in indices {
+                let s = surfaces[i]
+                Self.layoutEdges(roomNodes[i], size: s.size, box: s.isBox,
+                                 color: Self.roomColor(s.kind))
+                roomNodes[i].simdTransform = s.transform
+                roomNodes[i].opacity = 1
+            }
+            SCNTransaction.commit()
         }
-        SCNTransaction.commit()
+        apply(fresh, timing: .easeOut)
+        apply(existing.sorted(), timing: .linear)
     }
 
     /// 一個面的邊框 = 四條**圓管**（上下左右），每條再套一層外暈。
@@ -289,7 +301,7 @@ final class CoverageVisualizer {
         m.writesToDepthBuffer = false   // 不遮住點雲與真實畫面的深度關係
         m.blendMode = .add              // 加法混色 → 亮處發光，暗處不會變成灰塊
         m.diffuse.contents = color
-        m.transparency = glow ? 0.16 : 1.0
+        m.transparency = glow ? 0.10 : 1.0
         c.materials = [m]
         tubeCache[key] = c
         return c
@@ -346,9 +358,11 @@ final class CoverageVisualizer {
 
         // 以下全部走補間。**比例尺也要在裡面** —— 房間長大時 scale 每 0.4s 就換一次，
         // 那是整個縮圖一跳一跳最主要的來源，比單一元素的尺寸變化明顯得多。
+        // 線性：縮圖的比例尺與各元素尺寸每 0.2s 就換一次目標，
+        // 緩動會讓整個房間規律地漲一下停一下。等速才看得出是穩定長大。
         SCNTransaction.begin()
         SCNTransaction.animationDuration = Self.kGrowDuration
-        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeOut)
+        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .linear)
         defer { SCNTransaction.commit() }
 
         // 內容節點：把世界座標的房間搬到原點並縮小；擺放由 dollRoot 負責
