@@ -19,9 +19,13 @@ scan_accuracy.py — 量掃描出來的幾何精度（不需要外部真值）
                     → 同一表面被不同位姿投影到不同位置，是位姿誤差的直接證據
   4. 閉環誤差       走回起點時的位置落差 ÷ 走過的路徑長 = 漂移率
                     → 這是唯一能量到「全域」誤差的指標，前三個都只看局部
+  5. 誤差預算       拿「沒有疊影的牆」當對照組，把 (1) 的殘差拆成
+                    疊影貢獻 ＋ 其他（深度雜訊、單幀位姿抖動）
+                    → 回答「疊影修好之後精度會落在哪」，以及該不該先修疊影
 
 **沒有真值時最可信的是 (1) 與 (3)。** (1) 給你「表面有多厚」，
 (3) 告訴你那個厚度是雜訊還是位姿錯位 —— 兩者的處理方式完全不同。
+(5) 再把兩者的比例算出來，決定先修哪一個才划算。
 
 想要外部驗證：拿雷射測距儀量一面牆的長度，跟 floorplan.json 的 lengthM 對照。
 本工具刻意不猜那個 —— 它量的是內部一致性，那才是它有辦法誠實回答的問題。
@@ -137,7 +141,8 @@ def main():
     print(f"主方向    {best_a:.1f}°")
 
     # 沿兩軸各自找「密集的一條線」＝一面牆，量它的平面殘差與厚度
-    resid, thick, shells = [], [], 0
+    # 每面牆記 (殘差, 牆帶厚度, 殼間距)；殼間距 None 代表單峰（沒有疊影）
+    resid, thick, seps = [], [], []
     for axis, (along, across) in enumerate(((v, u), (u, v))):
         lo, hi = across.min(), across.max()
         bins = np.arange(lo, hi + 0.05, 0.05)
@@ -163,16 +168,23 @@ def main():
             rms, _ = out
             resid.append(rms)
             thick.append(c1 - c0)
-            # 疊影：同一條牆帶內，跨牆方向的分佈若是雙峰就是兩層殼
+            # 疊影：同一條牆帶內，跨牆方向的分佈若是雙峰就是兩層殼。
+            # 除了「有沒有」，也要量「相隔多遠」—— 那個距離才換算得出誤差貢獻。
             hh, _ = np.histogram(across[sel], bins=np.arange(c0, c1 + 0.02, 0.02))
             peaks = [k for k in range(1, len(hh) - 1)
                      if hh[k] > hh[k - 1] and hh[k] > hh[k + 1] and hh[k] > hh.max() * 0.35]
             if len(peaks) >= 2:
-                shells += 1
+                # 取最高的兩個峰＝兩層主要的殼（三峰以上時，其餘是零星雜訊）
+                top = sorted(peaks, key=lambda k: hh[k], reverse=True)[:2]
+                seps.append(abs(top[0] - top[1]) * 0.02)
+            else:
+                seps.append(None)
 
     if resid:
         resid = np.array(resid)
         thick = np.array(thick)
+        dbl = np.array([s is not None for s in seps])
+        sep = np.array([s for s in seps if s is not None])
         print()
         print("── 1. 牆面平面殘差（表面該是平的，散開多厚就是誤差）──")
         print(f"   {len(resid)} 面牆：中位數 {np.median(resid) * 100:.1f} cm、"
@@ -182,8 +194,51 @@ def main():
         print(f"   判讀：<1.5cm 良好 ／ 1.5~4cm 可用 ／ >4cm 位姿或深度有明顯問題")
         print()
         print("── 3. 重複面（疊影）──")
-        print(f"   {shells}/{len(resid)} 面牆在跨牆方向上呈現雙峰以上"
+        print(f"   {int(dbl.sum())}/{len(resid)} 面牆在跨牆方向上呈現雙峰以上"
               f" → 同一表面被投影到不只一個位置")
+        if len(sep):
+            print(f"   殼間距 中位數 {np.median(sep) * 100:.1f} cm、"
+                  f"p90 {np.percentile(sep, 90) * 100:.1f} cm")
+
+        # ── 5. 誤差預算 ──────────────────────────────────────────
+        # 把 (1) 的殘差拆成「疊影」與「其他」兩份。做法不是套公式，而是
+        # **拿單峰牆當對照組** —— 它們身上沒有疊影，所以殘差就是深度雜訊
+        # ＋局部位姿抖動的總和，那正好是「疊影修好之後會落在哪」的答案。
+        # 疊影的貢獻則由兩組相減（平方差開根號）得到，不假設殼有幾層。
+        #
+        # 另外印出「最強兩峰間距」當**形狀**的診斷，不當誤差來源用：
+        #   間距 ≈ 疊影貢獻 → 乾淨的兩層殼，成因是兩趟之間有固定偏移
+        #                     （掠射角深度偏差、或兩段軌跡沒對齊）
+        #   間距 ≪ 疊影貢獻 → 不是兩層而是多層／糊開，成因是每幀抖動
+        #                     在多趟之間各自累積，要治的是單幀品質不是對齊
+        # 這兩種的處理方式完全不同，所以值得分辨。
+        if len(sep) >= 3 and (~dbl).sum() >= 3:
+            base = float(np.median(resid[~dbl]))
+            meas = float(np.median(resid[dbl]))
+            ghost = math.sqrt(max(meas ** 2 - base ** 2, 0.0))
+            gap = float(np.median(sep))
+            print()
+            print("── 5. 誤差預算（疊影拿掉之後會落在哪）──")
+            print(f"   單峰牆 {int((~dbl).sum())} 面：殘差中位數 {base * 100:.1f} cm"
+                  f"  ← 深度雜訊＋位姿抖動，這是修好疊影後的地板")
+            print(f"   雙峰牆 {int(dbl.sum())} 面：殘差中位數 {meas * 100:.1f} cm")
+            print(f"   疊影貢獻 σ = √({meas * 100:.1f}² − {base * 100:.1f}²)"
+                  f" = {ghost * 100:.1f} cm")
+            print()
+            if gap / 2 < ghost * 0.6:
+                print(f"   形狀診斷：最強兩峰只隔 {gap * 100:.1f}cm（σ 僅 {gap * 50:.1f}cm），"
+                      f"遠小於疊影貢獻 {ghost * 100:.1f}cm")
+                print(f"   → **不是乾淨的兩層殼，而是多層／糊開的分佈**。"
+                      f"成因偏向每幀深度與位姿抖動，")
+                print(f"      而不是兩趟之間的固定偏移 —— 對齊類的修法（掠射角、BA）"
+                      f"幫助有限，要先治單幀品質。")
+            else:
+                print(f"   形狀診斷：最強兩峰隔 {gap * 100:.1f}cm（σ {gap * 50:.1f}cm），"
+                      f"與疊影貢獻 {ghost * 100:.1f}cm 同量級")
+                print(f"   → **是乾淨的兩層殼**：兩趟之間有固定偏移。"
+                      f"掠射角過濾／BA／重新對齊會直接見效。")
+        elif len(sep):
+            print("   （單峰或雙峰牆不足 3 面，樣本太少，不做誤差預算拆解）")
     else:
         print("   找不到足夠密集的牆帶 —— 點太稀或牆沒掃到")
 
