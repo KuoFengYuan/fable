@@ -60,13 +60,26 @@ def floor_ceiling(y):
     地板與天花板在直方圖上是**兩個非常明顯的峰**（這份資料：地板 19084 點、
     天花板 30607 點，其他 bin 都在 4000 以下），取峰值穩健得多。
     順便回報離群比例 —— 那本身就是一個品質指標。
+
+    **但「把直方圖切一半、兩邊各取 argmax」也不可靠。** 離群尾巴一長，
+    中點就會滑到某個真峰上：實測同一場景重跑出來的點雲（Y 最小值只差 0.1m、
+    少一個 bin），中點正好落在地板峰 −1.50，於是「下半」取到 −1.54、
+    「上半」取到 −1.49，樓高算成 0.10m，後面每一項都跟著錯。
+    原本那份資料會過只是運氣。
+    改成「先取最高峰，再取離它 ≥ MIN_STOREY 的最高峰」——
+    樓層高度有物理下限，那比任何位置啟發式都硬。
     """
+    MIN_STOREY = 1.8                  # 沒有哪一層樓的淨高低於此；用來排除同一個峰的旁瓣
     bins = np.arange(y.min(), y.max() + 0.05, 0.05)
     h, _ = np.histogram(y, bins=bins)
-    mid = len(h) // 2
-    lo_i = int(np.argmax(h[:mid]))
-    hi_i = int(np.argmax(h[mid:])) + mid
-    fy, cy = float(bins[lo_i]), float(bins[hi_i])
+    a = int(np.argmax(h))
+    far = np.abs(bins[:len(h)] - bins[a]) >= MIN_STOREY
+    if not far.any():                 # 整份點雲的垂直跨度不到一層樓 —— 退回極值
+        fy, cy = float(np.percentile(y, 2)), float(np.percentile(y, 98))
+        return fy, cy, 0.0
+    masked = np.where(far, h, -1)
+    b = int(np.argmax(masked))
+    fy, cy = float(bins[min(a, b)]), float(bins[max(a, b)])
     outside = ((y < fy - 0.30) | (y > cy + 0.30)).mean()
     return fy, cy, float(outside)
 
@@ -87,7 +100,11 @@ def main():
         print(__doc__)
         sys.exit(1)
     d = pathlib.Path(sys.argv[1])
-    pts = read_ply(d / "points.ply")
+    # 第二個參數可指定別的 .ply —— 掃參數時要拿 tools/refuse_ply.swift 重跑出來的
+    # 點雲跟原始的比，而它們共用同一個 poses_refined.jsonl（閉環誤差不變）。
+    ply = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else d / "points.ply"
+    pts = read_ply(ply)
+    print(f"點雲檔    {ply.name}")
     x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
 
     floor_y, ceil_y, outlier_frac = floor_ceiling(y)

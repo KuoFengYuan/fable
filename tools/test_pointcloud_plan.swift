@@ -12,6 +12,7 @@
 //
 //  編譯：
 //    swiftc -O -o /tmp/pctest fable/Capture/FloorPlanData.swift \
+//           fable/Capture/FloorPlanDrawing.swift \
 //           fable/Capture/PointCloudFloorPlan.swift fable/Capture/FloorPlanDXF.swift \
 //           tools/test_pointcloud_plan.swift && /tmp/pctest
 //

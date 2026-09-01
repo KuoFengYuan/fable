@@ -54,9 +54,16 @@ import simd
             print("用法: ply_to_floorplan <scan_dir>")
             exit(1)
         }
-        let dir = URL(fileURLWithPath: CommandLine.arguments[1])
-        guard let pts = readPLY(dir.appendingPathComponent("points.ply")) else {
-            print("讀不到 points.ply"); exit(1)
+        let dir = URL(fileURLWithPath:
+            (CommandLine.arguments[1] as NSString).expandingTildeInPath)
+        // 第二個參數可指定別的 .ply（例如 tools/refuse_ply.swift 用不同參數重跑的）。
+        // 平面圖對點密度極度敏感 —— 見 PointCloudFloorPlan.pickCell —— 所以
+        // 「拿哪一份點雲畫」本身就是要掃的參數之一。
+        let plyPath = CommandLine.arguments.count > 2
+            ? URL(fileURLWithPath: (CommandLine.arguments[2] as NSString).expandingTildeInPath)
+            : dir.appendingPathComponent("points.ply")
+        guard let pts = readPLY(plyPath) else {
+            print("讀不到 \(plyPath.path)"); exit(1)
         }
         print("讀入 \(pts.count) 點")
         guard let r = PointCloudFloorPlan.extract(points: pts) else {

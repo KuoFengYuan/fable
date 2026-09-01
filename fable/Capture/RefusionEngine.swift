@@ -269,8 +269,11 @@ nonisolated enum RefusionEngine {
     /// 在背景執行緒同步執行；progress ∈ 0...1。
     /// - meshVertices: ARKit 場景重建網格的世界座標頂點（可空）。用來補上關鍵幀沒拍到的表面
     ///   —— ARKit 的 mesh 融合每一幀（60fps）的深度，而本函式只吃 ~120 個關鍵幀。
+    /// - target: 匯出點數上限的覆寫。nil ＝ 用 config.exportMaxPoints。
+    ///   平面圖要的密度遠高於訓練種子點能承受的量（見 CaptureConfig.floorPlanMaxPoints），
+    ///   兩者共用一個上限的話，平面圖會被訓練的記憶體預算綁住。
     static func refuse(records: [FrameRecord], sessionDir: URL, config: CaptureConfig,
-                       meshVertices: [SIMD3<Float>] = [],
+                       meshVertices: [SIMD3<Float>] = [], target: Int? = nil,
                        progress: @Sendable (Double) -> Void) -> [CloudPoint] {
         // 位姿在進來之前就已經定案（ARKit ＋ 錨點修正，必要時再加 BA ——
         // 見 CaptureController.processScan）。這裡只負責融合。
@@ -328,7 +331,7 @@ nonisolated enum RefusionEngine {
             // 權重同時吃兩個來源：估計的幾何劣化（運動/捲簾）與實測的清晰度判定。
             // 原本只看 estimatedBlurPx，於是「相機拿得很穩但失焦」的幀拿到滿分權重，
             // 它糊掉的顏色會主導那格的加權平均 —— 這是實測清晰度才看得到的破口。
-            let sharpness = 1 / (1 + Float(r.estimatedBlurPx) / 4)
+            let sharpness = blurWeight(Float(r.estimatedBlurPx), config)
             y.measured = unprojectStored(depth: depth, conf: conf, rgba: rgba,
                                          dw: dw, dh: dh, K: K, c2w: c2w,
                                          config: config, sharpness: sharpness)
@@ -391,7 +394,7 @@ nonisolated enum RefusionEngine {
         let inferredOnly = grid.inferredOnlyCount
         let gridVoxel = grid.voxelSize
         let tE = Date()
-        let out = grid.exportPoints(target: config.exportMaxPoints,
+        let out = grid.exportPoints(target: target ?? config.exportMaxPoints,
                                     minNeighbors: config.refuseMinNeighbors)
         print(String(format: "  匯出擇優 %.2fs（%d 格 → %d 點）",
                      Date().timeIntervalSince(tE), rawCells, out.count))
@@ -420,6 +423,21 @@ nonisolated enum RefusionEngine {
     /// simd_float4x4 → row-major 16（FrameRecord.transform 的格式）
     static func rowMajor(_ m: simd_float4x4) -> [Double] {
         (0..<4).flatMap { r in (0..<4).map { c in Double(m[c][r]) } }
+    }
+
+    /// 模糊 → 融合權重。曲線與錨點見 CaptureConfig.blurWeightPower。
+    ///
+    /// 以 refPx 錨定的用意：power 只該改變「幀之間的相對輕重」。若直接取 base^power，
+    /// 所有權重會一起縮小數十倍，而匯出端的 `min(1, weight/1.5)` 是有飽和點的 ——
+    /// 那會連帶改變下採樣的選點，把一個「相對權重」的實驗混進「絕對尺度」的副作用。
+    @inline(__always)
+    static func blurWeight(_ blurPx: Float, _ config: CaptureConfig) -> Float {
+        let half = max(0.1, config.blurWeightHalfPx)
+        let base = 1 / (1 + max(0, blurPx) / half)
+        let p = config.blurWeightPower
+        guard p != 1 else { return base }          // 預設路徑：與舊寫法逐位元相同
+        let ref = 1 / (1 + max(0, config.blurWeightRefPx) / half)
+        return pow(base, p) * pow(ref, 1 - p)
     }
 
     static func float4x4(rowMajor m: [Double]) -> simd_float4x4 {
@@ -574,7 +592,14 @@ nonisolated enum RefusionEngine {
     /// 只用其中一半：另一半要留給匯出階段（點陣列 ＋ 分層下採樣的字典），
     /// 那兩個的尖峰跟融合格是**重疊**的。
     /// 觸頂粗化仍然保底 —— 真的到上限就加粗格距，是降級不是失敗。
+    ///
+    /// macOS 直接照用設定值：那裡沒有 jetsam，而 os_proc_available_memory() 本身
+    /// 也只存在於 iOS。本檔的用意之一是能在桌機重跑同一份融合做離線驗證
+    /// （見檔頭、tools/refuse_ply.swift），少了這個 #if 就編不過。
     static func safeMaxCells(_ configured: Int) -> Int {
+        #if !os(iOS)
+        return configured
+        #else
         let avail = os_proc_available_memory()
         guard avail > 0 else { return configured }
         let budget = Int(Double(avail) * 0.5) / kBytesPerCell
@@ -585,6 +610,7 @@ nonisolated enum RefusionEngine {
                          Double(avail) / 1e6, configured, capped))
         }
         return capped
+        #endif
     }
 
     /// JPEG →（縮圖解碼）→ 深度解析度的緊湊 RGBA buffer。

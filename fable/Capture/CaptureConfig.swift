@@ -118,8 +118,28 @@ nonisolated struct CaptureConfig: Sendable {
     var voxelSizeM: Float = 0.01
     /// 記憶體內點數上限：觸頂時 voxel 自動 ×2 粗化後繼續收（長掃描不會停止累積）
     var maxPoints = 600_000
-    /// 匯出點數上限：超過時分層擇優下採樣（每格取最高品質分數的點，密度均勻）
+    /// 匯出點數上限：超過時分層擇優下採樣（每格取最高品質分數的點，密度均勻）。
+    ///
+    /// **這個數字是被 msplat 的訓練記憶體綁住的，不是幾何上的選擇。**
+    /// 初始高斯數 ＝ 種子點數，而每顆高斯連梯度與 Adam 狀態約 1KB
+    /// → 250k ≈ 240MB，已經接近手機端能配置的上限。所以它不能為了幾何品質往上開。
     var exportMaxPoints = 250_000
+    /// 平面圖用的點數上限。**刻意與 exportMaxPoints 分開。**
+    ///
+    /// 平面圖沒有訓練那個記憶體限制，卻一直沿用同一個上限 —— 後果在實機資料上很嚴重：
+    /// scan_20260831_133615 融出 3,285,362 格（2cm），下採樣到 250k 等於丟掉 95%，
+    /// 有效解析度從 2cm 掉到 ~7cm、平均點距 11.5cm。而 PointCloudFloorPlan.pickCell
+    /// 是照實測密度挑格距的，於是它只能挑 12cm 格。
+    ///
+    /// 用同一份掃描實測（tools/refuse_ply.swift ＋ tools/ply_to_floorplan.swift）：
+    ///   250k  → 格距 12cm、牆 82 段／總長 327m、最長 18.48m
+    ///   3.27M → 格距  5cm、牆 88 段／總長 351m、最長 28.15m
+    /// 牆面平面殘差同時由 5.8cm 降到 3.0cm（tools/scan_accuracy.py）——
+    /// 那不是「多了點」而已，是原本的下採樣在挑點時系統性偏向離群樣本。
+    ///
+    /// 2M 點 ≈ 40MB（CloudPoint 20B），只在 processScan 內短暫存在：
+    /// 算完平面圖就下採樣成 exportMaxPoints，訓練尚未配置記憶體。
+    var floorPlanMaxPoints = 2_000_000
     /// COLMAP 輸出對齊世界上方向：ARKit 為 +Y up，多數 3DGS 工具假設 -Y up，
     /// 直接匯入會上下顛倒。true = 繞世界 X 軸翻 180° 對齊 COLMAP 慣例（預設，修正顛倒）。
     /// 若你的 viewer 反而變顛倒，設為 false 即輸出 ARKit 原生 +Y up。
@@ -188,6 +208,24 @@ nonisolated struct CaptureConfig: Sendable {
     /// 加權平均會被拉回正確的表面，而不是留著兩層殼。
     /// 想更乾淨可以收到 70~75°，代價是斜面覆蓋率下降。
     var depthMaxIncidenceDeg: Float = 80
+    /// 模糊權重曲線 w = (1/(1 + blurPx/half))^power，並以 refPx 那一點錨定尺度
+    /// （所以改 power 只改「幀之間的相對輕重」，不整體平移權重大小）。
+    ///
+    /// **為什麼要能調 power** —— 實機資料顯示這條曲線太平，等於沒有在挑幀。
+    /// scan_20260831_133615（2006 幀）：
+    ///   estimatedBlurPx  p10 7.2 / p50 11.0 / p90 14.2 / max 15.1
+    ///   w=1/(1+b/4)      p10 0.36 / p50 0.27 / p90 0.22 —— 中間 80% 只差 1.6×
+    /// 也就是 2006 幀票票等值。若其中有一批位姿偏掉，它們就以幾乎全票的力道
+    /// 把點寫進去，加權平均被拉成一條糊帶 —— 那正是 scan_accuracy.py 第 5 項
+    /// 量到的「多層／糊開」而非兩層乾淨的殼。
+    ///
+    /// power 3 會把同一份資料的最好/最差比從 1.6× 拉到 4.2×。
+    /// half 與 refPx 的預設值使 power=1 與先前的寫法**完全等價**（逐位元相同），
+    /// 所以這組參數的預設不改變任何既有行為。
+    var blurWeightHalfPx: Float = 4
+    var blurWeightPower: Float = 1
+    /// 錨點取 10px：那是 maxBlurPixels（警告線），也接近實機掃描的模糊中位數。
+    var blurWeightRefPx: Float = 10
 
     // MARK: - 即時點雲預覽（AR 疊加，Scaniverse 式）
     /// 每 N 個 ARFrame 融合一次（60fps → 每 0.1s），與智慧快門解耦，點雲連續長出

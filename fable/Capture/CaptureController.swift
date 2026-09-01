@@ -475,10 +475,23 @@ final class CaptureController: NSObject, ObservableObject {
                 Task { @MainActor [weak self] in self?.exportProgress = 0.45 + p * 0.55 }
             }
             let mesh = meshVertices
-            points = await Task.detached(priority: .userInitiated) {
+            // 先取平面圖要的密度，算完平面圖再下採樣給訓練／匯出用。
+            // 反過來（先砍到 250k 再畫平面圖）會讓平面圖只剩 ~7cm 的有效解析度 ——
+            // 見 CaptureConfig.floorPlanMaxPoints 的實測對照。
+            let dense = await Task.detached(priority: .userInitiated) {
                 RefusionEngine.refuse(records: records, sessionDir: dir, config: cfg,
-                                      meshVertices: mesh, progress: onProg)
+                                      meshVertices: mesh,
+                                      target: max(cfg.exportMaxPoints, cfg.floorPlanMaxPoints),
+                                      progress: onProg)
             }.value
+            // 平面圖吃高密度那一份；它只留下 floorPlanData（很小），dense 隨即釋放。
+            if !cfg.captureFloorPlan || !FloorPlanCapture.isSupported {
+                usePointCloudPlan(dense)
+            }
+            points = dense.count > cfg.exportMaxPoints
+                ? PointCloudMath.stratifiedBest(dense, startCell: cfg.refuseVoxelSizeM,
+                                                target: cfg.exportMaxPoints)
+                : dense
         }
         if points.isEmpty {                          // 無 LiDAR / 無深度時退回即時累積雲
             points = await accumulator.bestPoints(target: config.exportMaxPoints)
@@ -496,7 +509,10 @@ final class CaptureController: NSObject, ObservableObject {
         // RoomPlan 沒開（或機型不支援）→ 平面圖直接用點雲版。
         // 不這樣做的話 floorPlanData 永遠是 nil，review 的平面圖按鈕不會出現，
         // 使用者要等到匯出才知道有沒有平面圖。
-        if !config.captureFloorPlan || !FloorPlanCapture.isSupported { usePointCloudPlan() }
+        // 有 LiDAR 的路徑上這已經在融合那一段用高密度點雲算完了（見上），
+        // 所以這裡只補「沒有深度、退回即時累積雲」那條路。
+        if floorPlanData == nil,
+           !config.captureFloorPlan || !FloorPlanCapture.isSupported { usePointCloudPlan() }
         reviewTrajectory = refinedRecords.map { RefusionEngine.float4x4(rowMajor: $0.transform) }
         pointCount = points.count
         statusText = corrected > 0 ? "姿態已修正 \(corrected) 幀（ARKit 地圖優化）" : nil
@@ -913,9 +929,13 @@ final class CaptureController: NSObject, ObservableObject {
     ///
     /// 算一次就存著：review 的預覽、房間命名、匯出都吃同一份，
     /// 不然使用者看到的圖和匯出的圖可能不是同一張（點雲不會變，但重算沒有意義）。
-    private func usePointCloudPlan() {
-        guard config.pointCloudFloorPlan, !reviewPoints.isEmpty else { return }
-        let pts = reviewPoints.map { SIMD3<Float>($0.x, $0.y, $0.z) }
+    /// - source: 要拿哪一份點雲畫。nil ＝ reviewPoints（已下採樣到 exportMaxPoints）。
+    ///   有深度的路徑會明確傳入融合後的高密度點雲 —— 平面圖的格距是由實測密度挑的，
+    ///   拿下採樣後的雲來畫等於自己把解析度先砍掉。
+    private func usePointCloudPlan(_ source: [CloudPoint]? = nil) {
+        let src = source ?? reviewPoints
+        guard config.pointCloudFloorPlan, !src.isEmpty else { return }
+        let pts = src.map { SIMD3<Float>($0.x, $0.y, $0.z) }
         guard let r = PointCloudFloorPlan.extract(points: pts) else {
             print("點雲平面圖: 抽不出牆（點太少、或沒有垂直跨度足夠的表面）")
             return
